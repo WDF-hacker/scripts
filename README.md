@@ -1,2 +1,1 @@
-# scripts
-scripts
+保存一些我的大王AI脚本
