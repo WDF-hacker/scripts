@@ -1,0 +1,108 @@
+-- AutoCracker.lua – 整合版（Linoria UI + 自动破解）
+-- 使用方法：loadstring(game:HttpGet("你的raw链接"))()
+
+local Library = (function()
+    local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
+    local backups = {
+        'https://raw.githubusercontent.com/danihre/linorialib/main/',
+        'https://raw.githubusercontent.com/Kore-Scripts/LinoriaLib/main/'
+    }
+    local function loadModule(url)
+        local ok, res = pcall(function() return loadstring(game:HttpGet(url))() end)
+        return ok and res or nil
+    end
+    local lib = loadModule(repo .. 'Library.lua')
+    if not lib then
+        for _, url in ipairs(backups) do
+            lib = loadModule(url .. 'Library.lua')
+            if lib then break end
+        end
+    end
+    if not lib then error("LinoriaLib not loaded") end
+    return lib
+end)()
+
+-- 你的自动破解逻辑
+local Players = game:GetService("Players")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local crackConnection = nil
+
+local function fixCharacter()
+    local char = player.Character
+    if not char then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    if humanoid:GetState() == Enum.HumanoidStateType.FallingDown then
+        humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+    if humanoid.PlatformStand then
+        humanoid.PlatformStand = false
+    end
+    humanoid.AutoRotate = true
+    if not humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+    end
+end
+
+local function clearAttributes()
+    local char = player.Character
+    if char then
+        char:SetAttribute("Picking", nil)
+        char:SetAttribute("Lockpicking", nil)
+    end
+end
+
+local function crack(uiName, triggerName)
+    local ui = playerGui:FindFirstChild(uiName)
+    if not ui then return end
+    task.wait(0.2)
+    local trigger = ui:FindFirstChild(triggerName)
+    if trigger and trigger:IsA("RemoteEvent") then
+        trigger:FireServer(true)
+        VirtualInputManager:SendKeyEvent(true, "Space", false, game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, "Space", false, game)
+        task.wait(0.1)
+        VirtualInputManager:SendKeyEvent(true, "F", false, game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, "F", false, game)
+        task.wait(0.2)
+        fixCharacter()
+        clearAttributes()
+    end
+end
+
+local function start()
+    if crackConnection then return end
+    crackConnection = playerGui.ChildAdded:Connect(function(child)
+        if child.Name == "SafeLock" then
+            crack("SafeLock", "Trigger")
+        elseif child.Name == "LockpickUI" then
+            crack("LockpickUI", "Trigger")
+        end
+    end)
+    crack("SafeLock", "Trigger")
+    crack("LockpickUI", "Trigger")
+end
+
+local function stop()
+    if crackConnection then
+        crackConnection:Disconnect()
+        crackConnection = nil
+    end
+end
+
+-- 创建 Linoria 窗口
+local Window = Library:CreateWindow({ Title = "Auto Cracker", Center = true, AutoShow = true })
+local Tab = Window:AddTab("Main")
+local Group = Tab:AddLeftGroupbox("Controls")
+Group:AddToggle("AutoCrackerToggle", {
+    Text = "Auto Cracker",
+    Default = false,
+    Callback = function(v) if v then start() else stop() end end,
+})
+Group:AddLabel("Manually press F on safe/weapon crate.\nScript will auto-complete.")
+Library:Notify({ Title = "Auto Cracker", Description = "Ready. Toggle ON to start." })
