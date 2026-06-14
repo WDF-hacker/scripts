@@ -1,28 +1,11 @@
--- AutoCracker.lua – 整合版（Linoria UI + 自动破解）
--- 使用方法：loadstring(game:HttpGet("你的raw链接"))()
+-- 加载增强版 Linoria UI 库（使用你提供的 GitHub 原始链接）
+local base = 'https://raw.githubusercontent.com/17kShotsss/UI-LIBRARY/main/'
 
-local Library = (function()
-    local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
-    local backups = {
-        'https://raw.githubusercontent.com/danihre/linorialib/main/',
-        'https://raw.githubusercontent.com/Kore-Scripts/LinoriaLib/main/'
-    }
-    local function loadModule(url)
-        local ok, res = pcall(function() return loadstring(game:HttpGet(url))() end)
-        return ok and res or nil
-    end
-    local lib = loadModule(repo .. 'Library.lua')
-    if not lib then
-        for _, url in ipairs(backups) do
-            lib = loadModule(url .. 'Library.lua')
-            if lib then break end
-        end
-    end
-    if not lib then error("LinoriaLib not loaded") end
-    return lib
-end)()
+local Library = loadstring(game:HttpGet(base .. 'Library.lua'))()
+local ThemeManager = loadstring(game:HttpGet(base .. 'addons/ThemeManager.lua'))()
+local SaveManager = loadstring(game:HttpGet(base .. 'addons/SaveManager.lua'))()
 
--- 你的自动破解逻辑
+-- ========== 自动破解核心逻辑 ==========
 local Players = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local player = Players.LocalPlayer
@@ -30,6 +13,7 @@ local playerGui = player:WaitForChild("PlayerGui")
 
 local crackConnection = nil
 
+-- 修复角色摔倒
 local function fixCharacter()
     local char = player.Character
     if not char then return end
@@ -47,6 +31,7 @@ local function fixCharacter()
     end
 end
 
+-- 清除角色属性
 local function clearAttributes()
     local char = player.Character
     if char then
@@ -55,6 +40,7 @@ local function clearAttributes()
     end
 end
 
+-- 破解单个保险箱/武器箱
 local function crack(uiName, triggerName)
     local ui = playerGui:FindFirstChild(uiName)
     if not ui then return end
@@ -75,7 +61,8 @@ local function crack(uiName, triggerName)
     end
 end
 
-local function start()
+-- 启动监听
+local function startCracker()
     if crackConnection then return end
     crackConnection = playerGui.ChildAdded:Connect(function(child)
         if child.Name == "SafeLock" then
@@ -88,21 +75,81 @@ local function start()
     crack("LockpickUI", "Trigger")
 end
 
-local function stop()
+-- 停止监听
+local function stopCracker()
     if crackConnection then
         crackConnection:Disconnect()
         crackConnection = nil
     end
 end
 
--- 创建 Linoria 窗口
-local Window = Library:CreateWindow({ Title = "Auto Cracker", Center = true, AutoShow = true })
-local Tab = Window:AddTab("Main")
-local Group = Tab:AddLeftGroupbox("Controls")
-Group:AddToggle("AutoCrackerToggle", {
+-- ========== 创建 UI 窗口 ==========
+local Window = Library:CreateWindow({
+    Title = "Auto Cracker",
+    Center = true,
+    AutoShow = true,
+})
+
+-- 【关键】关闭右上角的水印
+Library:SetWatermarkVisibility(false)
+
+local Tabs = {
+    Main = Window:AddTab("Main"),
+    Settings = Window:AddTab("UI Settings"),
+}
+
+-- 主标签页：控制开关
+local leftGroup = Tabs.Main:AddLeftGroupbox("Controls")
+leftGroup:AddToggle("AutoCrackerToggle", {
     Text = "Auto Cracker",
     Default = false,
-    Callback = function(v) if v then start() else stop() end end,
+    Tooltip = "Enable auto crack for safes and weapon crates",
 })
-Group:AddLabel("Manually press F on safe/weapon crate.\nScript will auto-complete.")
-Library:Notify({ Title = "Auto Cracker", Description = "Ready. Toggle ON to start." })
+leftGroup:AddLabel("Manually press F on safe/weapon crate.\nScript will auto-complete and fix falling/jump.")
+
+-- 绑定开关回调
+Toggles.AutoCrackerToggle:OnChanged(function()
+    if Toggles.AutoCrackerToggle.Value then
+        startCracker()
+        Library:Notify("Auto Cracker enabled")
+    else
+        stopCracker()
+        Library:Notify("Auto Cracker disabled")
+    end
+end)
+
+-- 右侧添加说明
+local rightGroup = Tabs.Main:AddRightGroupbox("Info")
+rightGroup:AddLabel("How to use:", true)
+rightGroup:AddLabel("1. Turn ON the toggle above", true)
+rightGroup:AddLabel("2. Approach a safe or weapon crate", true)
+rightGroup:AddLabel("3. Press F to enter mini-game", true)
+rightGroup:AddLabel("4. Script will auto-complete and restore controls", true)
+
+-- ========== UI 设置标签页 ==========
+local menuGroup = Tabs.Settings:AddLeftGroupbox("Menu")
+menuGroup:AddButton("Unload", function() Library:Unload() end)
+menuGroup:AddLabel("Menu keybind"):AddKeyPicker("MenuKeybind", {
+    Default = "End",
+    NoUI = true,
+    Text = "Menu keybind",
+})
+Library.ToggleKeybind = Options.MenuKeybind
+
+-- 主题管理
+ThemeManager:SetLibrary(Library)
+ThemeManager:SetFolder("AutoCracker")
+ThemeManager:ApplyToTab(Tabs.Settings)
+
+-- 配置管理
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+SaveManager:SetFolder("AutoCracker/Settings")
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+-- 可选：自动加载上次配置
+SaveManager:LoadAutoloadConfig()
+
+-- 启动通知
+Library:Notify("Auto Cracker loaded. Toggle ON and press F on safes/weapon crates.")
