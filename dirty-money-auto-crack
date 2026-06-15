@@ -13,7 +13,7 @@ local playerGui = player:WaitForChild("PlayerGui")
 
 local crackConnection = nil
 
--- 修复角色摔倒
+-- 修复角色摔倒（通用）
 local function fixCharacter()
     local char = player.Character
     if not char then return end
@@ -40,6 +40,39 @@ local function clearAttributes()
     end
 end
 
+-- 武器箱专用修复（解绑 Tab 键劫持 + 恢复 UI + 跳跃）
+local function fixWeaponCrate()
+    local ContextActionService = game:GetService("ContextActionService")
+    -- 解绑游戏内绑定的 Tab 取消动作
+    ContextActionService:UnbindAction("LockpickCancelTab")
+    
+    -- 恢复跳跃能力
+    local char = player.Character
+    if char then
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+        end
+    end
+    
+    -- 恢复被隐藏的聊天界面
+    local StarterGui = game:GetService("StarterGui")
+    StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, true)
+    
+    -- 恢复可能被隐藏的 HUD 控件
+    local HUD = playerGui:FindFirstChild("HUD")
+    if HUD then
+        local controlsPC = HUD:FindFirstChild("ControlsPC")
+        if controlsPC then controlsPC.Visible = true end
+        local mobileButtons = HUD:FindFirstChild("MobileButtons")
+        if mobileButtons then mobileButtons.Visible = false end
+        local controlsConsole = HUD:FindFirstChild("ControlsConsole")
+        if controlsConsole then controlsConsole.Visible = false end
+    end
+    
+    print("[修复] 已解除武器箱的 Tab 劫持")
+end
+
 -- 破解单个保险箱/武器箱
 local function crack(uiName, triggerName)
     local ui = playerGui:FindFirstChild(uiName)
@@ -47,17 +80,28 @@ local function crack(uiName, triggerName)
     task.wait(0.2)
     local trigger = ui:FindFirstChild(triggerName)
     if trigger and trigger:IsA("RemoteEvent") then
+        -- 发送破解成功信号
         trigger:FireServer(true)
+        
+        -- 模拟空格完成动画
         VirtualInputManager:SendKeyEvent(true, "Space", false, game)
         task.wait(0.05)
         VirtualInputManager:SendKeyEvent(false, "Space", false, game)
+        
+        -- 模拟 F 关闭界面
         task.wait(0.1)
         VirtualInputManager:SendKeyEvent(true, "F", false, game)
         task.wait(0.05)
         VirtualInputManager:SendKeyEvent(false, "F", false, game)
+        
+        -- 如果是武器箱，执行专用修复
+        if uiName == "LockpickUI" then
+            fixWeaponCrate()
+        end
+        
         task.wait(0.2)
-        fixCharacter()
-        clearAttributes()
+        fixCharacter()      -- 通用摔倒修复
+        clearAttributes()   -- 清除属性残留
     end
 end
 
@@ -71,6 +115,7 @@ local function startCracker()
             crack("LockpickUI", "Trigger")
         end
     end)
+    -- 处理已存在的界面
     crack("SafeLock", "Trigger")
     crack("LockpickUI", "Trigger")
 end
@@ -90,7 +135,7 @@ local Window = Library:CreateWindow({
     AutoShow = true,
 })
 
--- 【关键】关闭右上角的水印
+-- 关闭右上角水印
 Library:SetWatermarkVisibility(false)
 
 local Tabs = {
@@ -103,9 +148,9 @@ local leftGroup = Tabs.Main:AddLeftGroupbox("Controls")
 leftGroup:AddToggle("AutoCrackerToggle", {
     Text = "Auto Cracker",
     Default = false,
-    Tooltip = "Enable auto crack for safes and weapon crates",
+    Tooltip = "Auto crack safes and weapon crates",
 })
-leftGroup:AddLabel("Manually press F on safe/weapon crate.\nScript will auto-complete and fix falling/jump.")
+leftGroup:AddLabel("Manually press F on safe/weapon crate.\nScript will auto-complete and fix controls.")
 
 -- 绑定开关回调
 Toggles.AutoCrackerToggle:OnChanged(function()
@@ -148,7 +193,7 @@ SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
 SaveManager:SetFolder("AutoCracker/Settings")
 SaveManager:BuildConfigSection(Tabs.Settings)
 
--- 可选：自动加载上次配置
+-- 自动加载上次配置
 SaveManager:LoadAutoloadConfig()
 
 -- 启动通知
