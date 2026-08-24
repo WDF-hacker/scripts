@@ -307,6 +307,28 @@ table.insert(freecam.conns, UserInputService.InputBegan:Connect(function(input)
 	end
 end))
 
+-- ========== Button click (Potassium Signal/Input Library) ==========
+-- firesignal triggers signal handlers directly (verified on Potassium);
+-- mousemoveabs+mouse1click performs a real click
+local function clickButton(btn)
+	if not btn then return false end
+	if firesignal then
+		pcall(firesignal, btn.MouseButton1Down)
+		pcall(firesignal, btn.MouseButton1Click)
+		pcall(firesignal, btn.MouseButton1Up)
+		pcall(firesignal, btn.Activated)
+	end
+	if mousemoveabs and mouse1click then
+		pcall(function()
+			local absPos, absSize = btn.AbsolutePosition, btn.AbsoluteSize
+			mousemoveabs(absPos.X + absSize.X / 2, absPos.Y + absSize.Y / 2)
+			task.wait(0.1)
+			mouse1click()
+		end)
+	end
+	return true
+end
+
 -- ========== Lobby UI ops ==========
 local function closePanel(name)
 	local ev = LocalPlayer.PlayerGui:FindFirstChild("Everything")
@@ -315,23 +337,8 @@ local function closePanel(name)
 		if p and p.Visible then
 			local exit = p:FindFirstChild("ExitButton")
 			if exit then
-				-- method 1: VIM real click (Potassium channel works)
-				pcall(function()
-					UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-					local absPos, absSize = exit.AbsolutePosition, exit.AbsoluteSize
-					local cx, cy = absPos.X + absSize.X/2, absPos.Y + absSize.Y/2
-					UserInputService:SetMousePosition(Vector2.new(cx, cy))
-					task.wait(0.2)
-					VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, {}, 0)
-					task.wait(0.1)
-					VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, {}, 0)
-				end)
-				task.wait(0.5)
-				-- method 2: Fire signal fallback
-				pcall(function() exit.MouseButton1Click:Fire() end)
-				pcall(function() exit.Activated:Fire() end)
-				task.wait(0.5)
-				-- method 3: hide panel directly (harmless for popups)
+				clickButton(exit)
+				task.wait(0.8)
 				if p.Visible then
 					pcall(function() p.Visible = false end)
 				end
@@ -350,28 +357,16 @@ local function clickPlay()
 	if sg2 then
 		local pb = sg2:FindFirstChild("PlayButton")
 		if pb and pb.Visible then
-			pcall(function() pb.MouseButton1Click:Fire() end)
-			pcall(function() pb.Activated:Fire() end)
+			clickButton(pb)
 			return true
 		end
 	end
 	return false
 end
 
--- real mouse click (VirtualInputManager, most reliable)
+-- real mouse click alias
 local function realClick(btn)
-	if not btn then return false end
-	local absPos, absSize = btn.AbsolutePosition, btn.AbsoluteSize
-	local center = absPos + absSize / 2
-	local ok = pcall(function()
-		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-		UserInputService:SetMousePosition(center)
-		task.wait(0.1)
-		VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, {}, 0)
-		task.wait(0.1)
-		VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, {}, 0)
-	end)
-	return ok
+	return clickButton(btn)
 end
 
 -- ========== Match end detect + return ==========
@@ -421,23 +416,8 @@ local function handleTitleScreen()
 		if pb then
 			print("[AF] found title PlayButton")
 			local clicked = false
-			-- method 1: Fire ALL signals (v12 proven path)
-			pcall(function() pb.MouseButton1Down:Fire() end)
-			pcall(function() pb.MouseButton1Click:Fire() end)
-			pcall(function() pb.MouseButton1Up:Fire() end)
-			pcall(function() pb.Activated:Fire() end)
-			task.wait(1)
-			-- method 2: real mouse click (VIM, verified on Potassium)
-			pcall(function()
-				UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-				local absPos, absSize = pb.AbsolutePosition, pb.AbsoluteSize
-				local cx, cy = absPos.X + absSize.X/2, absPos.Y + absSize.Y/2
-				UserInputService:SetMousePosition(Vector2.new(cx, cy))
-				task.wait(0.2)
-				VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, {}, 0)
-				task.wait(0.1)
-				VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, {}, 0)
-			end)
+			-- click via firesignal + real mouse (Potassium Signal/Input Library)
+			clickButton(pb)
 			task.wait(1)
 			-- check click success (button gone = game handled it)
 			local pbGone = true
@@ -602,33 +582,15 @@ local mainThread = task.spawn(function()
 					if party and party.Visible then
 						local start = party:FindFirstChild("HostButtons") and party.HostButtons:FindFirstChild("CreateButton")
 						if start then
-							-- method 1 (remote-spy proven): FireServer("start", portal)
-							-- the game itself sends exactly this when Start is clicked
+							-- method 1: click button via firesignal + real mouse
+							-- (firesignal verified working; real click runs full game flow)
+							clickButton(start)
+							print("[AF] Start: clicked")
+							task.wait(1)
+							-- method 2 (remote-spy proven): FireServer("start", portal)
 							if isInLobby() and msEvt and portal then
 								print("[AF] Start: FireServer(start, portal)")
 								pcall(function() msEvt:FireServer("start", portal) end)
-								task.wait(1)
-							end
-							-- method 2 (v12 proven): Fire ALL signals then break
-							pcall(function() start.MouseButton1Down:Fire() end)
-							pcall(function() start.MouseButton1Click:Fire() end)
-							pcall(function() start.MouseButton1Up:Fire() end)
-							pcall(function() start.Activated:Fire() end)
-							print("[AF] Start: Fire signals sent")
-							task.wait(1)
-							-- method 3: VIM real mouse click (Potassium channel)
-							if isInLobby() then
-								pcall(function()
-									UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-									local absPos, absSize = start.AbsolutePosition, start.AbsoluteSize
-									local cx, cy = absPos.X + absSize.X/2, absPos.Y + absSize.Y/2
-									UserInputService:SetMousePosition(Vector2.new(cx, cy))
-									task.wait(0.2)
-									VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, {}, 0)
-									task.wait(0.1)
-									VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, {}, 0)
-								end)
-								print("[AF] Start: VIM click tried")
 								task.wait(1)
 							end
 							-- stop retrying: outer loop retries whole flow if still in lobby
