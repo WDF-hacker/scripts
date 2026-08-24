@@ -726,22 +726,26 @@ local mainThread = task.spawn(function()
 										if c:IsA("ImageButton") and c.Visible then
 											local tl = c:FindFirstChildOfClass("TextLabel")
 											if tl and tl.Text ~= "" and tl.Text ~= "template" then
-												table.insert(available, tl.Text)
+												table.insert(available, { name = tl.Text, btn = c })
 											end
 										end
 									end
 									if #available > 0 then
 										local best, bestScore = nil, -1
-										for _, name in ipairs(available) do
-											local score = UPGRADE_PRIORITY[name] or 0
-											if score > bestScore then best, bestScore = name, score end
+										for _, a in ipairs(available) do
+											local score = UPGRADE_PRIORITY[a.name] or 0
+											if score > bestScore then best, bestScore = a, score end
 										end
 										if not best then best = available[1] end
-										print("[AF] picking upgrade: " .. best)
+										print("[AF] picking upgrade: " .. best.name)
 										task.wait(1.2)
+										-- method 1: click the upgrade button (firesignal + mouse, same as Start)
+										clickButton(best.btn)
+										task.wait(0.5)
+										-- method 2: FireServer by name fallback
 										local upgradesRemote = ReplicatedStorage.Remotes:FindFirstChild("upgrades")
 										if upgradesRemote then
-											pcall(function() upgradesRemote:FireServer(best) end)
+											pcall(function() upgradesRemote:FireServer(best.name) end)
 										end
 										task.wait(0.3)
 										pcall(function()
