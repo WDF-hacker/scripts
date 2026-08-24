@@ -602,14 +602,21 @@ local mainThread = task.spawn(function()
 					if party and party.Visible then
 						local start = party:FindFirstChild("HostButtons") and party.HostButtons:FindFirstChild("CreateButton")
 						if start then
-							-- method 1 (v12 proven): Fire ALL signals then break
+							-- method 1 (remote-spy proven): FireServer("start", portal)
+							-- the game itself sends exactly this when Start is clicked
+							if isInLobby() and msEvt and portal then
+								print("[AF] Start: FireServer(start, portal)")
+								pcall(function() msEvt:FireServer("start", portal) end)
+								task.wait(1)
+							end
+							-- method 2 (v12 proven): Fire ALL signals then break
 							pcall(function() start.MouseButton1Down:Fire() end)
 							pcall(function() start.MouseButton1Click:Fire() end)
 							pcall(function() start.MouseButton1Up:Fire() end)
 							pcall(function() start.Activated:Fire() end)
 							print("[AF] Start: Fire signals sent")
 							task.wait(1)
-							-- method 2: VIM real mouse click (Potassium channel)
+							-- method 3: VIM real mouse click (Potassium channel)
 							if isInLobby() then
 								pcall(function()
 									UserInputService.MouseBehavior = Enum.MouseBehavior.Default
@@ -622,12 +629,6 @@ local mainThread = task.spawn(function()
 									VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, {}, 0)
 								end)
 								print("[AF] Start: VIM click tried")
-								task.wait(1)
-							end
-							-- method 3: FireServer("start", partyData) (Remote not sandbox-limited)
-							if isInLobby() and msEvt then
-								print("[AF] Start: trying FireServer(start)")
-								pcall(function() msEvt:FireServer("start", partyData) end)
 								task.wait(1)
 							end
 							-- stop retrying: outer loop retries whole flow if still in lobby
