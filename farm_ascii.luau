@@ -307,9 +307,10 @@ table.insert(freecam.conns, UserInputService.InputBegan:Connect(function(input)
 	end
 end))
 
--- ========== Button click (Potassium Signal/Input Library) ==========
--- firesignal triggers signal handlers directly (verified on Potassium);
--- mousemoveabs+mouse1click performs a real click
+-- ========== Button click (Potassium Signal Library) ==========
+-- firesignal triggers signal handlers directly (VERIFIED on Potassium:
+-- Start button, upgrade buttons all work with firesignal alone.
+-- mouse1click was removed: it interfered with upgrade selection.)
 local function clickButton(btn)
 	if not btn then return false end
 	if firesignal then
@@ -317,14 +318,6 @@ local function clickButton(btn)
 		pcall(firesignal, btn.MouseButton1Click)
 		pcall(firesignal, btn.MouseButton1Up)
 		pcall(firesignal, btn.Activated)
-	end
-	if mousemoveabs and mouse1click then
-		pcall(function()
-			local absPos, absSize = btn.AbsolutePosition, btn.AbsoluteSize
-			mousemoveabs(absPos.X + absSize.X / 2, absPos.Y + absSize.Y / 2)
-			task.wait(0.1)
-			mouse1click()
-		end)
 	end
 	return true
 end
@@ -739,13 +732,16 @@ local mainThread = task.spawn(function()
 										if not best then best = available[1] end
 										print("[AF] picking upgrade: " .. best.name)
 										task.wait(1.2)
-										-- method 1: click the upgrade button (firesignal + mouse, same as Start)
+										-- method 1: firesignal (VERIFIED: triggers game callback -> FireServer + card display)
 										clickButton(best.btn)
-										task.wait(0.5)
-										-- method 2: FireServer by name fallback
-										local upgradesRemote = ReplicatedStorage.Remotes:FindFirstChild("upgrades")
-										if upgradesRemote then
-											pcall(function() upgradesRemote:FireServer(best.name) end)
+										task.wait(1)
+										-- method 2: only if panel still open (callback missed), FireServer direct
+										if up.Visible then
+											print("[AF] upgrade callback missed, FireServer fallback")
+											local upgradesRemote = ReplicatedStorage.Remotes:FindFirstChild("upgrades")
+											if upgradesRemote then
+												pcall(function() upgradesRemote:FireServer(best.name) end)
+											end
 										end
 										task.wait(0.3)
 										pcall(function()
