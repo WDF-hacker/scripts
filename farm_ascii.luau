@@ -420,8 +420,14 @@ local function handleTitleScreen()
 		end
 		if pb then
 			print("[AF] found title PlayButton")
-			-- method 1: real mouse click (VIM, verified on Potassium)
 			local clicked = false
+			-- method 1: Fire ALL signals (v12 proven path)
+			pcall(function() pb.MouseButton1Down:Fire() end)
+			pcall(function() pb.MouseButton1Click:Fire() end)
+			pcall(function() pb.MouseButton1Up:Fire() end)
+			pcall(function() pb.Activated:Fire() end)
+			task.wait(1)
+			-- method 2: real mouse click (VIM, verified on Potassium)
 			pcall(function()
 				UserInputService.MouseBehavior = Enum.MouseBehavior.Default
 				local absPos, absSize = pb.AbsolutePosition, pb.AbsoluteSize
@@ -448,7 +454,7 @@ local function handleTitleScreen()
 				clicked = true
 				print("[AF] PlayButton clicked")
 			else
-				-- method 2: hide ScreenGui (keep button; game Wait() harmless)
+				-- method 3: hide ScreenGui (keep button; game Wait() harmless)
 				print("[AF] click failed, hide title (keep button)")
 				if pbSg then
 					pcall(function() pbSg.Enabled = false end)
@@ -596,10 +602,13 @@ local mainThread = task.spawn(function()
 					if party and party.Visible then
 						local start = party:FindFirstChild("HostButtons") and party.HostButtons:FindFirstChild("CreateButton")
 						if start then
-							-- method 1: Fire signal (works in some sandboxes)
+							-- method 1 (v12 proven): Fire ALL signals then break
+							pcall(function() start.MouseButton1Down:Fire() end)
 							pcall(function() start.MouseButton1Click:Fire() end)
+							pcall(function() start.MouseButton1Up:Fire() end)
 							pcall(function() start.Activated:Fire() end)
-							task.wait(0.5)
+							print("[AF] Start: Fire signals sent")
+							task.wait(1)
 							-- method 2: VIM real mouse click (Potassium channel)
 							if isInLobby() then
 								pcall(function()
@@ -621,10 +630,9 @@ local mainThread = task.spawn(function()
 								pcall(function() msEvt:FireServer("start", partyData) end)
 								task.wait(1)
 							end
-							if not isInLobby() then
-								started = true
-								break
-							end
+							-- stop retrying: outer loop retries whole flow if still in lobby
+							started = true
+							break
 						end
 					end
 				end
