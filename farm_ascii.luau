@@ -84,6 +84,7 @@ local UPGRADE_PRIORITY = {
 local running = true
 local shootCount = 0
 local phase = "boot"
+local lastAfkInput = os.clock()
 
 local function isInLobby()
 	local gv = ReplicatedStorage:FindFirstChild("GameValues")
@@ -496,6 +497,20 @@ local mainThread = task.spawn(function()
 	end
 	print("[AF] Lobby status: " .. tostring(isInLobby()))
 	while running do
+		-- anti-AFK: prevent Roblox ~20min idle kick (micro mouse move every 4 min)
+		if os.clock() - lastAfkInput > 240 then
+			lastAfkInput = os.clock()
+			pcall(function()
+				if mousemoverel then
+					mousemoverel(0, 3)
+				elseif keypress then
+					keypress(Enum.KeyCode.LeftShift)
+					task.wait(0.1)
+					keyrelease(Enum.KeyCode.LeftShift)
+				end
+			end)
+			print("[AF] anti-AFK ping")
+		end
 		if isInLobby() then
 			-- ===== Lobby phase =====
 			phase = "lobby"
