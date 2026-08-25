@@ -323,6 +323,72 @@ local function clickButton(btn)
 	return true
 end
 
+-- ========== Watch ad for 30-min coin boost ==========
+-- The lobby has a SurfaceGui ad sign with option buttons.
+-- Flow: click "Coin Boost (30 minutes)" -> game checks ad availability ->
+--   if available: Frame2 (Confirm watch ad) appears -> click confirm ->
+--     client UI instantly restores, server grants reward via RewardedAdEvent.
+--   if not available: Frame3 ("Sorry no ads") shows -> skip.
+local function findAdSign()
+	local lobby = Workspace:FindFirstChild("Lobby")
+	if not lobby then return nil end
+	local sign = nil
+	local function scan(x, depth)
+		if depth > 5 then return end
+		for _, c in ipairs(x:GetChildren()) do
+			if not sign and c:IsA("SurfaceGui") then
+				local f1 = c:FindFirstChild("Frame1")
+				if f1 then
+					for _, b in ipairs(f1:GetChildren()) do
+						if b:IsA("TextButton") and tostring(b.Text):find("Coin Boost") then
+							sign = c
+							return
+						end
+					end
+				end
+			end
+			scan(c, depth + 1)
+		end
+	end
+	scan(lobby, 0)
+	return sign
+end
+
+local function tryWatchAd()
+	local sign = findAdSign()
+	if not sign then return end
+	local f1 = sign:FindFirstChild("Frame1")
+	local f2 = sign:FindFirstChild("Frame2")
+	local coinBtn = nil
+	if f1 then
+		for _, b in ipairs(f1:GetChildren()) do
+			if b:IsA("TextButton") and tostring(b.Text):find("Coin Boost") then
+				coinBtn = b
+				break
+			end
+		end
+	end
+	if not coinBtn then return end
+	-- click Coin Boost -> triggers checkForAds()
+	clickButton(coinBtn)
+	task.wait(2.5)
+	-- if confirm window appeared, ad is available -> confirm it
+	local confirm = f2 and f2:FindFirstChild("confirm")
+	if confirm and confirm.Visible and f2 and f2.Visible then
+		clickButton(confirm)
+		print("[AF] watched ad (30min coin boost)")
+		-- server grants reward; client UI already restored, no manual close needed
+		task.wait(2)
+	else
+		print("[AF] no ad available (skip)")
+		-- cancel confirm if somehow open, then continue
+		local cancel = f2 and f2:FindFirstChild("cancel")
+		if cancel and cancel.Visible then
+			clickButton(cancel)
+		end
+	end
+end
+
 -- ========== Lobby UI ops ==========
 local function closePanel(name)
 	local ev = LocalPlayer.PlayerGui:FindFirstChild("Everything")
@@ -519,6 +585,8 @@ local mainThread = task.spawn(function()
 			task.wait(1)
 			-- retry title screen if first attempt incomplete
 			handleTitleScreen()
+			-- watch ad for 30-min coin boost (skips if no ad available)
+			tryWatchAd()
 			-- wait lobby UI ready (Everything panel exists)
 			local tUi = os.clock()
 			while running and os.clock() - tUi < 15 do
