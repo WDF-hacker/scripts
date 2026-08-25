@@ -2,6 +2,27 @@
 -- Usage: put in Potassium autoexec, runs automatically each game join
 -- Features: auto detect lobby/match, auto join (Shrine Extreme), client platform + big circle move, Tesla 8x instant attack,
 --       auto upgrade pick (money>dmg>xp), auto teleportback on match end, Freecam (V key)
+
+-- ========== Only run in the Noob Mayhem game ==========
+-- If this is NOT the target game, bail out immediately so the script
+-- never touches other games when left in autoexec.
+local function isNoobMayhem()
+	-- known place ids for this game (most reliable)
+	if game.PlaceId == 107727386530697 or game.PlaceId == 120570010222123 then
+		return true
+	end
+	-- fallback: match by name (case-insensitive English keywords)
+	local n = string.lower(tostring(game.Name))
+	return n:find("mayhem", nil, true) ~= nil
+		or n:find("noob", nil, true) ~= nil
+end
+
+if not isNoobMayhem() then
+	print("[AF] not Noob Mayhem (" .. tostring(game.Name) .. " #" .. tostring(game.PlaceId) .. "), skip")
+	return
+end
+print("[AF] Noob Mayhem detected (" .. tostring(game.Name) .. " #" .. tostring(game.PlaceId) .. ")")
+
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
