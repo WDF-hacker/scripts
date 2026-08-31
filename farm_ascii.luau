@@ -69,11 +69,18 @@ if not LocalPlayer then
 end
 print("[AF] LocalPlayer ready: " .. LocalPlayer.Name)
 
--- ========== CONFIG (change MAP to pick which map to farm) ==========
-local CONFIG = {
-	MAP = "Glass Houses",   -- "The Shrine" / "Glass Houses"
+-- ========== CONFIG ==========
+-- External config (set by the loader via _G.AF_CONFIG) takes priority.
+-- If absent, the defaults below apply.
+local CONFIG = _G.AF_CONFIG or {
+	MAP = "The Shrine",
 	MODE = "Extreme",
 }
+if _G.AF_CONFIG then
+	print("[AF] config from loader: MAP=" .. tostring(CONFIG.MAP) .. " MODE=" .. tostring(CONFIG.MODE))
+else
+	print("[AF] config default: MAP=" .. tostring(CONFIG.MAP) .. " MODE=" .. tostring(CONFIG.MODE))
+end
 
 local PLATFORM_SIZE = Vector3.new(20, 2, 20)
 
