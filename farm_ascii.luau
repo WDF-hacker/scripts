@@ -139,11 +139,13 @@ local MAP_CONFIGS = {
 	["The Shrine"] = {
 		PLATFORM_Y = 201.3, CIRCLE_Y = 204.3,
 		CIRCLE_RADIUS = 50, CIRCLE_PERIOD = 20,
+		PORTAL_INDEX = 4,
 		PRIORITY = SHRINE_UPGRADE,
 	},
 	["Glass Houses"] = {
 		PLATFORM_Y = 180, CIRCLE_Y = 183,
 		CIRCLE_RADIUS = 85, CIRCLE_PERIOD = 12,
+		PORTAL_INDEX = 12,
 		PRIORITY = GLASS_UPGRADE,
 	},
 }
@@ -617,7 +619,7 @@ local mainThread = task.spawn(function()
 			local mapselection = ReplicatedStorage.Remotes:FindFirstChild("mapselection")
 			local lobby = Workspace:FindFirstChild("Lobby")
 			local portals = lobby and lobby:FindFirstChild("portals")
-			local portal = portals and portals:GetChildren()[4]
+			local portal = portals and portals:GetChildren()[MC.PORTAL_INDEX]
 			-- wait for server "select" event (records u222), short wait
 			local serverU222 = nil
 			local selConn = nil
