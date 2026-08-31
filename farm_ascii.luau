@@ -637,12 +637,12 @@ local mainThread = task.spawn(function()
 			end
 			if mapselection then
 				pcall(function()
-					-- portal may be nil (lobby structure varies); prefer server u222, else nil or portal
-					mapselection:FireServer("select", serverU222 or portal, {
+					-- always use the fixed portal (beach corner, away from crowds)
+					mapselection:FireServer("select", portal, {
 						map = MAP, sandbox = "Grass", mode = MODE, rank = 1, partysize = 1
 					})
 				end)
-				print("[AF] map request: " .. MAP .. " " .. MODE .. " (u222=" .. tostring(serverU222 ~= nil) .. " portal=" .. tostring(portal ~= nil) .. ")")
+				print("[AF] map request: " .. MAP .. " " .. MODE .. " (portal=" .. tostring(portal ~= nil) .. ")")
 			end
 			-- wait for party + start (Start button click or "start" Remote)
 			local t0 = os.clock()
