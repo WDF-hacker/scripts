@@ -69,18 +69,17 @@ if not LocalPlayer then
 end
 print("[AF] LocalPlayer ready: " .. LocalPlayer.Name)
 
--- Config
-local PLATFORM_Y = 201.3
-local PLATFORM_SIZE = Vector3.new(20, 2, 20)
-local MAP = "The Shrine"
-local MODE = "Extreme"
-local CIRCLE_RADIUS = 50
-local CIRCLE_Y = 204.3
-local CIRCLE_PERIOD = 20
-local CIRCLE_POINTS = 72
+-- ========== CONFIG (change MAP to pick which map to farm) ==========
+local CONFIG = {
+	MAP = "Glass Houses",   -- "The Shrine" / "Glass Houses"
+	MODE = "Extreme",
+}
 
--- ========== Upgrade priority ==========
-local UPGRADE_PRIORITY = {
+local PLATFORM_SIZE = Vector3.new(20, 2, 20)
+
+-- ========== Per-map configs ==========
+-- The Shrine: small circle, keep original priority
+local SHRINE_UPGRADE = {
 	["Treasure Chest"] = 100, ["Bloxy Cola"] = 95,
 	["Glass Cannon"] = 90, ["Red Stratobloxxer"] = 85, ["Subspace Mine"] = 80,
 	["Spectral Sword"] = 75, ["Epic Sauce"] = 70, ["Leprechaun Potion"] = 70,
@@ -100,6 +99,57 @@ local UPGRADE_PRIORITY = {
 	["Frost Potion"] = 5, ["Fire Extinguisher"] = 5, ["Superhero Potion"] = 5,
 	["Antidote"] = 5, ["C4"] = 5,
 }
+
+-- Glass Houses: Coin > XP(level) > armor dmg > damage misc > point > rest
+local GLASS_UPGRADE = {
+	["Treasure Chest"] = 100,	-- 10% more coins
+	["RedBLOX"] = 95,			-- 10% more EXP (level matters most)
+	["Spectral Sword"] = 90,	-- armored enemies +15% dmg (armor-heavy map)
+	["Glass Cannon"] = 85,		-- +20% dmg
+	["Red Stratobloxxer"] = 82,	-- +5% dmg
+	["Precise Bow"] = 78,		-- crit dmg
+	["Pinata"] = 75,
+	["Roblox Card"] = 70,
+	["Bloxy Cola"] = 65,		-- 10% more points
+	["Subspace Mine"] = 60,
+	["Epic Sauce"] = 55, ["Leprechaun Potion"] = 55,
+	["Crimson Staff"] = 50, ["Woodland Staff"] = 50, ["Azure Staff"] = 50,
+	["Dark Age Sunfire Scroll"] = 45, ["Rocket"] = 45, ["Gravitron"] = 45, ["Celestial Staff"] = 45,
+	["Ghostfire Sword"] = 40, ["Elemental Sword"] = 40, ["Zombie Staff"] = 40,
+	["Vampire Cloak"] = 40, ["Mostly Ghostly Potion"] = 40,
+	["Noobcaik"] = 35, ["Instant Campfire"] = 35, ["Phoenix"] = 35,
+	["Battle Armor"] = 30, ["Decoy Deploy"] = 30,
+	["Forbidden Box"] = 25, ["Quantum Entangler"] = 25, ["Healing Potion"] = 25,
+	["Regen Coil"] = 25, ["Battle Shield"] = 25, ["Wind Staff"] = 20,
+	["Speed Coil"] = 20, ["Slateskin Potion"] = 15, ["Super Speedy Purple Potion"] = 15,
+	["Bloxiade"] = 15, ["Starblox Latte"] = 15, ["Rainbow Magic Carpet"] = 10,
+	["Ninja Blink Potion"] = 10, ["Gravity Coil"] = 10, ["Trowel"] = 10,
+	["Frost Potion"] = 5, ["Fire Extinguisher"] = 5, ["Superhero Potion"] = 5,
+	["Antidote"] = 5, ["C4"] = 5,
+}
+
+local MAP_CONFIGS = {
+	["The Shrine"] = {
+		PLATFORM_Y = 201.3, CIRCLE_Y = 204.3,
+		CIRCLE_RADIUS = 50, CIRCLE_PERIOD = 20,
+		PRIORITY = SHRINE_UPGRADE,
+	},
+	["Glass Houses"] = {
+		PLATFORM_Y = 180, CIRCLE_Y = 183,
+		CIRCLE_RADIUS = 85, CIRCLE_PERIOD = 12,
+		PRIORITY = GLASS_UPGRADE,
+	},
+}
+
+local MAP = CONFIG.MAP
+local MODE = CONFIG.MODE
+local MC = MAP_CONFIGS[MAP] or MAP_CONFIGS["The Shrine"]
+local PLATFORM_Y = MC.PLATFORM_Y
+local CIRCLE_Y = MC.CIRCLE_Y
+local CIRCLE_RADIUS = MC.CIRCLE_RADIUS
+local CIRCLE_PERIOD = MC.CIRCLE_PERIOD
+local CIRCLE_POINTS = 72
+local UPGRADE_PRIORITY = MC.PRIORITY
 
 -- ========== State ==========
 local running = true
@@ -142,11 +192,17 @@ local function ensureEquipped()
 	return getWeapon()
 end
 
+-- priority order: Sniper > Healer > TankNoob > TriWalker > BombNoob > TankBot > nearest
+local KILL_PRIORITY = { "sniper", "healer", "tanknoob", "triwalker", "bombnoob", "tankbot" }
+
 local function getNearestHead(origin)
 	local allNoobs = Workspace:FindFirstChild("Allnoobs")
 	if not allNoobs then return nil, nil end
-	local nearestPart, nearestPos, nearestDist = nil, nil, math.huge
-	local healerPart, healerPos, healerDist = nil, nil, math.huge
+	local picks = {}
+	for _, k in ipairs(KILL_PRIORITY) do
+		picks[k] = { d = math.huge }
+	end
+	local nearestPart, nearestPos, nearestHum, nearestDist = nil, nil, nil, math.huge
 	for _, noob in ipairs(allNoobs:GetChildren()) do
 		if noob:IsA("Model") then
 			local hum = noob:FindFirstChild("Humanoid")
@@ -154,28 +210,31 @@ local function getNearestHead(origin)
 				local head = noob:FindFirstChild("Head") or noob:FindFirstChild("HumanoidRootPart")
 				if head and head:IsA("BasePart") then
 					local dist = (head.Position - origin).Magnitude
-					-- healer (HealerNoob) highest priority: track separately
-					if noob.Name == "HealerNoob" then
-						if dist < healerDist then
-							healerDist = dist
-							healerPart = head
-							healerPos = head.Position
+					local n = string.lower(tostring(noob.Name))
+					for _, k in ipairs(KILL_PRIORITY) do
+						if n:find(k) then
+							if dist < picks[k].d then
+								picks[k] = { d = dist, part = head, pos = head.Position, hum = hum }
+							end
+							break
 						end
 					end
 					if dist < nearestDist then
 						nearestDist = dist
 						nearestPart = head
 						nearestPos = head.Position
+						nearestHum = hum
 					end
 				end
 			end
 		end
 	end
-	-- healer beats nearest target
-	if healerPart then
-		return healerPart, healerPos
+	for _, k in ipairs(KILL_PRIORITY) do
+		if picks[k].part then
+			return picks[k].part, picks[k].pos, picks[k].hum
+		end
 	end
-	return nearestPart, nearestPos
+	return nearestPart, nearestPos, nearestHum
 end
 
 -- ========== Platform ==========
@@ -682,19 +741,25 @@ local mainThread = task.spawn(function()
 			local t0 = os.clock()
 			while running and not isInLobby() do
 				local now = os.clock()
-				-- 1) attack (8x per target; getNearestHead is Healer-first)
+				-- 1) attack (priority: Sniper > Healer > TankNoob > TriWalker > BombNoob > TankBot > nearest)
 				local w = getWeapon()
 				if w and currentSend then
 					local handle = w:FindFirstChild("Handle")
 					local fp = handle and handle:FindFirstChild("GunFirePoint")
 					if fp then
 						local origin = fp.WorldPosition
-						local targetPart, targetPos = getNearestHead(origin)
+						local targetPart, targetPos, targetHum = getNearestHead(origin)
 						if targetPart and targetPos then
 							local data = { position = origin, target = targetPart, hitposition = targetPos, weapon = w }
 							for i = 1, 8 do
 								pcall(function() currentSend(data) end)
 								shootCount = shootCount + 1
+							end
+							-- TankNoob: after dealing damage, zero its health (fast kill; no coin reward anyway)
+							local tn = targetHum and targetPart.Parent and targetPart.Parent.Name or ""
+							if targetHum and string.lower(tostring(tn)):find("tanknoob") then
+								task.wait(0.15)
+								pcall(function() targetHum.Health = 0 end)
 							end
 						end
 					end
@@ -800,6 +865,21 @@ local mainThread = task.spawn(function()
 						task.wait(2)
 					end
 					break
+				end
+
+				-- 5) auto-skip NPC dialogue (Noob Captain) to save time
+				local evNow = LocalPlayer.PlayerGui:FindFirstChild("Everything")
+				local dlg = evNow and evNow:FindFirstChild("Dialogue")
+				local dlgVisible = dlg and dlg.Visible or false
+				if dlgVisible and not _G.AF_dlgSkipped then
+					_G.AF_dlgSkipped = true
+					local skip = dlg:FindFirstChild("SkipButton")
+					if skip then
+						clickButton(skip)
+						print("[AF] dialogue skipped")
+					end
+				elseif not dlgVisible then
+					_G.AF_dlgSkipped = nil
 				end
 
 				task.wait(0.016)
