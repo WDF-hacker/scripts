@@ -10,13 +10,19 @@ Boot camp / Basic controls 自动刷钱常驻循环
   * 建房: lobby.room_create:FireServer({{index="inviteOnly",value=false},{index="groupId",value="Campaign"}})
   * 选图: lobby.room_edit:InvokeServer("map", "Boot camp", 1)  (返回 0=成功, 强制 modeId=5)
   * 开局: lobby.room_start:FireServer()  → teleport 到对局服务器
-  * 跳过教程对白: firesignal(Cutscene.Fade) 数次
+  * 跳过教程对白: require(Cutscene.CutsceneUI):procced() 直调(绕过点击 guard, 秒跳)
   * 移动: inGame.actions.Move:FireServer(队id, {tile...})  每回合 1 次移动, MP=2
-  * 结束回合: inGame.Voting:FireServer()  (敌回合约 9 秒)
+  * 结束回合: inGame.Voting:FireServer()  (敌回合约 5-6 秒)
   * 占领: 需新回合(未移动)且与建筑相邻(manhattan==1): inGame.actions.Capture:FireServer(队id, 建筑id)
   * 回大厅: inGame.ReturnBack:FireServer()
   * 结算: WinGui.MainFrame.Title 含 "VICTORY"/"DEFEAT ... turns"
 ]]
+
+-- 游戏检测(与 AF 云端脚本相同模式): 只对 战斗中的新手 (Noobs in Combat) 生效
+if game.PlaceId ~= 5734383673 then
+  print("[NIC] not Noobs in Combat (Place " .. tostring(game.PlaceId) .. "), skip")
+  return
+end
 
 local NIC = _G.NIC_AF
 if NIC and NIC.thread then
