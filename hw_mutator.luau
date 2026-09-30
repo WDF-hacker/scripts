@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 29
+local VERSION = 30
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -77,6 +77,8 @@ end
 
 --============================================================== 状态容器（_G 防重载孤儿）
 local GLOBAL_KEY = "HW_MUTATOR"
+-- 专属魔数：killOrphans 只认带这个键的表，绝不误伤别的脚本的状态表
+local MAGIC = "hw_mutator.by.wdf.place.74729868188364"
 _G[GLOBAL_KEY] = _G[GLOBAL_KEY] or {}
 local R = _G[GLOBAL_KEY]
 
@@ -87,6 +89,7 @@ if R.version and R.version >= VERSION and R.alive then
 end
 if R.destroy then pcall(R.destroy) end
 
+R.__HW_MAGIC = MAGIC
 R.version = VERSION
 R.alive = true
 R.gen = (R.gen or 0) + 1
@@ -109,12 +112,11 @@ local function killOrphans()
     for _, obj in ipairs(list) do
         if type(obj) == "table" and obj ~= R then
             local ok2, looksOurs = pcall(function()
-                return type(rawget(obj, "version")) == "number"
+                -- ⚠ 只认专属魔数。以前靠"形状"猜测（version/destroy/threads/hotbar/candidates），
+                --   理论上可能误伤别的脚本的状态表（人家的 hub 也可能有这些键），
+                --   误调人家的 destroy() 就等于把别人的脚本关掉了。
+                return rawget(obj, "__HW_MAGIC") == MAGIC
                     and type(rawget(obj, "destroy")) == "function"
-                    and type(rawget(obj, "threads")) == "table"
-                    and type(rawget(obj, "hotbar")) == "table"
-                    and type(rawget(obj, "candidates")) == "table"
-                    and rawget(obj, "alive") ~= nil
             end)
             if ok2 and looksOurs then
                 local ok3 = pcall(function()
@@ -1446,24 +1448,48 @@ local function readUIIntoCfg()
     end)
 end
 
--- 清扫残留的 Obsidian ScreenGui（历史上 UI 堆积的遗留）
-local function cleanupStaleObsidianUI()
-    local containers = {}
+--============================================================== 只碰"我们自己的" UI
+-- ⚠ 惨痛教训：以前这里按 `c.Name == "Obsidian"` 删除 ScreenGui，
+--   结果把别人的 hub（例如 Ouroboros 也是 Obsidian 写的）的界面一起删了，
+--   用户以为自己的挂机脚本"被顶掉了"。
+--   现在改成：创建时给自己的 ScreenGui 打一个专属属性标记，清理时只删带标记的。
+local UI_MARK = "HW_MutatorOwned"
+
+local function uiContainers()
+    local t = {}
     pcall(function()
         local h = gethui and gethui()
-        if h then containers[#containers + 1] = h end
+        if h then t[#t + 1] = h end
     end)
-    pcall(function() containers[#containers + 1] = game:GetService("CoreGui") end)
+    pcall(function() t[#t + 1] = game:GetService("CoreGui") end)
     local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if pg then containers[#containers + 1] = pg end
+    if pg then t[#t + 1] = pg end
+    return t
+end
 
-    local seen, removed = {}, 0
-    for _, cont in ipairs(containers) do
+-- 记录当前已存在的所有 ScreenGui（用于"加载库之后找出新增的那个 = 我们的"）
+local function snapshotGuiSet()
+    local set = {}
+    for _, cont in ipairs(uiContainers()) do
         for _, c in ipairs(cont:GetChildren()) do
-            if c:IsA("ScreenGui") and c.Name == "Obsidian" and not seen[c] then
-                seen[c] = true
-                pcall(function() c:Destroy() end)
-                removed = removed + 1
+            if c:IsA("ScreenGui") then set[c] = true end
+        end
+    end
+    return set
+end
+
+-- 只清扫"我们自己"上次重载留下的残留（带 UI_MARK 的），绝不碰别人的 UI
+local function cleanupStaleObsidianUI()
+    local removed = 0
+    for _, cont in ipairs(uiContainers()) do
+        for _, c in ipairs(cont:GetChildren()) do
+            if c:IsA("ScreenGui") then
+                local marked = false
+                pcall(function() marked = c:GetAttribute(UI_MARK) ~= nil end)
+                if marked then
+                    pcall(function() c:Destroy() end)
+                    removed = removed + 1
+                end
             end
         end
     end
@@ -1475,7 +1501,8 @@ local function buildUI()
     -- ⚠ 必须在加载 Obsidian 之前清扫：库在 loadstring 执行时就会创建自己的
     --   "Obsidian" ScreenGui，若在之后清扫会把新建的也一起删掉（导致 UI 消失）
     local stale = cleanupStaleObsidianUI()
-    if stale > 0 then print(PREFIX .. " 清理残留 Obsidian UI: " .. stale .. " 个") end
+    if stale > 0 then print(PREFIX .. " 清理自家残留 UI: " .. stale .. " 个") end
+    local preGuiSet = snapshotGuiSet()          -- 加载前快照，用来认出"新增的那个"
 
     local Library = loadObsidianLib("Library")
     if not Library then
@@ -1497,6 +1524,22 @@ local function buildUI()
     })
     R._library = Library
     R.window = Window
+
+    -- 给"我们自己的"那个 ScreenGui 打标记（加载前的快照里没有、现在新出现的）
+    do
+        local mine
+        for _, cont in ipairs(uiContainers()) do
+            for _, c in ipairs(cont:GetChildren()) do
+                if c:IsA("ScreenGui") and not preGuiSet[c] and c.Name:find("Obsidian") then
+                    mine = c
+                end
+            end
+        end
+        if mine then
+            pcall(function() mine:SetAttribute(UI_MARK, tostring(VERSION)) end)
+            R._uiGui = mine
+        end
+    end
 
     local Tabs = {
         Main = Window:AddTab("主控", "crosshair"),
@@ -1954,10 +1997,15 @@ R.destroy = function()
     pcall(doRelease)
     if R.restoreClientInsertHooks then pcall(R.restoreClientInsertHooks) end
     if R.unhookHotbar then pcall(R.unhookHotbar) end
+    -- 卸载时只销毁"我们标记过的"那个 ScreenGui（Library:Unload 本身也是只删自己那个，安全）
+    if R._uiGui then
+        local okMark = false
+        pcall(function() okMark = R._uiGui:GetAttribute(UI_MARK) ~= nil end)
+        if okMark then pcall(function() R._uiGui:Destroy() end) end
+        R._uiGui = nil
+    end
     if R._library then
         if R._library.Unload then pcall(function() R._library:Unload() end) end
-        local sg = R._library.ScreenGui
-        if sg then pcall(function() sg:Destroy() end) end
     end
     R.renderStatus, R.renderLog, R.notify, R.resurface = nil, nil, nil, nil
     print(PREFIX .. " destroyed")
