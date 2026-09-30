@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 25
+local VERSION = 27
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -177,6 +177,8 @@ local DEFAULT_CONFIG = {
     rarities = { Ancient = true, Celestial = true },
     targets = { Dracula = true, Demonic = true },
     releaseOnEventEnd = true,
+    releaseForeignHold = true,      -- 连你手动手持的角色也一起放手（非万圣节期间）
+    nativeSelectionFrame = true,    -- 自动手持时显示和手动一样的原生蓝框
     releaseLeadSeconds = 1,
     -- 快捷栏管理
     autoStorePotions = true,
@@ -403,6 +405,168 @@ local function detectMutation(baseline, summary, name)
     return hits
 end
 
+--============================================================== 客户端环境 / 原生蓝框
+-- 实测：游戏客户端把它所有可编程入口挂在**它自己的 _G** 上（110 个 CF_/__BP_ 键，例如
+--   CF_BackpackClearSelection / CF_BackpackGetSelected / __BP_ForceHotbarSlots）。
+-- 执行器的 _G ≠ 客户端的 _G（实测 _G == getgenv() 为 false），往自己的 _G 写 __BP_* 客户端读不到。
+-- 但**函数/表对象本身是共享的** -> 用 getgc 扫出那张表，就能直接调用客户端内部函数。
+-- 蓝框机制（BackpackClientService:3758 applySelectionVisuals）：
+--   u166 = 当前选中的 key；函数遍历 u172[key]->按钮，非 u166 的销毁 SelectionStroke，
+--   给 u166 的按钮 applySelectionStroke()。u166 是 setSelected/applySelectionVisuals 的**共享 upvalue**
+--   -> 用 debug.setupvalue 写入它 = 和手动点击一模一样的原生蓝框。
+local CLIENT_G = nil
+local CLIENT_SEL = { visit = nil, idx = nil, lastScan = 0, ok = false }
+
+local function findClientG()
+    if type(getgc) ~= "function" then return nil end
+    local ok, objs = pcall(getgc, true)
+    if not ok or type(objs) ~= "table" then return nil end
+    for _, obj in ipairs(objs) do
+        if type(obj) == "table" then
+            local got = false
+            pcall(function() got = type(rawget(obj, "CF_BackpackClearSelection")) == "function" end)
+            if got then return obj end
+        end
+    end
+    return nil
+end
+
+local function clientG()
+    if CLIENT_G then
+        local alive = false
+        pcall(function() alive = type(rawget(CLIENT_G, "CF_BackpackClearSelection")) == "function" end)
+        if alive then return CLIENT_G end
+        CLIENT_G = nil
+    end
+    -- 复用上一个实例（重载时不重复扫 60 万对象）
+    local shared = _G.__HW_CLIENT_G
+    if type(shared) == "table" then
+        local ok = false
+        pcall(function() ok = type(rawget(shared, "CF_BackpackClearSelection")) == "function" end)
+        if ok then CLIENT_G = shared return CLIENT_G end
+    end
+    local now = os.clock()
+    if now - (CLIENT_SEL.lastScan or 0) < 30 then return nil end   -- 要扫 60 万+ 对象，别太勤
+    CLIENT_SEL.lastScan = now
+    CLIENT_G = findClientG()
+    if CLIENT_G then
+        _G.__HW_CLIENT_G = CLIENT_G
+        if not CLIENT_SEL.announced then
+            CLIENT_SEL.announced = true
+            log("已定位客户端环境表（原生选中/蓝框已解锁）", Color3.fromRGB(120, 255, 140))
+        end
+    end
+    return CLIENT_G
+end
+
+-- applySelectionVisuals = CF_BackpackClearSelection 的 upvalue 里那个 function
+local function selectionVisuals()
+    if CLIENT_SEL.visit then return CLIENT_SEL.visit end
+    local g = clientG()
+    if not g then return nil end
+    local clearFn = rawget(g, "CF_BackpackClearSelection")
+    if type(clearFn) ~= "function" then return nil end
+    for i = 1, 6 do
+        local v = debug.getupvalue(clearFn, i)
+        if type(v) == "function" then
+            CLIENT_SEL.visit = v
+            return v
+        end
+    end
+    return nil
+end
+
+-- 保底：原生不可用时，自己在对应槽位上画一个描边
+local function drawOwnStroke(key)
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local mg = pg and pg:FindFirstChild("MainGui")
+    local bar = mg and mg:FindFirstChild("BackpackHotBar")
+    if not bar then return false end
+    local done = false
+    for _, slot in ipairs(bar:GetChildren()) do
+        if slot.Name:match("^Slot_%d+$") then
+            local old = slot:FindFirstChild("HW_HeldStroke")
+            if old then pcall(function() old:Destroy() end) end
+            if key ~= nil and slot:GetAttribute("BoundKey") == key then
+                local st = Instance.new("UIStroke")
+                st.Name = "HW_HeldStroke"
+                st.Color = Color3.fromRGB(90, 180, 255)
+                st.Thickness = 2
+                st.Transparency = 0.12
+                st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+                st.Parent = slot
+                done = true
+            end
+        end
+    end
+    return done
+end
+
+local function clearOwnStroke()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local mg = pg and pg:FindFirstChild("MainGui")
+    local bar = mg and mg:FindFirstChild("BackpackHotBar")
+    if not bar then return end
+    for _, slot in ipairs(bar:GetChildren()) do
+        local old = slot:FindFirstChild("HW_HeldStroke")
+        if old then pcall(function() old:Destroy() end) end
+    end
+end
+
+-- 让游戏把某个 key 显示为"选中"（原生蓝框）
+local function clientSetSelected(key)
+    if cfg.nativeSelectionFrame == false then return false end
+    local g = clientG()
+    if not g then return drawOwnStroke(key) end
+    local visit = selectionVisuals()
+    if not visit then return drawOwnStroke(key) end
+    local getSel = rawget(g, "CF_BackpackGetSelected")
+
+    local function verify()
+        if type(getSel) ~= "function" then return true end
+        local ok, sel = pcall(getSel)
+        return ok and sel == key
+    end
+
+    -- 已缓存索引：直接写
+    if CLIENT_SEL.idx then
+        pcall(debug.setupvalue, visit, CLIENT_SEL.idx, key)
+        if verify() then
+            pcall(visit)
+            clearOwnStroke()
+            return true
+        end
+        CLIENT_SEL.idx = nil
+    end
+
+    -- 逐个尝试"值为 nil"的 upvalue，并用 GetSelected 验证（u166 当前必然为 nil）
+    for i = 1, 14 do
+        local v = debug.getupvalue(visit, i)
+        if v == nil then
+            pcall(debug.setupvalue, visit, i, key)
+            if verify() then
+                CLIENT_SEL.idx = i
+                pcall(visit)
+                clearOwnStroke()
+                return true
+            end
+            pcall(debug.setupvalue, visit, i, nil)
+        end
+    end
+    return drawOwnStroke(key)
+end
+
+local function clientClearSelection()
+    clearOwnStroke()
+    local g = clientG()
+    if not g then return false end
+    local clearFn = rawget(g, "CF_BackpackClearSelection")
+    if type(clearFn) == "function" then
+        return pcall(clearFn)
+    end
+    return false
+end
+
 --============================================================== 手持控制
 local function applyHold(key, name, rarity)
     doHold(key)
@@ -410,15 +574,37 @@ local function applyHold(key, name, rarity)
     R.hold.since = os.clock()
     R.hold.misses = 0
     R.hold.baseline = baselineFor(R.summary, name)
+    R.hold.adopted = false
     R.stats.attempts = R.stats.attempts + 1
+    clientSetSelected(key)          -- 原生蓝框（和手动点击一样）
+end
+
+-- 你手动手持了某个候选角色 -> 直接接管，不重复发包、不跟你抢
+local function adoptHold(key, name, rarity)
+    R.hold.key, R.hold.name, R.hold.rarity = key, name, rarity
+    R.hold.since = os.clock()
+    R.hold.misses = 0
+    R.hold.baseline = baselineFor(R.summary, name)
+    R.hold.adopted = true
+    clientSetSelected(key)
+    log("接替你手动手持的 " .. name .. " [" .. tostring(rarity) .. "]", Color3.fromRGB(140, 220, 255))
 end
 
 local function applyRelease(reason)
-    if R.hold.key then
-        doRelease()
-        log("放手 " .. tostring(R.hold.name) .. (reason and ("（" .. reason .. "）") or ""))
+    -- ⚠ 修复：以前只在 R.hold.key 存在时才 doRelease()，
+    --   所以你手动手持时点界面上的"放手"按钮完全没有反应。
+    --   现在无论是不是本脚本所持，都真发一次放手。
+    local who = R.hold.name or R.hold.foreignName
+    doRelease()
+    if who then
+        log("放手 " .. tostring(who) .. (reason and ("（" .. reason .. "）") or ""))
+    elseif reason then
+        log("放手（" .. reason .. "）")
     end
     R.hold.key, R.hold.name, R.hold.rarity, R.hold.baseline, R.hold.misses = nil, nil, nil, nil, 0
+    R.hold.foreignName = nil
+    R.hold.adopted = false
+    clientClearSelection()
 end
 
 local function refreshCandidates()
@@ -909,7 +1095,10 @@ local function updateEventFromTable(t)
     R.event.active = (active == true) and (name ~= nil)
     R.event.name = name
     R.event.title = (t.eventTitle and tostring(t.eventTitle)) or (t.gradientName and tostring(t.gradientName)) or name
-    if remaining then R.event.remaining = remaining end
+    if remaining then
+        R.event.remaining = remaining
+        R.event.at = os.clock()      -- 打锚点：显示时按本地时钟平滑推算，避免一跳一跳
+    end
     if tonumber(t.duration) then R.event.duration = tonumber(t.duration) end
 end
 
@@ -930,12 +1119,23 @@ do
     end
 end
 
+-- 平滑剩余秒数：服务器每秒才推一次、我们又只 5 秒轮询一次，
+-- 直接用原值会让界面倒计时"一卡一卡"。这里用"上次读数 + 本地时钟差"推算。
+local function eventRemaining()
+    local r = tonumber(R.event.remaining) or 0
+    if R.event.active and R.event.at then
+        r = r - (os.clock() - R.event.at)
+    end
+    return math.max(0, r)
+end
+R.eventRemaining = eventRemaining
+
 local function isHalloween()
     if R._force then
         if os.clock() < (R._force.until_ or 0) then return R._force.name == EVENT_NAME end
         R._force = nil
     end
-    return R.event.active and R.event.name == EVENT_NAME and (tonumber(R.event.remaining) or 0) > 0
+    return R.event.active and R.event.name == EVENT_NAME and eventRemaining() > 0
 end
 
 --============================================================== 主循环
@@ -992,7 +1192,7 @@ local function tick()
     local now = os.clock()
     takeoverClientInsertHooks()
 
-    if not R._lastEventPoll or now - R._lastEventPoll > 5 then
+    if not R._lastEventPoll or now - R._lastEventPoll > 2 then
         R._lastEventPoll = now
         refreshEvent()
     end
@@ -1010,11 +1210,39 @@ local function tick()
     local forced = R._force ~= nil and os.clock() < (R._force.until_ or 0)
     local halloween = isHalloween()
     local lead = tonumber(cfg.releaseLeadSeconds) or 0
-    local ending = (not forced) and halloween and (tonumber(R.event.remaining) or 0) <= lead
+    local ending = (not forced) and halloween and eventRemaining() <= lead
     local live = halloween and not ending
 
     if not live then
-        if R.hold.key and cfg.releaseOnEventEnd then
+        -- 分级策略（既安全又不打扰）：
+        --   * 有"别的突变事件"在跑  -> 你手动持的角色有被烧的风险 -> 按开关自动放手
+        --   * 没有任何事件          -> 根本不会被烧 -> 脚本完全不干预，你可以自由看/用你的角色
+        local curName = heldName()
+        local holdingOurs = R.hold.key ~= nil
+        local holdingForeign = (not holdingOurs) and curName ~= nil
+        local evName = R.event.active and R.event.name or nil
+        local evRunning = evName ~= nil and eventRemaining() > 0
+        local releaseForeign = false
+
+        if holdingForeign then
+            R.hold.foreignName = curName
+            if evRunning then
+                releaseForeign = (cfg.releaseForeignHold ~= false)
+                if releaseForeign and R._foreignLogged ~= curName then
+                    R._foreignLogged = curName
+                    log("事件 " .. tostring(R.event.title or evName) .. " 运行中，你手动手持的 "
+                        .. tostring(curName) .. " 可能被突变 -> 自动放手", Color3.fromRGB(255, 200, 90))
+                end
+            elseif R._foreignLogged ~= curName then
+                R._foreignLogged = curName
+                log("你手动持有着 " .. tostring(curName) .. "（当前无事件，不会被烧）-> 脚本不干预，你随便看",
+                    Color3.fromRGB(160, 200, 255))
+            end
+        else
+            R._foreignLogged = nil
+        end
+
+        if (holdingOurs or releaseForeign) and cfg.releaseOnEventEnd then
             if R.hold.baseline then
                 local s = fetchSummary()
                 if s then R.summary = s; checkMutation(s) end
@@ -1038,6 +1266,19 @@ local function tick()
         if checkMutation(R.summary) > 0 then
             advanceAfterHit(R.summary)
             return
+        end
+    end
+
+    -- 你手动手持了某个候选角色 -> 直接接管它，不重复发包、不跟你抢
+    if not R.hold.key then
+        local curName0 = heldName()
+        if curName0 then
+            for _, c in ipairs(R.candidates) do
+                if c.name == curName0 then
+                    adoptHold(c.key, c.name, c.rarity)
+                    return
+                end
+            end
         end
     end
 
@@ -1140,6 +1381,8 @@ local function applyCfgToUI()
         E.dTargets:SetValue(cfg.targets)
         E.dPriority:SetValue(tostring(cfg.priorityMode or "rarity"))
         E.tRelease:SetValue(cfg.releaseOnEventEnd ~= false)
+        E.tForeign:SetValue(cfg.releaseForeignHold ~= false)
+        E.tFrame:SetValue(cfg.nativeSelectionFrame ~= false)
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -1168,6 +1411,8 @@ local function readUIIntoCfg()
         cfg.targets = normMulti(E.dTargets.Value)
         cfg.priorityMode = tostring(E.dPriority.Value or "rarity")
         cfg.releaseOnEventEnd = E.tRelease.Value == true
+        cfg.releaseForeignHold = E.tForeign.Value == true
+        cfg.nativeSelectionFrame = E.tFrame.Value == true
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
         cfg.autoFillCandidates = E.tFill.Value == true
@@ -1287,6 +1532,14 @@ local function buildUI()
     E.sLead = se:AddSlider("releaseLeadSeconds", {
         Text = "提前放手", Default = tonumber(cfg.releaseLeadSeconds) or 1,
         Min = 0, Max = 10, Rounding = 0, Suffix = " 秒",
+    })
+    E.tForeign = se:AddToggle("releaseForeignHold", {
+        Text = "事件期间连你手动持的也放手 ★", Default = cfg.releaseForeignHold ~= false,
+        Tooltip = "只在「别的突变事件正在运行」时才放手（那时你的角色会被烧）。没有任何事件时脚本完全不干涉，你可以自由持有查看，角色会正常出现在身边。",
+    })
+    E.tFrame = se:AddToggle("nativeSelectionFrame", {
+        Text = "手持时显示原生蓝框 ★", Default = cfg.nativeSelectionFrame ~= false,
+        Tooltip = "自动手持时，让游戏里对应的快捷栏槽位显示和手动点击一模一样的蓝色选中描边",
     })
     se:AddDivider()
     se:AddButton({ Text = "立刻扫描背包", Icon = "refresh-cw", Func = function()
@@ -1471,6 +1724,15 @@ local function buildUI()
         manageHotbar(true)
     end)
     E.tRelease:OnChanged(function(v) cfg.releaseOnEventEnd = v == true end)
+    E.tForeign:OnChanged(function(v)
+        cfg.releaseForeignHold = v == true
+        log(cfg.releaseForeignHold and "已开启：有事件运行时，连你手动持的角色也一起放手"
+            or "已关闭：完全不碰你手动持的角色")
+    end)
+    E.tFrame:OnChanged(function(v)
+        cfg.nativeSelectionFrame = v == true
+        if not cfg.nativeSelectionFrame then clientClearSelection() end
+    end)
     E.sLead:OnChanged(function(v) cfg.releaseLeadSeconds = tonumber(v) or 0 end)
     E.tPotions:OnChanged(function(v) cfg.autoStorePotions = v == true; manageHotbar(true) end)
     E.tFill:OnChanged(function(v) cfg.autoFillCandidates = v == true; manageHotbar(true) end)
@@ -1540,7 +1802,7 @@ local function buildUI()
             E.lEvent:SetText('<font color="rgb(255,200,90)">事件: [强制] ' .. tostring(R._force.name)
                 .. string.format('  剩 %.0fs</font>', (R._force.until_ or 0) - os.clock()))
         elseif ev.active and ev.name then
-            local secs = math.floor(tonumber(ev.remaining) or 0)
+            local secs = math.floor(eventRemaining())
             local hl = (ev.name == EVENT_NAME)
             E.lEvent:SetText(string.format('%s事件: %s (%s)  剩余 %d:%02d</font>',
                 hl and '<font color="rgb(120,255,140)">' or '<font color="rgb(255,200,90)">',
@@ -1733,6 +1995,11 @@ R.diag = function()
         hotbarExcludeChars = tostring(cfg.hotbarExcludeChars),
         menuKeybind = tostring(cfg.menuKeybind),
         priorityMode = tostring(cfg.priorityMode),
+        nativeSelectionFrame = cfg.nativeSelectionFrame,
+        releaseForeignHold = cfg.releaseForeignHold,
+        clientEnvFound = (CLIENT_G ~= nil),
+        selectionUpvalueIdx = (CLIENT_SEL.idx or 0),
+        eventRemainSmooth = math.floor(eventRemaining()),
         topCandidate = (R.candidates[1] and (R.candidates[1].name .. "/" .. tostring(R.candidates[1].cps))) or "none",
         candidates = #R.candidates,
         potionNameTableSize = potionNameCount,
@@ -1763,8 +2030,7 @@ R.syncUI = function()
 end
 
 -- 提前结束让路 / 恢复接管
-R.resumeHotbar = function()
-    R.hotbar.manualUntil = 0
+R.resumeHotbar = function()    R.hotbar.manualUntil = 0
     cfg.pauseHotbar = false
     manageHotbar(true)
     log("▶ 已恢复快捷栏接管")
@@ -1773,6 +2039,42 @@ end
 R.letGo = function(sec)
     extendManual(sec or 60, "API")
     return R.hotbar.manualUntil
+end
+
+-- 原生选中（蓝框）诊断与手动测试
+R.selectKey = function(key)
+    local k = key or R.hold.key
+    if not k then return false, "没有 key" end
+    return clientSetSelected(k)
+end
+R.clearSelection = function() return clientClearSelection() end
+R.clientEnvDiag = function()
+    local g = clientG()
+    if not g then return "客户端环境表未找到（getgc 不可用？）" end
+    local n = 0
+    for k in pairs(g) do
+        if type(k) == "string" and (k:sub(1, 3) == "CF_" or k:sub(1, 5) == "__BP_") then n = n + 1 end
+    end
+    local visit = selectionVisuals()
+    local idx = CLIENT_SEL.idx
+    local sel = "?"
+    if type(rawget(g, "CF_BackpackGetSelected")) == "function" then
+        local ok, v = pcall(g.CF_BackpackGetSelected)
+        if ok then sel = tostring(v) end
+    end
+    -- 检查当前选中槽位是否真的带上了 SelectionStroke
+    local strokes = {}
+    local bar = LocalPlayer.PlayerGui.MainGui:FindFirstChild("BackpackHotBar")
+    if bar then
+        for _, s in ipairs(bar:GetChildren()) do
+            if s.Name:match("^Slot_%d+$") and s:FindFirstChild("SelectionStroke") then
+                strokes[#strokes + 1] = s.Name
+            end
+        end
+    end
+    return string.format("客户端表OK · BP/CF键=%d · 视觉函数=%s · 选中upvalue idx=%s · 当前选中=%s · 带描边槽位=%s",
+        n, tostring(visit ~= nil), tostring(idx), sel,
+        (#strokes > 0) and table.concat(strokes, ",") or "无")
 end
 
 -- 测试：触发服务器的 PotionHotbarInsert 事件，验证药水是否被拦下
@@ -1868,6 +2170,15 @@ if cfg.useNamecallHook then installHotbarHook() else R.unhookHotbar = nil end
 hookHotbarSlots()
 manageHotbar(true)
 R.threads[#R.threads + 1] = mainLoop()
+
+-- 独立的界面刷新线程（5Hz）：主循环空闲时要 3 秒才跑一轮，
+-- 倒计时/让路剩余/手持时长挂在它上面就会"一卡一卡"。这里解耦成固定 0.2 秒刷新。
+R.threads[#R.threads + 1] = task.spawn(function()
+    while isCurrent() do
+        if R.renderStatus then pcall(R.renderStatus) end
+        task.wait(0.2)
+    end
+end)
 
 -- 独立的快速接管线程：游戏脚本重载（复活/传送）会重新定义那两个全局函数，
 -- 这里保证 0.4 秒内重新接管，不依赖主循环的空闲间隔
