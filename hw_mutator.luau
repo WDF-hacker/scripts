@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 27
+local VERSION = 29
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -539,10 +539,12 @@ local function clientSetSelected(key)
         CLIENT_SEL.idx = nil
     end
 
-    -- 逐个尝试"值为 nil"的 upvalue，并用 GetSelected 验证（u166 当前必然为 nil）
+    -- 逐个尝试候选 upvalue，并用 GetSelected 验证后缓存。
+    -- ⚠ u166 可能是 nil（没选中），也可能是**另一个 key**（你已经手动选了别的角色）
+    --   -> 所以 nil 和 string 两种都要试，不能只试 nil（这是"命中后重新持有蓝框消失"的根因）
     for i = 1, 14 do
         local v = debug.getupvalue(visit, i)
-        if v == nil then
+        if v == nil or type(v) == "string" then
             pcall(debug.setupvalue, visit, i, key)
             if verify() then
                 CLIENT_SEL.idx = i
@@ -550,7 +552,7 @@ local function clientSetSelected(key)
                 clearOwnStroke()
                 return true
             end
-            pcall(debug.setupvalue, visit, i, nil)
+            pcall(debug.setupvalue, visit, i, v)
         end
     end
     return drawOwnStroke(key)
@@ -1132,8 +1134,22 @@ R.eventRemaining = eventRemaining
 
 local function isHalloween()
     if R._force then
-        if os.clock() < (R._force.until_ or 0) then return R._force.name == EVENT_NAME end
+        if os.clock() < (R._force.until_ or 0) then
+            -- ⚠ 安全：真实事件正在运行且不是万圣节 -> 强制立即让位。
+            --   绝不允许"为了测试"而把手持角色暴露在真实突变事件里。
+            if R.event.active and R.event.name and R.event.name ~= EVENT_NAME and eventRemaining() > 0 then
+                if not R._forceYielded then
+                    R._forceYielded = true
+                    log("⚠ 强制测试让位于真实事件 " .. tostring(R.event.name) .. " -> 取消强制并放手",
+                        Color3.fromRGB(255, 120, 120))
+                end
+                R._force = nil
+                return false
+            end
+            return R._force.name == EVENT_NAME
+        end
         R._force = nil
+        R._forceYielded = nil
     end
     return R.event.active and R.event.name == EVENT_NAME and eventRemaining() > 0
 end
@@ -2101,9 +2117,39 @@ end
 R.tidyHotbar = function(force) manageHotbar(force ~= false); return R.hotbar.layout end
 R.debugForce = function(name, seconds)
     R._force = { name = tostring(name or EVENT_NAME), until_ = os.clock() + (tonumber(seconds) or 15) }
+    R._forceYielded = nil
     log("debug: 强制事件 " .. R._force.name .. " " .. tostring(seconds or 15) .. "s（注意风险）", Color3.fromRGB(255, 200, 90))
 end
-R.debugClear = function() R._force = nil; log("debug: 已清除强制事件") end
+R.debugClear = function() R._force = nil; R._forceYielded = nil; log("debug: 已清除强制事件") end
+
+-- 测试：给当前手持的角色注入一个假的 Dracula 突变，走**真实代码路径**验证
+--      "命中检测 -> 记账 -> 放手 -> 换下一只 -> 刷新快捷栏" 全链路
+R.simulateHit = function(keepClean)
+    if not R.hold.key then return false, "当前没有手持（先 debugForce 让它持一只）" end
+    local s = {}
+    for k, v in pairs(R.summary or {}) do s[k] = v end
+    if (not keepClean) and type(s[R.hold.key]) == "table" then
+        -- 真实情况：这一只突变后，干净的那条就没了（除非你还有第二只干净的同名，c>1）
+        local c = tonumber(s[R.hold.key].c) or 1
+        if c <= 1 then
+            s[R.hold.key] = nil
+        else
+            local cp = {}
+            for k, v in pairs(s[R.hold.key]) do cp[k] = v end
+            cp.c = c - 1
+            s[R.hold.key] = cp
+        end
+    end
+    s[R.hold.key .. "Dracula|"] = { ty = "Dracula", c = 1, n = R.hold.name, ra = R.hold.rarity, bl = 1 }
+    local hits = detectMutation(R.hold.baseline, s, R.hold.name)
+    if #hits == 0 then return false, "注入的假突变未被识别（突变检测逻辑有问题！）" end
+    R.summary = s
+    R.stats.dracula = (R.stats.dracula or 0) + 1
+    log("【测试】给 " .. tostring(R.hold.name) .. " 注入假 Dracula 突变（干净那只已消耗）-> 识别到 " .. #hits .. " 个命中",
+        Color3.fromRGB(255, 180, 90))
+    advanceAfterHit(s)
+    return true, R.hold.name
+end
 R.selftest = function()
     local b1 = { ["C|Test|"] = { ty = "", c = 1 } }
     local s1 = { ["C|Test|"] = { ty = "", c = 1, n = "Test", ra = "Ancient" },
