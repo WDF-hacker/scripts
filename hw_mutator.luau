@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 59
+local VERSION = 60
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -206,6 +206,7 @@ local DEFAULT_CONFIG = {
     solarEnabled = true,            -- Solar 陨石雨模块
     solarTargets = { Mars = true, Angelic = true }, -- 想要的突变（Solar→Mars 6x / Heaven→Angelic 天使 6x）
     solarRarities = { Ancient = true, Celestial = true },   -- Solar 用哪些品质的角色去赌
+    solarRequireCandidate = true,   -- ★ 没有可用的白板角色时完全不介入（不传送、不打断钓鱼）
     solarTeleport = true,           -- 陨石一生成就传送到它的落点
     solarMaxHold = 30,              -- 同一只手持多久没被砸中就换下一只
     solarPoll = 0.25,               -- Solar 期间主循环间隔（秒）—— 陨石只有 0.5~2 秒窗口，必须快
@@ -1480,8 +1481,10 @@ local function mainLoop()
             -- ⚠ 关键：Solar 期间必须用**快节奏**。以前这里只有"万圣节快 / 其它 3 秒"两档，
             --   而 Solar 不是万圣节 -> 整个陨石逻辑只有 0.33Hz，表现就是"手持不够快、不连贯"。
             local interval
-            if isSolar() then
-                interval = tonumber(cfg.solarPoll) or 0.25
+            if R.solar and R.solar.active then
+                interval = tonumber(cfg.solarPoll) or 0.25      -- 只有真正介入了才需要快节奏
+            elseif isSolar() then
+                interval = tonumber(cfg.pollIdle) or 3          -- 事件在但没介入（比如没角色）-> 保持待机节奏
             elseif isHalloween() then
                 interval = tonumber(cfg.pollHold) or 0.5
             else
@@ -1749,8 +1752,9 @@ end
 
 function fishTick()
     if not cfg.autoFish then return end
-    -- ⭐ Solar 活动期间**暂停自动钓鱼**：否则游戏/脚本会一直把我们拉回钓点，和陨石抢位置
-    if cfg.solarPauseFishing ~= false and isSolar() then
+    -- ⭐ 只有"脚本真正介入了天降"才暂停钓鱼。如果因为没有可用角色而没介入，
+    --    钓鱼必须照常跑（用户实测：没角色了还被打断钓鱼 = 白损失）。
+    if cfg.solarPauseFishing ~= false and R.solar and R.solar.active then
         if not R._fishPausedBy then
             R._fishPausedBy = "Solar"
             log("⏸ Solar 活动开始 -> 自动钓鱼暂时停手（避免被拉回钓点）", Color3.fromRGB(255, 180, 90))
@@ -1867,9 +1871,44 @@ local function cancelFishing()
     return done
 end
 
+-- ⭐ 有没有"可用的白板角色"（ty=="" 且品质在 Solar 勾选里）？
+--    没有就**完全不介入**：不取消钓鱼、不传送、不手持 —— 免得白忙一场还打断钓鱼。
+local function solarUsableCount()
+    local allow = cfg.solarRarities or {}
+    if type(R.summary) ~= "table" then return 0 end
+    local n = 0
+    for _, v in pairs(R.summary) do
+        if type(v) == "table" and tostring(v.ty or "") == "" and allow[tostring(v.ra or "")] then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function solarRarityNames()
+    local n = {}
+    for k, v in pairs(cfg.solarRarities or {}) do if v then n[#n + 1] = k end end
+    table.sort(n, function(a, b) return (RARITY_RANK[a] or 0) > (RARITY_RANK[b] or 0) end)
+    return #n > 0 and table.concat(n, "/") or "（未勾选）"
+end
+
 local function solarStart_impl()
     local S = solarState()
     if S.active then return end
+    -- ⭐ 前置条件：必须有可用的白板角色（指定品质）。没有就完全不介入 —— 继续钓鱼。
+    if cfg.solarRequireCandidate ~= false then
+        refreshCandidates(cfg.solarRarities)
+        local n = solarUsableCount()
+        if n == 0 then
+            if not S._noCandLogged or (os.clock() - S._noCandLogged) > 30 then
+                S._noCandLogged = os.clock()
+                log("☄ 天降事件来了，但你没有可用的白板角色（品质: " .. solarRarityNames() ..
+                    "）-> 不介入，继续钓鱼", Color3.fromRGB(255, 200, 90))
+            end
+            return                       -- S.active 保持 false -> 钓鱼不会被暂停、也不会传送
+        end
+        S._noCandLogged = nil
+    end
     S.active = true
     S.startedAt = os.clock()
     log("☄ Solar 活动开始 -> 进入陨石模式", Color3.fromRGB(255, 180, 90))
@@ -1954,6 +1993,8 @@ local function solarOnMeteor(d)
     if not (isSolar() or isTest) then return end
     local S = solarState()
     if isSolar() and not S.active then solarStart() end
+    -- ⭐ 没真正介入（例如没有可用的白板角色）-> 连传送都不做，避免白跑还打断钓鱼
+    if not isTest and not S.active then return end
     local p
     if d:IsA("BasePart") then p = d else pcall(function() p = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart") end) end
     if not p then return end
@@ -2002,6 +2043,14 @@ function solarTick()
     -- Solar 用专属品质筛选刷新候选
     if (not R._lastSummaryAt) or (now - R._lastSummaryAt >= (tonumber(cfg.pollSummary) or 1)) then
         refreshCandidates(cfg.solarRarities)
+    end
+
+    -- ⭐ 中途角色耗尽（全被突变完了）-> 退出模式，把钓鱼还给用户
+    if cfg.solarRequireCandidate ~= false and type(R.summary) == "table" then
+        if solarUsableCount() == 0 and not R.hold.key then
+            solarStop("可用的白板角色已用完")
+            return
+        end
     end
 
     -- ① 命中检测（复用万圣节那套已验证的 diff：baseline 里同名 key 出现 ty~="" 且数量增加）
@@ -2366,6 +2415,7 @@ local function applyCfgToUI()
         if E.dSolarTargets then E.dSolarTargets:SetValue(cfg.solarTargets or { Mars = true }) end
         if E.dSolarRar then E.dSolarRar:SetValue(cfg.solarRarities or { Ancient = true, Celestial = true }) end
         if E.tSolarTp then E.tSolarTp:SetValue(cfg.solarTeleport ~= false) end
+        if E.tSolarReq then E.tSolarReq:SetValue(cfg.solarRequireCandidate ~= false) end
         if E.sSolarHold then E.sSolarHold:SetValue(tonumber(cfg.solarMaxHold) or 30) end
         if E.sSolarPoll then E.sSolarPoll:SetValue(tonumber(cfg.solarPoll) or 0.25) end
         if E.tSolarPauseFish then E.tSolarPauseFish:SetValue(cfg.solarPauseFishing ~= false) end
@@ -2420,6 +2470,7 @@ local function readUIIntoCfg()
             cfg.solarRarities = (type(v) == "table") and v or {}
         end
         if E.tSolarTp then cfg.solarTeleport = E.tSolarTp.Value == true end
+        if E.tSolarReq then cfg.solarRequireCandidate = E.tSolarReq.Value == true end
         if E.sSolarHold then cfg.solarMaxHold = tonumber(E.sSolarHold.Value) or 30 end
         if E.sSolarPoll then cfg.solarPoll = tonumber(E.sSolarPoll.Value) or 0.25 end
         if E.tSolarPauseFish then cfg.solarPauseFishing = E.tSolarPauseFish.Value == true end
@@ -2889,6 +2940,11 @@ local function buildUI()
                 Tooltip = "只有这些品质的【干净】角色会被拿去赌 Solar 突变（与万圣节的品质勾选相互独立）",
             })
         end
+        E.tSolarReq = sg:AddToggle("solarRequireCandidate", {
+            Text = "没有可用角色就不介入 ★", Default = cfg.solarRequireCandidate ~= false,
+            Tooltip = "勾选品质里的白板角色用完时：不传送、不手持、也不打断自动钓鱼（继续钓鱼）。"
+                .. "中途角色被洗完/突变完也会自动退出陨石模式。",
+        })
         E.tSolarTp = sg:AddToggle("solarTeleport", {            Text = "陨石生成就传送到落点", Default = cfg.solarTeleport ~= false,
             Tooltip = "实测：陨石垂直下落，落点就是生成时的 (X,Z)，生成到落地只有 0.5~2 秒",
         })
@@ -3077,6 +3133,12 @@ local function buildUI()
     end
     if E.tSolarTp then
         E.tSolarTp:OnChanged(function(v) cfg.solarTeleport = v == true end)
+    end
+    if E.tSolarReq then
+        E.tSolarReq:OnChanged(function(v)
+            cfg.solarRequireCandidate = v == true
+            log("没有可用白板角色时不介入 = " .. tostring(cfg.solarRequireCandidate))
+        end)
     end
     if E.sSolarHold then
         E.sSolarHold:OnChanged(function(v) cfg.solarMaxHold = tonumber(v) or 30 end)
