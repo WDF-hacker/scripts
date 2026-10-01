@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 45
+local VERSION = 52
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -205,9 +205,11 @@ local DEFAULT_CONFIG = {
     fishStallSeconds = 45,          -- 多久没出现"有鱼上钩"就重按《点击开始钓鱼》(15~180)
     solarEnabled = true,            -- Solar 陨石雨模块
     solarTargets = { Mars = true }, -- 想要的 Solar 突变（默认只要火星，倍数 6 最高）
+    solarRarities = { Ancient = true, Celestial = true },   -- Solar 用哪些品质的角色去赌
     solarTeleport = true,           -- 陨石一生成就传送到它的落点
     solarMaxHold = 30,              -- 同一只手持多久没被砸中就换下一只
-    solarPauseFishing = true,       -- Solar 期间暂停自动钓鱼（否则会被拉回钓点）
+    solarPoll = 0.25,               -- Solar 期间主循环间隔（秒）—— 陨石只有 0.5~2 秒窗口，必须快
+    solarPauseFishing = true,       -- Solar 期间暂停并取消自动钓鱼（否则会被拉回钓点）
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
     pollHold = 0.5,
@@ -346,14 +348,15 @@ local function heldName()
 end
 
 --============================================================== 候选 / 突变检测
-local function buildCandidates(summary)
+local function buildCandidates(summary, raritySet)
     local list = {}
     if type(summary) ~= "table" then return list end
+    local filter = raritySet or cfg.rarities
     for key, v in pairs(summary) do
         if type(v) == "table" then
             local ty = tostring(v.ty or "")
             local ra = tostring(v.ra or "")
-            if ty == "" and cfg.rarities[ra] then
+            if ty == "" and filter[ra] then
                 list[#list + 1] = {
                     key = key, name = tostring(v.n or "?"), rarity = ra,
                     rank = RARITY_RANK[ra] or 0, count = tonumber(v.c) or 1,
@@ -620,14 +623,17 @@ local function applyRelease(reason)
     R.hold.key, R.hold.name, R.hold.rarity, R.hold.baseline, R.hold.misses = nil, nil, nil, nil, 0
     R.hold.foreignName = nil
     R.hold.adopted = false
+    -- ⭐ 放手确认窗口：服务器可能滞后几百毫秒，期间若角色还挂着，
+    --    会被后面的"非事件分支"误判成"你手动持有的"从而不干预 -> 表现为"放手了但角色还在"。
+    R.releaseConfirmUntil = os.clock() + 3
     clientClearSelection()
 end
 
-local function refreshCandidates()
+local function refreshCandidates(raritySet)
     local s = fetchSummary()
     if s then
         R.summary = s
-        R.candidates = buildCandidates(s)
+        R.candidates = buildCandidates(s, raritySet)
         R._lastSummaryAt = os.clock()
         return true
     end
@@ -1230,9 +1236,13 @@ local function hotbarTick()
     end
 end
 
--- 前向声明：fishTick / solarTick 的真实定义在后面的模块里（tick 比它们更早定义）
+-- 前向声明：这些函数的真实定义在后面的模块里（tick 比它们更早定义）。
+-- ⚠ 漏掉任何一个都会让主循环每轮报 "attempt to call a nil value" 并**静默失效**
+--   （踩过两次：fishTick 一次、solarStart/solarStop 一次）。
 local fishTick
 local solarTick
+local solarStart
+local solarStop
 
 local function tick()
     local now = os.clock()
@@ -1261,6 +1271,25 @@ local function tick()
         return
     end
 
+    -- 模式切换日志：让"现在是谁在接管"一目了然，避免看起来像两套逻辑在打架
+    do
+        local mode = "idle"
+        if cfg.enabled then
+            if cfg.solarEnabled and isSolar() then mode = "solar"
+            elseif isHalloween() then mode = "halloween" end
+        else
+            mode = "disabled"
+        end
+        if R._mode ~= mode then
+            R._mode = mode
+            if mode == "halloween" then
+                log("▶ 模式切换 -> 万圣节自动突变（Solar 逻辑已停）", Color3.fromRGB(255, 180, 90))
+            elseif mode == "idle" then
+                log("▶ 模式切换 -> 待机（当前不是目标事件，不手持）", Color3.fromRGB(160, 160, 180))
+            end
+        end
+    end
+
     -- ===== Solar 活动最高优先级：陨石雨机制完全不同，接管一切 =====
     -- （Solar 与万圣节是互斥事件，不会同时存在，所以这里直接 return 是安全的）
     if cfg.solarEnabled and isSolar() then
@@ -1282,6 +1311,21 @@ local function tick()
     local live = halloween and not ending
 
     if not live then
+        -- ⓪ 放手确认窗口：刚调用过 applyRelease（万圣节/Solar 结束等），但服务器可能还没生效。
+        --   期间反复补发放手，直到确实放掉 —— 否则残留会被下面误判成"你手动持有的"而不干预。
+        if (R.releaseConfirmUntil or 0) > now then
+            local cn = heldName()
+            if cn then
+                doRelease()
+                if not R._relConfirmLogged then
+                    R._relConfirmLogged = true
+                    log("正在确认放手（服务器滞后补发）: " .. tostring(cn), Color3.fromRGB(160, 200, 255))
+                end
+                hotbarTick()
+                return
+            end
+            R.releaseConfirmUntil, R._relConfirmLogged = nil, nil
+        end
         -- 分级策略（既安全又不打扰）：
         --   * 有"别的突变事件"在跑  -> 你手动持的角色有被烧的风险 -> 按开关自动放手
         --   * 没有任何事件          -> 根本不会被烧 -> 脚本完全不干预，你可以自由看/用你的角色
@@ -1374,7 +1418,16 @@ end
 local function mainLoop()
     return task.spawn(function()
         while isCurrent() do
-            local interval = isHalloween() and (tonumber(cfg.pollHold) or 0.5) or (tonumber(cfg.pollIdle) or 3)
+            -- ⚠ 关键：Solar 期间必须用**快节奏**。以前这里只有"万圣节快 / 其它 3 秒"两档，
+            --   而 Solar 不是万圣节 -> 整个陨石逻辑只有 0.33Hz，表现就是"手持不够快、不连贯"。
+            local interval
+            if isSolar() then
+                interval = tonumber(cfg.solarPoll) or 0.25
+            elseif isHalloween() then
+                interval = tonumber(cfg.pollHold) or 0.5
+            else
+                interval = tonumber(cfg.pollIdle) or 3
+            end
             local ok, err = pcall(tick)
             if not ok then
                 log("loop error: " .. tostring(err), Color3.fromRGB(255, 120, 120))
@@ -1597,7 +1650,12 @@ end
 
 -- ⭐ 高速观察线程：0.15 秒采样一次，负责记录"最后一次上钩/收获"的时间
 local function startFishWatcher()
-    if R._fishWatch then return end
+    -- ⚠ 不能用 `if R._fishWatch then return end`：R 跨重载复用，旧线程已被 destroy 取消，
+    --   新实例却以为"已经在跑"而跳过 -> 观察线程静默消失。用线程状态判断。
+    if R._fishWatch then
+        local ok, st = pcall(coroutine.status, R._fishWatch)
+        if ok and st ~= "dead" then return end
+    end
     R._fishWatch = task.spawn(function()
         while isCurrent() do
             if cfg.autoFish then
@@ -1733,14 +1791,38 @@ local function solarTargetSet()
     return set
 end
 
-local function solarStart()
+-- 主动取消当前的钓鱼会话（Solar 开始时必须做，否则游戏自己还会继续钓/把我们留在钓点）
+local function cancelFishing()
+    local fa = fishActionGui()
+    local cb = fa and fa:FindFirstChild("CloseBTN")
+    local done = false
+    if cb then
+        local vis = false
+        pcall(function() vis = cb.Visible end)
+        if vis then done = fireClick(cb) end
+    end
+    -- 兜底：直接发 FishingCancel
+    local Rm = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local rc = Rm and Rm:FindFirstChild("FishingCancel")
+    if rc then pcall(function() rc:FireServer() end) done = true end
+    return done
+end
+
+local function solarStart_impl()
     local S = solarState()
     if S.active then return end
     S.active = true
     S.startedAt = os.clock()
-    log("☄ Solar 活动开始 -> 进入陨石模式（自动钓鱼已让路）", Color3.fromRGB(255, 180, 90))
-    -- 立刻先手持一只，不要等第一颗陨石（陨石间隔只有 5 秒）
-    refreshCandidates()
+    log("☄ Solar 活动开始 -> 进入陨石模式", Color3.fromRGB(255, 180, 90))
+    -- ① 让路：暂停自动钓鱼 + **主动取消当前钓鱼会话**（只停手不够，游戏自己还会继续钓）
+    if cfg.solarPauseFishing ~= false then
+        R._fishPausedBy = "Solar"
+        if cancelFishing() then
+            log("⏸ 已取消当前钓鱼会话（Solar 期间自动钓鱼让路）", Color3.fromRGB(255, 180, 90))
+        end
+    end
+    -- ② 用 Solar 专属的品质筛选刷新候选，并立刻先手持一只
+    refreshCandidates(cfg.solarRarities)
     if not R.hold.key and R.candidates[1] then
         local pick = R.candidates[1]
         applyHold(pick.key, pick.name, pick.rarity)
@@ -1748,7 +1830,7 @@ local function solarStart()
     end
 end
 
-local function solarStop(reason)
+local function solarStop_impl(reason)
     local S = solarState()
     if not S.active then return end
     S.active = false
@@ -1758,12 +1840,34 @@ local function solarStop(reason)
         Color3.fromRGB(160, 220, 255))
 end
 
+-- 快速"确保手持"：陨石一出现就立刻调用，**不等主循环**（落地窗口只有 0.5~2 秒）
+-- 返回 true 表示"现在确实拿着候选角色"
+local function solarEnsureHold()
+    if not cfg.solarEnabled then return false end
+    if R.hold.key then
+        if heldName() == R.hold.name then return true end
+        -- 名字暂时不符：可能是 server 还没生效，1.2 秒内先宽容，避免 release/hold 抖动
+        if (os.clock() - (R.hold.since or 0)) < 1.2 then return true end
+    end
+    if #R.candidates == 0 then return false end
+    local pick = R.candidates[1]
+    if not pick then return false end
+    applyHold(pick.key, pick.name, pick.rarity)
+    return true, pick.name
+end
+
+-- 把实现接到前面的前向声明上（这样 tick 里调用的就是真函数，不会 nil）
+solarStart = solarStart_impl
+solarStop = solarStop_impl
+
 -- 陨石生成回调：事件驱动、零延迟（轮询绝对来不及）
-local function solarOnMeteor(d)
-    if not cfg.solarEnabled or d.Name ~= "Meteorite" then return end
-    if not isSolar() then return end
+local function solarOnMeteor(d)    if not cfg.solarEnabled or d.Name ~= "Meteorite" then return end
+    -- 我们自己造的假陨石：无条件走传送路径（用于测试）。
+    -- 它是本地造的假对象，不会触发服务端判定，所以没有"被别的突变烧掉"的风险。
+    local isTest = (R._solarTestActive == true) or (R._testMeteor ~= nil and d == R._testMeteor)
+    if not (isSolar() or isTest) then return end
     local S = solarState()
-    if not S.active then solarStart() end
+    if isSolar() and not S.active then solarStart() end
     local p
     if d:IsA("BasePart") then p = d else pcall(function() p = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart") end) end
     if not p then return end
@@ -1785,6 +1889,13 @@ local function solarOnMeteor(d)
         S.lastTpAt = now
         log(string.format("☄ 陨石 #%d -> 传送到落点 (%.0f, %.0f)", S.meteors, pos.X, pos.Z),
             Color3.fromRGB(255, 180, 90))
+        -- ⭐ 传送后**立刻**再确认一次手持（不等主循环）—— 陨石落地那一刻必须已经拿在手上
+        if isSolar() then
+            local okHold, who = solarEnsureHold()
+            if okHold and who then
+                S.holds = (S.holds or 0) + 1
+            end
+        end
     end
 end
 
@@ -1796,8 +1907,9 @@ function solarTick()
     end
     local now = os.clock()
 
+    -- Solar 用专属品质筛选刷新候选
     if (not R._lastSummaryAt) or (now - R._lastSummaryAt >= (tonumber(cfg.pollSummary) or 1)) then
-        refreshCandidates()
+        refreshCandidates(cfg.solarRarities)
     end
 
     -- ① 命中检测（复用万圣节那套已验证的 diff：baseline 里同名 key 出现 ty~="" 且数量增加）
@@ -1843,32 +1955,32 @@ function solarTick()
         end
     end
 
-    -- ③ 手持丢失检测
+    -- ③ 手持丢失检测：连续 3 次确认才放手（避免网络抖动导致 release/hold 抖动 = 手感"不连贯"）
     if R.hold.key then
-        local curName = heldName()
-        if curName ~= R.hold.name and (now - (R.hold.since or 0)) > 2 then
-            applyRelease("Solar 手持丢失")
+        if heldName() == R.hold.name or (now - (R.hold.since or 0)) < 1.2 then
+            R.hold.missRun = 0
+        else
+            R.hold.missRun = (R.hold.missRun or 0) + 1
+            if R.hold.missRun >= 3 then
+                R.hold.missRun = 0
+                applyRelease("Solar 手持丢失")
+            end
         end
     end
 
     -- ④ 保证一直持有着（陨石落地那一刻必须已经拿在手上）
-    if not R.hold.key then
-        if #R.candidates == 0 then refreshCandidates() end
-        local pick = R.candidates[1]
-        if pick then
-            applyHold(pick.key, pick.name, pick.rarity)
-            log("Solar 手持 " .. pick.name .. " [" .. pick.rarity .. "]")
-        end
-    end
+    if not R.hold.key then solarEnsureHold() end
 end
 
--- 陨石监听（只建一次）
-if not R._solarConn then
-    R._solarConn = workspace.ChildAdded:Connect(function(d)
+-- 陨石监听：**每个实例都要新建**（R 跨重载复用，写 `if not R._solarConn` 会让新实例跳过创建，
+-- 而旧连接已被上一个实例的 destroy 断开 -> 结果一个监听都没有）。
+do
+    local conn = workspace.ChildAdded:Connect(function(d)
         if not isCurrent() then return end
         pcall(solarOnMeteor, d)
     end)
-    R.connections[#R.connections + 1] = R._solarConn
+    R.connections[#R.connections + 1] = conn
+    R._solarConn = conn
 end
 
 --============================================================== Obsidian 加载
@@ -1942,8 +2054,10 @@ local function applyCfgToUI()
         if E.tFishTp then E.tFishTp:SetValue(cfg.autoFishTeleport ~= false) end
         if E.tSolar then E.tSolar:SetValue(cfg.solarEnabled ~= false) end
         if E.dSolarTargets then E.dSolarTargets:SetValue(cfg.solarTargets or { Mars = true }) end
+        if E.dSolarRar then E.dSolarRar:SetValue(cfg.solarRarities or { Ancient = true, Celestial = true }) end
         if E.tSolarTp then E.tSolarTp:SetValue(cfg.solarTeleport ~= false) end
         if E.sSolarHold then E.sSolarHold:SetValue(tonumber(cfg.solarMaxHold) or 30) end
+        if E.sSolarPoll then E.sSolarPoll:SetValue(tonumber(cfg.solarPoll) or 0.25) end
         if E.tSolarPauseFish then E.tSolarPauseFish:SetValue(cfg.solarPauseFishing ~= false) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
@@ -1984,8 +2098,13 @@ local function readUIIntoCfg()
             local v = E.dSolarTargets.Value
             cfg.solarTargets = (type(v) == "table") and v or {}
         end
+        if E.dSolarRar then
+            local v = E.dSolarRar.Value
+            cfg.solarRarities = (type(v) == "table") and v or {}
+        end
         if E.tSolarTp then cfg.solarTeleport = E.tSolarTp.Value == true end
         if E.sSolarHold then cfg.solarMaxHold = tonumber(E.sSolarHold.Value) or 30 end
+        if E.sSolarPoll then cfg.solarPoll = tonumber(E.sSolarPoll.Value) or 0.25 end
         if E.tSolarPauseFish then cfg.solarPauseFishing = E.tSolarPauseFish.Value == true end
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
@@ -2348,8 +2467,19 @@ local function buildUI()
                        Gold = "Gold 黄金（1.25）", Solar = "Solar", Blood = "Blood", Honey = "Honey" },
             Multi = true, Default = cfg.solarTargets or { Mars = true },
         })
-        E.tSolarTp = sg:AddToggle("solarTeleport", {
-            Text = "陨石生成就传送到落点", Default = cfg.solarTeleport ~= false,
+        -- Solar 专属品质选择（与万圣节的品质勾选独立）
+        do
+            local rarVals = {}
+            for name in pairs(RARITY_RANK) do rarVals[#rarVals + 1] = name end
+            table.sort(rarVals, function(a, b) return (RARITY_RANK[a] or 0) < (RARITY_RANK[b] or 0) end)
+            E.dSolarRar = sg:AddDropdown("solarRarities", {
+                Text = "Solar 参与品质 ★",
+                Values = rarVals, Multi = true,
+                Default = cfg.solarRarities or { Ancient = true, Celestial = true },
+                Tooltip = "只有这些品质的【干净】角色会被拿去赌 Solar 突变（与万圣节的品质勾选相互独立）",
+            })
+        end
+        E.tSolarTp = sg:AddToggle("solarTeleport", {            Text = "陨石生成就传送到落点", Default = cfg.solarTeleport ~= false,
             Tooltip = "实测：陨石垂直下落，落点就是生成时的 (X,Z)，生成到落地只有 0.5~2 秒",
         })
         E.sSolarHold = sg:AddSlider("solarMaxHold", {
@@ -2357,14 +2487,27 @@ local function buildUI()
             Min = 5, Max = 120, Rounding = 0, Suffix = " 秒",
             Tooltip = "一直没被砸中就换下一只候选",
         })
+        E.sSolarPoll = sg:AddSlider("solarPoll", {
+            Text = "Solar 反应间隔", Default = tonumber(cfg.solarPoll) or 0.25,
+            Min = 0.05, Max = 1, Rounding = 2, Suffix = " 秒",
+            Tooltip = "陨石从生成到落地只有 0.5~2 秒，这个值越小越灵敏（默认 0.25 秒 = 4Hz）",
+        })
         E.tSolarPauseFish = sg:AddToggle("solarPauseFishing", {
             Text = "Solar 期间暂停自动钓鱼 ★", Default = cfg.solarPauseFishing ~= false,
             Tooltip = "必须开：否则自动钓鱼会把你拉回钓点，和陨石抢位置",
         })
         sg:AddDivider()
-        sg:AddButton({ Text = "模拟 Solar（30 秒）", Icon = "flask-conical", Func = function()
+        sg:AddButton({ Text = "★ 完整模拟测试（假陨石）", Icon = "flask-conical", Func = function()
+            local ok, x, z = R.solarTest(25)
+            if not ok then log("模拟测试启动失败: " .. tostring(x)) end
+        end })
+        sg:AddButton({ Text = "清理假陨石", Icon = "trash-2", Func = function()
+            R.solarTestCleanup()
+            log("已清理假陨石")
+        end })
+        sg:AddButton({ Text = "模拟 Solar（只切状态，30 秒）", Icon = "flask-conical", Func = function()
             R.debugForce("Solar", 30)
-            log("已强制 Solar 30 秒（真实活动不可制造，这里只是让判定生效）")
+            log("已强制 Solar 30 秒（不会生成真实陨石）")
         end })
         sg:AddButton({ Text = "查看 Solar 状态", Icon = "search", Func = function()
             local S = solarState()
@@ -2492,11 +2635,24 @@ local function buildUI()
             log("Solar 目标突变 = " .. (#names > 0 and table.concat(names, ", ") or "（空，默认 Mars）"))
         end)
     end
+    if E.dSolarRar then
+        E.dSolarRar:OnChanged(function(v)
+            cfg.solarRarities = (type(v) == "table") and v or {}
+            local names = {}
+            for k, on in pairs(cfg.solarRarities) do if on then names[#names + 1] = k end end
+            table.sort(names, function(a, b) return (RARITY_RANK[a] or 0) > (RARITY_RANK[b] or 0) end)
+            log("Solar 参与品质 = " .. (#names > 0 and table.concat(names, " > ") or "（空）"))
+            if R.solar and R.solar.active then refreshCandidates(cfg.solarRarities) end
+        end)
+    end
     if E.tSolarTp then
         E.tSolarTp:OnChanged(function(v) cfg.solarTeleport = v == true end)
     end
     if E.sSolarHold then
         E.sSolarHold:OnChanged(function(v) cfg.solarMaxHold = tonumber(v) or 30 end)
+    end
+    if E.sSolarPoll then
+        E.sSolarPoll:OnChanged(function(v) cfg.solarPoll = tonumber(v) or 0.25 end)
     end
     if E.tSolarPauseFish then
         E.tSolarPauseFish:OnChanged(function(v) cfg.solarPauseFishing = v == true end)
@@ -2903,6 +3059,136 @@ R.gotoPond = function()
     if not pos then return false end
     teleportToPond(pos)
     return true, name, dist
+end
+
+--============================================================== Solar 完整模拟测试
+-- 自己造一颗"假陨石"（Name="Meteorite" 的 Model + 下落动画），走**真实的监听路径**，
+-- 验证 监听 -> 传送 -> 手持 -> 记账 全链路是否工作。
+R.solarTest = function(dur)
+    local hrp = rootPart()
+    if not hrp then return false, "没有角色" end
+    local S = solarState()
+    -- ① 强制 Solar 状态（仅当真实事件就是 Solar、或当前没有别的突变事件时才真正进入陨石模式）
+    R._force = { name = "Solar", until_ = os.clock() + (tonumber(dur) or 25) }
+    R._forceYielded = nil
+    local realOther = R.event.active and R.event.name and R.event.name ~= "Solar" and eventRemaining() > 0
+    if realOther then
+        log("【测试】当前真实事件是 " .. tostring(R.event.name) ..
+            " -> 安全守卫生效：只测试『监听+传送』路径，不手持角色（避免被真实突变烧掉）",
+            Color3.fromRGB(255, 200, 90))
+    elseif not S.active then
+        solarStart()
+    end
+    -- ② 在离玩家 120 格处生成假陨石（高度用实测的生成高度 182）
+    local ang = math.random() * math.pi * 2
+    local dist = 120
+    local x = hrp.Position.X + math.cos(ang) * dist
+    local z = hrp.Position.Z + math.sin(ang) * dist
+    R.solarTestCleanup()
+    R._solarTestActive = true          -- ⭐ 必须先立标志：下面 Parent 赋值会**同步**触发 ChildAdded
+    local model = Instance.new("Model")
+    model.Name = "Meteorite"
+    local part = Instance.new("Part")
+    part.Name = "Base"
+    part.Size = Vector3.new(5, 5, 5)
+    part.Anchored = true
+    part.CanCollide = false
+    part.Material = Enum.Material.Neon
+    part.Color = Color3.fromRGB(255, 120, 30)
+    part.Position = Vector3.new(x, 182, z)
+    part.Parent = model
+    model.PrimaryPart = part
+    R._testMeteor = model              -- ⭐ 同样必须在 Parent 之前设置
+    model.Parent = workspace
+    log(string.format("【测试】已在 (%.0f, 182, %.0f) 生成假陨石，距玩家 %.0f 格", x, z, dist),
+        Color3.fromRGB(255, 180, 90))
+    -- ③ 让它下落（Y 递减，模拟真实陨石）
+    task.spawn(function()
+        local y = 182
+        while y > 66 and model.Parent do
+            y = y - 7
+            pcall(function() part.Position = Vector3.new(x, y, z) end)
+            task.wait(0.05)
+        end
+        if model.Parent then
+            log(string.format("【测试】假陨石已落地 Y=%.0f（落点 %.0f, %.0f）", y, x, z))
+        end
+    end)
+    -- ④ 自动核对结果
+    task.delay(1.5, function()
+        local h = rootPart()
+        if not h then return end
+        local d = (Vector3.new(x, h.Position.Y, z) - h.Position).Magnitude
+        log(string.format("【测试】生成后 1.5 秒：距假陨石落点 %.1f 格 -> %s",
+            d, d < 10 and "✓ 传送成功" or "✗ 传送没生效（检查 solarTeleport / 监听）"),
+            d < 10 and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 120, 120))
+        log("【测试】当前手持=" .. tostring(R.hold.key) .. " · 候选=" .. #R.candidates ..
+            " · 陨石计数=" .. S.meteors .. " · 传送计数=" .. S.tp)
+        if R.hold.key then
+            local tf = workspace:FindFirstChild("ToolFollowers")
+            local held = "无"
+            if tf then
+                for _, c in ipairs(tf:GetChildren()) do
+                    local n = c.Name:match("^ToolFollower_(.+)$")
+                    if n then held = n end
+                end
+            end
+            log("【测试】实际手持模型=" .. held .. (held ~= "无" and " ✓ 已出现在身侧" or " ✗ 没出现"))
+        end
+    end)
+    return true, x, z
+end
+
+R.solarTestCleanup = function()
+    R._solarTestActive = false
+    if R._testMeteor then
+        pcall(function() R._testMeteor:Destroy() end)
+        R._testMeteor = nil
+    end
+end
+
+--============================================================== 彻底清理
+-- 一键清掉本脚本产生的一切残留：实例（按魔数识别）、UI（按标记识别）、
+-- 以及所有后台观察器线程（用代号让旧循环全部失效）。
+R.panicCleanup = function()
+    local n = 0
+    -- ① 所有"我们的"状态实例
+    if type(getgc) == "function" then
+        local ok, list = pcall(getgc, true)
+        if ok and type(list) == "table" then
+            for _, obj in ipairs(list) do
+                if type(obj) == "table" and obj ~= R then
+                    local ours = false
+                    pcall(function() ours = rawget(obj, "__HW_MAGIC") == MAGIC end)
+                    if ours then
+                        pcall(function()
+                            local d = rawget(obj, "destroy")
+                            if type(d) == "function" then d() end
+                        end)
+                        n = n + 1
+                    end
+                end
+            end
+        end
+    end
+    -- ② 观察器线程（代号 +1 让所有旧循环退出）
+    _G.__METEOR_WATCH = false
+    _G.__MW_GEN = (_G.__MW_GEN or 0) + 1
+    pcall(function() if _G.__MW_CONN then _G.__MW_CONN:Disconnect() end end)
+    _G.__MW_CONN = nil
+    -- ③ 假陨石
+    pcall(function() if _G.HW_MUTATOR and _G.HW_MUTATOR.solarTestCleanup then _G.HW_MUTATOR.solarTestCleanup() end end)
+    -- ④ 我们标记过的 UI
+    local ui = 0
+    for _, cont in ipairs(uiContainers()) do
+        for _, c in ipairs(cont:GetChildren()) do
+            local marked = false
+            pcall(function() marked = c:IsA("ScreenGui") and c:GetAttribute("HW_MutatorOwned") ~= nil end)
+            if marked then pcall(function() c:Destroy() end) ui = ui + 1 end
+        end
+    end
+    print(PREFIX .. " 彻底清理：实例 " .. n .. " 个 · UI " .. ui .. " 个 · 观察器已停")
+    return n, ui
 end
 R.clientEnvDiag = function()
     local g = clientG()
