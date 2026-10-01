@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 52
+local VERSION = 54
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -209,6 +209,9 @@ local DEFAULT_CONFIG = {
     solarTeleport = true,           -- 陨石一生成就传送到它的落点
     solarMaxHold = 30,              -- 同一只手持多久没被砸中就换下一只
     solarPoll = 0.25,               -- Solar 期间主循环间隔（秒）—— 陨石只有 0.5~2 秒窗口，必须快
+    holdBurst = true,               -- 手持前先「取消 -> 再拿出」一次，强制游戏刷新跟随角色
+    holdBurstGap = 0.05,            -- 取消与再拿出之间的间隔（秒）
+    solarHoldEveryMeteor = true,    -- 每颗陨石都强制刷新一次手持（解决游戏"误触"导致角色不到身后）
     solarPauseFishing = true,       -- Solar 期间暂停并取消自动钓鱼（否则会被拉回钓点）
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
@@ -586,9 +589,26 @@ local function clientClearSelection()
     return false
 end
 
+--============================================================== 手持强制刷新
+-- 游戏自带 bug：包里有多只同品质角色时，紧接着再手持会被判定成"误触"，
+--   角色不走完整的"消失 -> 重新出现在身后"循环（表现为角色不消失、而是一路跑过去）。
+-- 实测对策（用户发现）：**先取消手持、再把角色拿出来一次**就能刷新。
+--   （注意不是"手持两次"—— 游戏需要先看到角色回到背包，才会走完整循环。）
+-- 最终状态一定是"持有着"，否则落地判定收不到。
+local function doHoldRefresh(key)
+    if cfg.holdBurst == false then
+        doHold(key)
+        return
+    end
+    local gap = tonumber(cfg.holdBurstGap) or 0.05
+    doRelease()                       -- ① 先取消（让游戏看到角色回背包）
+    if gap > 0 then task.wait(gap) end
+    doHold(key)                       -- ② 再拿出来 -> 触发完整的刷新循环
+end
+
 --============================================================== 手持控制
 local function applyHold(key, name, rarity)
-    doHold(key)
+    doHoldRefresh(key)
     R.hold.key, R.hold.name, R.hold.rarity = key, name, rarity
     R.hold.since = os.clock()
     R.hold.misses = 0
@@ -1872,7 +1892,10 @@ local function solarOnMeteor(d)    if not cfg.solarEnabled or d.Name ~= "Meteori
     if d:IsA("BasePart") then p = d else pcall(function() p = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart") end) end
     if not p then return end
     local now = os.clock()
-    if now - (S.lastMeteor or 0) < 0.15 then return end    -- 同一颗的多个子对象去重
+    -- 去重只看"是不是同一颗"（不能按时间窗去重：连发测试时 0.15 秒内会有多颗，
+    -- 时间窗会把后面的陨石全吞掉 -> 表现为"连发时不动"）
+    if S.lastMeteorObj == d then return end
+    S.lastMeteorObj = d
     S.lastMeteor = now
     S.meteors = S.meteors + 1
     if cfg.solarTeleport == false then return end
@@ -1889,11 +1912,14 @@ local function solarOnMeteor(d)    if not cfg.solarEnabled or d.Name ~= "Meteori
         S.lastTpAt = now
         log(string.format("☄ 陨石 #%d -> 传送到落点 (%.0f, %.0f)", S.meteors, pos.X, pos.Z),
             Color3.fromRGB(255, 180, 90))
-        -- ⭐ 传送后**立刻**再确认一次手持（不等主循环）—— 陨石落地那一刻必须已经拿在手上
-        if isSolar() then
-            local okHold, who = solarEnsureHold()
-            if okHold and who then
+        -- ⭐ 每颗陨石都做一次「取消 -> 再拿出」的手持刷新（绕开游戏的"误触"判定），
+        --    保证落地那一刻角色确实完整地出现在身后。
+        if isSolar() and cfg.solarHoldEveryMeteor ~= false then
+            if R.hold.key then
+                doHoldRefresh(R.hold.key)
                 S.holds = (S.holds or 0) + 1
+            else
+                solarEnsureHold()
             end
         end
     end
@@ -2059,6 +2085,9 @@ local function applyCfgToUI()
         if E.sSolarHold then E.sSolarHold:SetValue(tonumber(cfg.solarMaxHold) or 30) end
         if E.sSolarPoll then E.sSolarPoll:SetValue(tonumber(cfg.solarPoll) or 0.25) end
         if E.tSolarPauseFish then E.tSolarPauseFish:SetValue(cfg.solarPauseFishing ~= false) end
+        if E.tSolarBurst then E.tSolarBurst:SetValue(cfg.solarHoldEveryMeteor ~= false) end
+        if E.tBurst then E.tBurst:SetValue(cfg.holdBurst ~= false) end
+        if E.sBurstGap then E.sBurstGap:SetValue(tonumber(cfg.holdBurstGap) or 0.05) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -2106,6 +2135,9 @@ local function readUIIntoCfg()
         if E.sSolarHold then cfg.solarMaxHold = tonumber(E.sSolarHold.Value) or 30 end
         if E.sSolarPoll then cfg.solarPoll = tonumber(E.sSolarPoll.Value) or 0.25 end
         if E.tSolarPauseFish then cfg.solarPauseFishing = E.tSolarPauseFish.Value == true end
+        if E.tSolarBurst then cfg.solarHoldEveryMeteor = E.tSolarBurst.Value == true end
+        if E.tBurst then cfg.holdBurst = E.tBurst.Value == true end
+        if E.sBurstGap then cfg.holdBurstGap = tonumber(E.sBurstGap.Value) or 0.05 end
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
         cfg.autoFillCandidates = E.tFill.Value == true
@@ -2496,6 +2528,21 @@ local function buildUI()
             Text = "Solar 期间暂停自动钓鱼 ★", Default = cfg.solarPauseFishing ~= false,
             Tooltip = "必须开：否则自动钓鱼会把你拉回钓点，和陨石抢位置",
         })
+        E.tSolarBurst = sg:AddToggle("solarHoldEveryMeteor", {
+            Text = "每颗陨石刷新手持 ★", Default = cfg.solarHoldEveryMeteor ~= false,
+            Tooltip = "游戏有个 bug：包里有多只同品质角色时，紧接着再手持会被判定成『误触』，"
+                .. "角色不走完整的『消失→重新出现在身后』。开启后每颗陨石都做一次"
+                .. "『先取消 → 再拿出』，强制它走完刷新。",
+        })
+        E.tBurst = sg:AddToggle("holdBurst", {
+            Text = "所有手持都先取消再拿出（含万圣节）", Default = cfg.holdBurst ~= false,
+            Tooltip = "对所有手持生效（Solar + 万圣节通用）。关闭则退化成单次手持。",
+        })
+        E.sBurstGap = sg:AddSlider("holdBurstGap", {
+            Text = "取消→拿出 的间隔", Default = tonumber(cfg.holdBurstGap) or 0.05,
+            Min = 0, Max = 0.4, Rounding = 2, Suffix = " 秒",
+            Tooltip = "太小可能被游戏判定成误触、太大可能落地前来不及；默认 0.05 秒。",
+        })
         sg:AddDivider()
         sg:AddButton({ Text = "★ 完整模拟测试（假陨石）", Icon = "flask-conical", Func = function()
             local ok, x, z = R.solarTest(25)
@@ -2656,6 +2703,21 @@ local function buildUI()
     end
     if E.tSolarPauseFish then
         E.tSolarPauseFish:OnChanged(function(v) cfg.solarPauseFishing = v == true end)
+    end
+    if E.tSolarBurst then
+        E.tSolarBurst:OnChanged(function(v)
+            cfg.solarHoldEveryMeteor = v == true
+            log("每颗陨石强制刷新手持 = " .. tostring(cfg.solarHoldEveryMeteor))
+        end)
+    end
+    if E.tBurst then
+        E.tBurst:OnChanged(function(v)
+            cfg.holdBurst = v == true
+            log("手持『先取消再拿出』= " .. tostring(cfg.holdBurst) .. "（万圣节与 Solar 通用）")
+        end)
+    end
+    if E.sBurstGap then
+        E.sBurstGap:OnChanged(function(v) cfg.holdBurstGap = tonumber(v) or 0.05 end)
     end
     E.sLead:OnChanged(function(v) cfg.releaseLeadSeconds = tonumber(v) or 0 end)
     E.tPotions:OnChanged(function(v) cfg.autoStorePotions = v == true; manageHotbar(true) end)
