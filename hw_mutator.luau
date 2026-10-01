@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 60
+local VERSION = 62
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -203,6 +203,9 @@ local DEFAULT_CONFIG = {
     pondYOffset = 4,                -- 相对钓点区域的 Y 偏移
     fishEnsureAuto = true,          -- 自动确保"内置自动捕鱼"处于开启状态
     fishStallSeconds = 45,          -- 多久没出现"有鱼上钩"就重按《点击开始钓鱼》(15~180)
+    autoSave = true,                -- ★ 任何设置改动都自动写回配置文件
+    autoSaveDelay = 1.5,            -- 停止改动多久后写盘（秒）—— 防抖，避免频繁写文件
+    autoSaveHeartbeat = 120,        -- 兜底：最长多久无条件保存一次（秒）
     solarEnabled = true,            -- Solar 陨石雨模块
     solarTargets = { Mars = true, Angelic = true }, -- 想要的突变（Solar→Mars 6x / Heaven→Angelic 天使 6x）
     solarRarities = { Ancient = true, Celestial = true },   -- Solar 用哪些品质的角色去赌
@@ -275,15 +278,69 @@ local function loadConfig(silent)
     return true
 end
 
-local function saveConfig()
+local function saveConfig(quiet)
     local ok, err = writeFileSafe(CONFIG_FILE, HttpService:JSONEncode(cfg))
-    if ok then print(PREFIX .. " 配置已保存 -> " .. CONFIG_FILE)
-    else warn(PREFIX .. " 保存失败: " .. tostring(err)) end
+    if ok then
+        if not quiet then print(PREFIX .. " 配置已保存 -> " .. CONFIG_FILE) end
+    else
+        warn(PREFIX .. " 保存失败: " .. tostring(err))
+    end
     return ok
 end
 
 loadConfig(true)
 R.cfg = cfg
+
+--============================================================== 配置自动保存
+-- ⭐ 给 cfg 挂元表：任何一处 `cfg.x = y` 都会被自动捕获并排队保存。
+--    为什么要用元表而不是逐个回调加保存：UI 有 40+ 个 OnChanged 回调 + 十来个 API，
+--    手写必然漏（漏掉的那个设置下次加载就丢了）。
+R._cfgDirty = false
+R._cfgSaveCount = 0
+R._lastAutoSave = "-"
+local function markDirty()
+    R._cfgDirty = true
+    R._cfgChangedAt = os.clock()
+end
+R.cfgSig = function() return cfgSignature(cfg) end
+R.markDirty = markDirty
+do
+    local mt = {
+        __newindex = function(t, k, v)
+            rawset(t, k, v)
+            R._cfgDirty = true
+            R._cfgChangedAt = os.clock()
+        end,
+    }
+    local ok = pcall(setmetatable, cfg, mt)
+    if not ok then
+        warn(PREFIX .. " 自动保存：cfg 挂了元表失败（退化为定时保存）")
+    end
+end
+-- ⚠ 重要经验：`__newindex` **只在"键不存在"时触发**！对已存在的键（cfg.maxLog=…）
+--   是直接赋值，元表根本不会被调用。而 UI 回调改的恰恰全是已存在的键 -> 元表方案不可靠。
+-- ✅ 真正可靠的做法：**签名差分** —— 每秒把整个 cfg 拍一个稳定签名，跟上次比，变了就算改动。
+--    它能捕获一切（含嵌套表如 cfg.rarities），代价是每秒遍历一次小表（可忽略）。
+local function cfgSignature(t)
+    local parts = {}
+    local function walk(tbl, pre)
+        local keys = {}
+        for k in pairs(tbl) do keys[#keys + 1] = tostring(k) end
+        table.sort(keys)
+        for _, k in ipairs(keys) do
+            local v = tbl[k]
+            local vt = type(v)
+            if vt == "table" then
+                walk(v, pre .. k .. ".")
+            elseif vt == "number" or vt == "string" or vt == "boolean" then
+                parts[#parts + 1] = pre .. k .. "=" .. tostring(v)
+            end
+        end
+    end
+    pcall(walk, t, "")
+    return table.concat(parts, "|")
+end
+R._cfgSig = cfgSignature(cfg)
 
 --============================================================== 运行时状态
 R.summary = nil
@@ -2424,6 +2481,8 @@ local function applyCfgToUI()
         if E.sBurstGap then E.sBurstGap:SetValue(tonumber(cfg.holdBurstGap) or 0.02) end
         if E.sBurstCycles then E.sBurstCycles:SetValue(tonumber(cfg.holdBurstCycles) or 2) end
         if E.tWash then E.tWash:SetValue(cfg.washEnabled == true) end
+        if E.tAutoSave then E.tAutoSave:SetValue(cfg.autoSave ~= false) end
+        if E.sAutoSaveDelay then E.sAutoSaveDelay:SetValue(tonumber(cfg.autoSaveDelay) or 1.5) end
         if E.dWashTypes then E.dWashTypes:SetValue(cfg.washTypes or {}) end
         if E.dWashRar then E.dWashRar:SetValue(cfg.washRarities or {}) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
@@ -2479,6 +2538,8 @@ local function readUIIntoCfg()
         if E.sBurstGap then cfg.holdBurstGap = tonumber(E.sBurstGap.Value) or 0.02 end
         if E.sBurstCycles then cfg.holdBurstCycles = math.max(1, math.floor(tonumber(E.sBurstCycles.Value) or 2)) end
         if E.tWash then cfg.washEnabled = E.tWash.Value == true end
+        if E.tAutoSave then cfg.autoSave = E.tAutoSave.Value == true end
+        if E.sAutoSaveDelay then cfg.autoSaveDelay = tonumber(E.sAutoSaveDelay.Value) or 1.5 end
         if E.dWashTypes then
             local v = E.dWashTypes.Value
             cfg.washTypes = (type(v) == "table") and v or {}
@@ -2672,6 +2733,46 @@ local function buildUI()
     end })
     se:AddButton({ Text = "放手", Icon = "undo-2", Func = function() applyRelease("手动") end })
     se:AddButton({ Text = "保存配置到文件", Icon = "save", Func = function() saveConfig() end })
+
+    --================ 配置自动保存
+    do
+        local as = Tabs.Config:AddLeftGroupbox("配置自动保存", "save")
+        E.tAutoSave = as:AddToggle("autoSave", {
+            Text = "自动保存我的一切更改 ★", Default = cfg.autoSave ~= false,
+            Tooltip = "任何设置改动（界面上的每一个开关/滑块/多选、以及 API 调用）都会自动写回配置文件。"
+                .. "重载脚本或载入新版本时不会再丢配置。",
+        })
+        E.lAutoSave = as:AddLabel("自动保存: —", true)
+        E.sAutoSaveDelay = as:AddSlider("autoSaveDelay", {
+            Text = "改动后多久写盘", Default = tonumber(cfg.autoSaveDelay) or 1.5,
+            Min = 0.5, Max = 10, Rounding = 1, Suffix = " 秒",
+            Tooltip = "防抖：连续拖动滑块只在停下来之后写一次文件，避免频繁读写",
+        })
+        as:AddDivider()
+        as:AddButton({ Text = "立即保存一次", Icon = "save", Func = function()
+            R._cfgDirty = false
+            local ok = saveConfig()
+            R._cfgSaveCount = (R._cfgSaveCount or 0) + 1
+            R._lastAutoSave = os.date("%H:%M:%S")
+            log("手动保存: " .. (ok and "成功 ✓" or "失败 ✗"), ok and Color3.fromRGB(120, 255, 140)
+                or Color3.fromRGB(255, 120, 120))
+        end })
+        as:AddButton({ Text = "重新从文件加载配置", Icon = "rotate-ccw", Func = function()
+            local ok = loadConfig()
+            if ok then
+                applyCfgToUI(); readUIIntoCfg(); refreshCandidates()
+                log("已从文件重新加载配置 ✓", Color3.fromRGB(120, 255, 140))
+            else
+                log("加载失败（文件不存在或损坏）", Color3.fromRGB(255, 120, 120))
+            end
+        end })
+        as:AddButton({ Text = "打开配置文件所在位置", Icon = "folder-open", Func = function()
+            log("配置文件路径: " .. CONFIG_FILE)
+            log("已保存次数: " .. tostring(R._cfgSaveCount or 0) .. " · 上次: " .. tostring(R._lastAutoSave or "-"))
+            local d = tostring(R._cfgDirty)
+            log("当前是否有未保存改动: " .. d)
+        end })
+    end
 
     --================ 快捷栏
     local hb1 = Tabs.Hotbar:AddLeftGroupbox("快捷栏管理", "layout-grid")
@@ -3167,9 +3268,18 @@ local function buildUI()
     if E.sBurstCycles then
         E.sBurstCycles:OnChanged(function(v) cfg.holdBurstCycles = math.max(1, math.floor(tonumber(v) or 2)) end)
     end
+    if E.tAutoSave then
+        E.tAutoSave:OnChanged(function(v)
+            cfg.autoSave = v == true
+            log("配置自动保存 = " .. tostring(cfg.autoSave))
+            if cfg.autoSave then saveConfig(true) end
+        end)
+    end
+    if E.sAutoSaveDelay then
+        E.sAutoSaveDelay:OnChanged(function(v) cfg.autoSaveDelay = tonumber(v) or 1.5 end)
+    end
     if E.tWash then
-        E.tWash:OnChanged(function(v)
-            cfg.washEnabled = v == true
+        E.tWash:OnChanged(function(v)            cfg.washEnabled = v == true
             if cfg.washEnabled then
                 local nt = 0
                 for _ in pairs(cfg.washTypes or {}) do nt = nt + 1 end
@@ -3389,6 +3499,16 @@ local function buildUI()
                 end)()))
         end
 
+        -- 自动保存状态
+        if E.lAutoSave then
+            E.lAutoSave:SetText(string.format('自动保存: %s · 已保存 %d 次\n上次写盘 %s · 待保存改动 %s',
+                (cfg.autoSave ~= false) and '<font color="rgb(120,255,140)">开启</font>'
+                    or '<font color="rgb(255,200,90)">关闭</font>',
+                R._cfgSaveCount or 0, tostring(R._lastAutoSave or "-"),
+                R._cfgDirty and '<font color="rgb(255,200,90)">有</font>'
+                    or '<font color="rgb(120,255,140)">无</font>'))
+        end
+
         -- 去突变状态
         if E.lWash then
             local st, act = depoState()
@@ -3461,6 +3581,11 @@ end
 R.destroy = function()
     R.alive = false
     R.gen = (R.gen or 0) + 1
+    -- ⭐ 卸载 / 重载前立刻落盘一次：这样"重载脚本 / 载入新版本"绝不会丢配置
+    if cfg.autoSave ~= false then
+        local okSave = pcall(saveConfig, true)
+        if okSave then print(PREFIX .. " 卸载前已自动保存配置") end
+    end
     for _, c in ipairs(R.connections or {}) do pcall(function() c:Disconnect() end) end
     R.connections = {}
     for _, t in ipairs(R.threads or {}) do pcall(function() task.cancel(t) end) end
@@ -3914,6 +4039,37 @@ if cfg.useNamecallHook then installHotbarHook() else R.unhookHotbar = nil end
 hookHotbarSlots()
 manageHotbar(true)
 R.threads[#R.threads + 1] = mainLoop()
+
+-- ⭐ 配置自动保存线程：用"签名差分"检测一切改动（元表 __newindex 对已存在的键不触发，
+--    所以不能只靠它）。检测到变化就防抖写盘，另加"心跳兜底"。
+R.threads[#R.threads + 1] = task.spawn(function()
+    local lastHeartbeat = os.clock()
+    while isCurrent() do
+        task.wait(0.5)
+        if cfg.autoSave ~= false then
+            local now = os.clock()
+            -- ① 签名差分：任何改动（含嵌套表）都会被发现
+            local sig = cfgSignature(cfg)
+            if sig ~= R._cfgSig then
+                R._cfgSig = sig
+                R._cfgDirty = true
+                R._cfgChangedAt = now
+            end
+            -- ② 防抖：停止改动 autoSaveDelay 秒后才写盘（拖滑块时不会狂写文件）
+            local delay = tonumber(cfg.autoSaveDelay) or 1.5
+            local hb = tonumber(cfg.autoSaveHeartbeat) or 120
+            local due = R._cfgDirty and (now - (R._cfgChangedAt or 0)) >= delay
+            local beat = hb > 0 and (now - lastHeartbeat) >= hb
+            if due or beat then
+                lastHeartbeat = now
+                R._cfgDirty = false
+                R._cfgSaveCount = (R._cfgSaveCount or 0) + 1
+                R._lastAutoSave = os.date("%H:%M:%S")
+                saveConfig(true)          -- 静默保存（避免刷屏），状态显示在面板上
+            end
+        end
+    end
+end)
 
 -- 独立的界面刷新线程（5Hz）：主循环空闲时要 3 秒才跑一轮，
 -- 倒计时/让路剩余/手持时长挂在它上面就会"一卡一卡"。这里解耦成固定 0.2 秒刷新。
