@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 62
+local VERSION = 63
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -222,6 +222,7 @@ local DEFAULT_CONFIG = {
     washEnabled = false,            -- ⚠ 默认关闭（操作不可撤销，必须你亲自打开）
     washTypes = {},                 -- 要洗掉的突变（默认空 = 什么都不洗）★ 由你勾选
     washRarities = {},              -- 参与的品质（默认空 = 什么都不洗）★ 由你勾选
+    washAutoPreview = true,         -- 去突变页签里的预览列表每 2 秒自动刷新
     solarPauseFishing = true,       -- Solar 期间暂停并取消自动钓鱼（否则会被拉回钓点）
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
@@ -2485,6 +2486,7 @@ local function applyCfgToUI()
         if E.sAutoSaveDelay then E.sAutoSaveDelay:SetValue(tonumber(cfg.autoSaveDelay) or 1.5) end
         if E.dWashTypes then E.dWashTypes:SetValue(cfg.washTypes or {}) end
         if E.dWashRar then E.dWashRar:SetValue(cfg.washRarities or {}) end
+        if E.tWashAuto then E.tWashAuto:SetValue(cfg.washAutoPreview ~= false) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -2548,6 +2550,7 @@ local function readUIIntoCfg()
             local v = E.dWashRar.Value
             cfg.washRarities = (type(v) == "table") and v or {}
         end
+        if E.tWashAuto then cfg.washAutoPreview = E.tWashAuto.Value == true end
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
         cfg.autoFillCandidates = E.tFill.Value == true
@@ -2968,16 +2971,8 @@ local function buildUI()
         })
         wg:AddDivider()
         wg:AddButton({ Text = "预览：会洗哪些角色", Icon = "search", Func = function()
-            refreshCandidates()
-            local t = washTargets()
-            log("—— 去突变预览（共 " .. #t .. " 个符合条件）——")
-            for i = 1, math.min(#t, 12) do
-                local c = t[i]
-                log(string.format("%d) %s [%s] 突变=%s $%s/s", i, c.name, c.rarity, c.ty, fmtCps(c.cps)))
-            end
-            if #t == 0 then
-                log("（没有符合条件的角色 —— 检查上面两个多选是否都勾了）", Color3.fromRGB(255, 180, 80))
-            end
+            R._washPreviewShown = true
+            R.renderWashList()
         end })
         wg:AddButton({ Text = "查看机器状态", Icon = "search", Func = function()
             local st, act = depoState()
@@ -2987,6 +2982,7 @@ local function buildUI()
             log("Depolarizer: " .. tostring(names[st] or st) .. " · prompt='" .. tostring(act) ..
                 "' · 剩余=" .. tostring(tl or "-") .. " · 本次已放入=" .. tostring(WASH.placed) ..
                 " 个 · 上一个=" .. tostring(WASH.lastPlacedName or "-"))
+            R.renderWashList()
             if st == "busy" then
                 log("⚠ 正在洗的时候提示会变成『Skip (Robux)』—— 那是付费跳过，脚本绝不会点它",
                     Color3.fromRGB(255, 180, 80))
@@ -3008,6 +3004,66 @@ local function buildUI()
             if not en then log("prompt 未启用（角色可能没有突变）", Color3.fromRGB(255, 180, 80)) return end
             depoFire(prompt)
             log("已尝试把 " .. tostring(R.hold.name) .. " 放进 Depolarizer", Color3.fromRGB(120, 255, 140))
+        end })
+    end
+
+    --================ 洗突变预览列表（放在「Depolarizer 去突变」下面）
+    do
+        local wl = Tabs.Wash:AddLeftGroupbox("洗突变预览", "list")
+        E.lWashList = wl:AddLabel("点上面的「预览：会洗哪些角色」查看清单", true)
+
+        function R.renderWashList()
+            if not E.lWashList then return end
+            local list = washTargets()
+            local allow = cfg.washRarities or {}
+            local allowT = cfg.washTypes or {}
+            local nR, nT = 0, 0
+            for _ in pairs(allow) do nR = nR + 1 end
+            for _ in pairs(allowT) do nT = nT + 1 end
+            if nR == 0 or nT == 0 then
+                E.lWashList:SetText('<font color="rgb(255,180,80)">⚠ 还没有勾选条件</font>\n' ..
+                    '<font color="rgb(150,150,170)">请先在「要洗掉的突变」和「参与品质」两个多选里勾选</font>')
+                return
+            end
+            if #list == 0 then
+                E.lWashList:SetText('<font color="rgb(200,180,120)">没有符合条件的角色</font>\n' ..
+                    '<font color="rgb(150,150,170)">（当前背包里没有「选中的突变 + 选中的品质」的角色）</font>')
+                return
+            end
+            local lines, total = {}, 0
+            local cap = math.min(#list, 30)
+            for i = 1, cap do
+                local c = list[i]
+                total = total + c.cps
+                local rc = RARITY_COLORS[c.rarity] or Color3.fromRGB(220, 220, 220)
+                lines[#lines + 1] = string.format(
+                    '<font color="rgb(%d,%d,%d)">%2d. %s</font>  <font color="rgb(150,150,170)">[%s]</font>  '
+                    .. '<font color="rgb(255,180,90)">%s</font>  <font color="rgb(120,255,140)">$%s/s</font>',
+                    math.floor(rc.R * 255), math.floor(rc.G * 255), math.floor(rc.B * 255),
+                    i, c.name, c.rarity, c.ty, fmtCps(c.cps))
+            end
+            if #list > cap then
+                lines[#lines + 1] = string.format('<font color="rgb(150,150,170)">   … 还有 %d 个</font>', #list - cap)
+            end
+            lines[#lines + 1] = ""
+            local st = depoState()
+            local busy = (st == "busy")
+            lines[#lines + 1] = string.format(
+                '<font color="rgb(120,220,255)">共 %d 个 · 合计 $%s/s</font>   <font color="rgb(200,200,120)">约需 %.1f 天（按 11.4 小时/个）</font>',
+                #list, fmtCps(total), #list * 11.42 / 24)
+            lines[#lines + 1] = string.format('<font color="rgb(160,160,190)">机器: %s%s</font>',
+                busy and "正在洗（占用中）" or "空闲（会自动放下一个）",
+                busy and (" · 剩余 " .. tostring(depoTimeLeft() or "-")) or "")
+            E.lWashList:SetText(table.concat(lines, "\n"))
+        end
+
+        E.tWashAuto = wl:AddToggle("washAutoPreview", {
+            Text = "自动刷新这个列表", Default = cfg.washAutoPreview ~= false,
+            Tooltip = "每 2 秒自动重扫背包并刷新上面的清单，不用手动点预览",
+        })
+        wl:AddButton({ Text = "刷新列表", Icon = "refresh-cw", Func = function()
+            refreshCandidates()
+            R.renderWashList()
         end })
     end
 
@@ -3301,6 +3357,7 @@ local function buildUI()
             for k, on in pairs(cfg.washTypes) do if on then n[#n + 1] = k end end
             table.sort(n)
             log("要洗掉的突变 = " .. (#n > 0 and table.concat(n, ", ") or "（空 —— 不会洗任何角色）"))
+            if R.renderWashList then pcall(R.renderWashList) end
         end)
     end
     if E.dWashRar then
@@ -3310,7 +3367,11 @@ local function buildUI()
             for k, on in pairs(cfg.washRarities) do if on then n[#n + 1] = k end end
             table.sort(n, function(a, b) return (RARITY_RANK[a] or 0) > (RARITY_RANK[b] or 0) end)
             log("去突变参与品质 = " .. (#n > 0 and table.concat(n, " > ") or "（空 —— 不会洗任何角色）"))
+            if R.renderWashList then pcall(R.renderWashList) end
         end)
+    end
+    if E.tWashAuto then
+        E.tWashAuto:OnChanged(function(v) cfg.washAutoPreview = v == true end)
     end
     E.sLead:OnChanged(function(v) cfg.releaseLeadSeconds = tonumber(v) or 0 end)
     E.tPotions:OnChanged(function(v) cfg.autoStorePotions = v == true; manageHotbar(true) end)
@@ -4074,8 +4135,16 @@ end)
 -- 独立的界面刷新线程（5Hz）：主循环空闲时要 3 秒才跑一轮，
 -- 倒计时/让路剩余/手持时长挂在它上面就会"一卡一卡"。这里解耦成固定 0.2 秒刷新。
 R.threads[#R.threads + 1] = task.spawn(function()
+    local lastWash = 0
     while isCurrent() do
         if R.renderStatus then pcall(R.renderStatus) end
+        -- 去突变预览列表：每 2 秒自动刷新（背包一变就能看到）
+        local now = os.clock()
+        if cfg.washAutoPreview ~= false and R.renderWashList and (now - lastWash) >= 2 then
+            lastWash = now
+            if (not R._lastSummaryAt) or (now - R._lastSummaryAt >= 1) then pcall(refreshCandidates) end
+            pcall(R.renderWashList)
+        end
         task.wait(0.2)
     end
 end)
