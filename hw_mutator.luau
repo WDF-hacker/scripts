@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 56
+local VERSION = 58
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -1444,7 +1444,12 @@ local function tick()
     end
 
     if #R.candidates == 0 or (not R.summary) then refreshCandidates() end
-    local pick = R.candidates[1]
+    -- ⚠ 硬性安全校验：只从"万圣节勾选品质"的候选里挑（逐个复核，不信任列表顺序）。
+    --   突变不可逆 —— 宁可这一轮不持有，也绝不拿没勾选的品质去赌。
+    local pick
+    for _, c in ipairs(R.candidates) do
+        if (cfg.rarities or {})[c.rarity] then pick = c break end
+    end
     if pick then
         applyHold(pick.key, pick.name, pick.rarity)
         log("手持 " .. pick.name .. " [" .. pick.rarity .. "]")
@@ -1882,13 +1887,26 @@ end
 -- 返回 true 表示"现在确实拿着候选角色"
 local function solarEnsureHold()
     if not cfg.solarEnabled then return false end
+    local allow = cfg.solarRarities or {}
     if R.hold.key then
-        if heldName() == R.hold.name then return true end
-        -- 名字暂时不符：可能是 server 还没生效，1.2 秒内先宽容，避免 release/hold 抖动
-        if (os.clock() - (R.hold.since or 0)) < 1.2 then return true end
+        -- ⚠⚠ 硬性安全校验（绝不能被绕过）：当前手持的品质不在勾选里 -> 立刻放手，
+        --     不拿它去赌。突变是不可逆的，宁可漏也不能错。
+        local cr = R.hold.rarity
+        if cr ~= nil and not allow[cr] then
+            log("⚠ Solar 安全拦截：手持 " .. tostring(R.hold.name) .. " [" .. tostring(cr) ..
+                "] 不在你勾选的品质里 -> 立刻放手", Color3.fromRGB(255, 120, 120))
+            applyRelease("Solar 品质不符")
+        elseif heldName() == R.hold.name then
+            return true
+        elseif (os.clock() - (R.hold.since or 0)) < 1.2 then
+            return true
+        end
     end
-    if #R.candidates == 0 then return false end
-    local pick = R.candidates[1]
+    -- 只从"勾选品质"的候选里挑（不信任 R.candidates 的顺序，逐个复核品质）
+    local pick
+    for _, c in ipairs(R.candidates) do
+        if allow[c.rarity] then pick = c break end
+    end
     if not pick then return false end
     applyHold(pick.key, pick.name, pick.rarity)
     return true, pick.name
@@ -1993,11 +2011,15 @@ function solarTick()
             applyRelease("Solar 已突变")
             refreshCandidates()
             R._lastSummaryAt = now
-            -- 立刻换下一只（陨石每 5 秒一颗，不能等）
-            if R.candidates[1] then
-                local pick = R.candidates[1]
-                applyHold(pick.key, pick.name, pick.rarity)
-                log("Solar 换手持 " .. pick.name .. " [" .. pick.rarity .. "]")
+            -- 立刻换下一只（陨石每 5 秒一颗，不能等）—— 同样复核品质
+            local nxt
+            local allow = cfg.solarRarities or {}
+            for _, c in ipairs(R.candidates) do
+                if allow[c.rarity] then nxt = c break end
+            end
+            if nxt then
+                applyHold(nxt.key, nxt.name, nxt.rarity)
+                log("Solar 换手持 " .. nxt.name .. " [" .. nxt.rarity .. "]")
             end
             return
         end
@@ -2027,7 +2049,14 @@ function solarTick()
     end
 
     -- ④ 保证一直持有着（陨石落地那一刻必须已经拿在手上）
+    --    ⚠ 这里也必须复核品质：只挑勾选品质的候选（突变不可逆，宁可漏也不能错）
     if not R.hold.key then solarEnsureHold() end
+    -- 额外一道保险：万一 R.hold 里躺着不在勾选范围的品质，立刻放手
+    if R.hold.key and R.hold.rarity ~= nil and not (cfg.solarRarities or {})[R.hold.rarity] then
+        log("⚠ Solar 安全拦截（tick）：" .. tostring(R.hold.name) .. " [" .. tostring(R.hold.rarity) ..
+            "] 不在勾选品质 -> 放手", Color3.fromRGB(255, 120, 120))
+        applyRelease("Solar 品质不符")
+    end
 end
 
 -- 陨石监听：**每个实例都要新建**（R 跨重载复用，写 `if not R._solarConn` 会让新实例跳过创建，
