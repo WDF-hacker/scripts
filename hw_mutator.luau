@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 63
+local VERSION = 65
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -212,6 +212,7 @@ local DEFAULT_CONFIG = {
     solarRequireCandidate = true,   -- ★ 没有可用的白板角色时完全不介入（不传送、不打断钓鱼）
     solarTeleport = true,           -- 陨石一生成就传送到它的落点
     solarMaxHold = 30,              -- 同一只手持多久没被砸中就换下一只
+    solarCommitSeconds = 4.5,       -- ★ 锁定一颗陨石后站定等它落地的秒数（期间不理新陨石）
     solarPoll = 0.25,               -- Solar 期间主循环间隔（秒）—— 陨石只有 0.5~2 秒窗口，必须快
     holdBurst = true,               -- 手持前做「取消 -> 再拿出」循环，强制游戏刷新跟随角色
     holdBurstGap = 0.02,            -- 每步之间的间隔（秒）—— 要"超快"，默认 0.02
@@ -1990,6 +1991,8 @@ local function solarStop_impl(reason)
     local S = solarState()
     if not S.active then return end
     S.active = false
+    S.commitUntil = 0
+    S.targetXZ = nil
     if R.hold.key then applyRelease("Solar " .. tostring(reason or "结束")) end
     log("☄ Solar 结束（" .. tostring(reason or "") .. "）：陨石 " .. S.meteors ..
         " 颗 · 传送 " .. S.tp .. " 次 · 突变 " .. S.hits .. " 次（目标 " .. S.targets .. "）",
@@ -2057,6 +2060,14 @@ local function solarOnMeteor(d)
     if d:IsA("BasePart") then p = d else pcall(function() p = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart") end) end
     if not p then return end
     local now = os.clock()
+    -- ⭐⭐ 承诺期（commit）：已经锁定一颗陨石、正站在它的落点上等它落地时，
+    --   **绝不能被后面新生成的陨石勾走** —— 否则人物被疯狂拉来拉去，
+    --   永远不站在任何一个落点上，也就永远等不到被砸中（用户实测到的"疯狂切换"）。
+    --   ⚠ 假陨石同样受约束（否则"连发测试"根本验证不到锁定）。
+    if (S.commitUntil or 0) > now then
+        S.skipped = (S.skipped or 0) + 1
+        return
+    end
     -- 去重只看"是不是同一颗"（不能按时间窗去重：连发测试时 0.15 秒内会有多颗，
     -- 时间窗会把后面的陨石全吞掉 -> 表现为"连发时不动"）
     if S.lastMeteorObj == d then return end
@@ -2075,7 +2086,11 @@ local function solarOnMeteor(d)
     if ok then
         S.tp = S.tp + 1
         S.lastTpAt = now
-        log(string.format("☄ 陨石 #%d -> 传送到落点 (%.0f, %.0f)", S.meteors, pos.X, pos.Z),
+        -- 锁定这颗：接下来 commitSeconds 秒内不再理会新陨石，站定等它落地
+        S.commitUntil = now + (tonumber(cfg.solarCommitSeconds) or 4.5)
+        S.targetXZ = string.format("%.0f, %.0f", pos.X, pos.Z)
+        log(string.format("☄ 锁定陨石 #%d -> 传送到落点 (%.0f, %.0f)，站定 %.1f 秒等它落地",
+            S.meteors, pos.X, pos.Z, tonumber(cfg.solarCommitSeconds) or 4.5),
             Color3.fromRGB(255, 180, 90))
         -- ⭐ 每颗陨石都做一次「取消 -> 再拿出」的手持刷新（绕开游戏的"误触"判定），
         --    保证落地那一刻角色确实完整地出现在身后。
@@ -2131,6 +2146,9 @@ function solarTick()
                     Color3.fromRGB(255, 200, 90))
             end
             S.lastHit = now
+            -- 命中后立刻解除锁定：这颗已经结算完了，下一颗可以马上追
+            S.commitUntil = 0
+            S.targetXZ = nil
             applyRelease("Solar 已突变")
             refreshCandidates()
             R._lastSummaryAt = now
@@ -2475,6 +2493,7 @@ local function applyCfgToUI()
         if E.tSolarTp then E.tSolarTp:SetValue(cfg.solarTeleport ~= false) end
         if E.tSolarReq then E.tSolarReq:SetValue(cfg.solarRequireCandidate ~= false) end
         if E.sSolarHold then E.sSolarHold:SetValue(tonumber(cfg.solarMaxHold) or 30) end
+        if E.sSolarCommit then E.sSolarCommit:SetValue(tonumber(cfg.solarCommitSeconds) or 4.5) end
         if E.sSolarPoll then E.sSolarPoll:SetValue(tonumber(cfg.solarPoll) or 0.25) end
         if E.tSolarPauseFish then E.tSolarPauseFish:SetValue(cfg.solarPauseFishing ~= false) end
         if E.tSolarBurst then E.tSolarBurst:SetValue(cfg.solarHoldEveryMeteor ~= false) end
@@ -2533,6 +2552,7 @@ local function readUIIntoCfg()
         if E.tSolarTp then cfg.solarTeleport = E.tSolarTp.Value == true end
         if E.tSolarReq then cfg.solarRequireCandidate = E.tSolarReq.Value == true end
         if E.sSolarHold then cfg.solarMaxHold = tonumber(E.sSolarHold.Value) or 30 end
+        if E.sSolarCommit then cfg.solarCommitSeconds = tonumber(E.sSolarCommit.Value) or 4.5 end
         if E.sSolarPoll then cfg.solarPoll = tonumber(E.sSolarPoll.Value) or 0.25 end
         if E.tSolarPauseFish then cfg.solarPauseFishing = E.tSolarPauseFish.Value == true end
         if E.tSolarBurst then cfg.solarHoldEveryMeteor = E.tSolarBurst.Value == true end
@@ -3110,6 +3130,13 @@ local function buildUI()
             Min = 5, Max = 120, Rounding = 0, Suffix = " 秒",
             Tooltip = "一直没被砸中就换下一只候选",
         })
+        E.sSolarCommit = sg:AddSlider("solarCommitSeconds", {
+            Text = "锁定一颗陨石后站定等待 ★", Default = tonumber(cfg.solarCommitSeconds) or 4.5,
+            Min = 1, Max = 12, Rounding = 1, Suffix = " 秒",
+            Tooltip = "陨石从生成到落地约需 3 秒（Solar）。这段时间内脚本不再理会新陨石，"
+                .. "站定在落点上等它砸下来 —— 否则会被后来的陨石一直勾走，永远等不到被砸中。"
+                .. "Heaven 的流星很快（约 0.8 秒），可以调小。",
+        })
         E.sSolarPoll = sg:AddSlider("solarPoll", {
             Text = "Solar 反应间隔", Default = tonumber(cfg.solarPoll) or 0.25,
             Min = 0.05, Max = 1, Rounding = 2, Suffix = " 秒",
@@ -3299,6 +3326,9 @@ local function buildUI()
     end
     if E.sSolarHold then
         E.sSolarHold:OnChanged(function(v) cfg.solarMaxHold = tonumber(v) or 30 end)
+    end
+    if E.sSolarCommit then
+        E.sSolarCommit:OnChanged(function(v) cfg.solarCommitSeconds = tonumber(v) or 4.5 end)
     end
     if E.sSolarPoll then
         E.sSolarPoll:OnChanged(function(v) cfg.solarPoll = tonumber(v) or 0.25 end)
@@ -3547,11 +3577,23 @@ local function buildUI()
             local S = solarState()
             local air = 0
             for _, d in ipairs(workspace:GetChildren()) do if d.Name == "Meteorite" then air = air + 1 end end
-            E.lSolar:SetText(string.format('Solar: %s · 空中陨石 %d 颗\n陨石 %d · 传送 %d · 突变 %d（目标 %d）\n目标突变: %s',
+            E.lSolar:SetText(string.format('Solar: %s · 空中陨石 %d 颗\n%s\n陨石 %d · 传送 %d · 突变 %d（目标 %d）· 跳过 %d\n目标突变: %s',
                 S.active and '<font color="rgb(120,255,140)">进行中</font>'
                     or (isSolar() and '<font color="rgb(255,200,90)">事件在但未激活</font>')
                     or '<font color="rgb(160,160,180)">未开始</font>',
-                air, S.meteors, S.tp, S.hits, S.targets,
+                air,
+                (function()
+                    local left = (S.commitUntil or 0) - os.clock()
+                    if S.active and left > 0 then
+                        return string.format('<font color="rgb(255,200,90)">☄ 已锁定陨石 (%.0f, %.0f)，站定等待中 %.1f 秒</font>',
+                            tonumber((S.targetXZ or "0, 0"):match("^(%-?%d+)") or 0),
+                            tonumber((S.targetXZ or "0, 0"):match("(%d+)$") or 0), left)
+                    elseif S.active then
+                        return '<font color="rgb(160,200,255)">待命：等下一颗陨石</font>'
+                    end
+                    return '<font color="rgb(150,150,170)">-</font>'
+                end)(),
+                S.meteors, S.tp, S.hits, S.targets, S.skipped or 0,
                 (function()
                     local n = {}
                     for k, on in pairs(solarTargetSet()) do if on then n[#n + 1] = k end end
