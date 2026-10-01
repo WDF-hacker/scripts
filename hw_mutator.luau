@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 36
+local VERSION = 42
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -197,12 +197,12 @@ local DEFAULT_CONFIG = {
     pauseHotbar = false,            -- 暂停接管：完全交还控制权，方便手动整理快捷栏
     manualOverrideSeconds = 60,     -- 你一动快捷栏，脚本自动让路这么多秒
     autoFish = false,               -- 自动钓鱼（点钓鱼按钮 + 开游戏内置自动捕鱼）
-    autoFishTeleport = false,       -- 自己传送钓点（**默认关**：实测点《点击开始钓鱼》游戏会自己传送）
+    autoFishTeleport = true,        -- 允许脚本在"游戏没自己传送"时补一次传送回钓点（兜底）
     pondMargin = 4,                 -- 传送落点距钓点边缘的留白
     pondUseAreaY = true,            -- 使用钓点区域的 Y（否则保持当前高度）
     pondYOffset = 4,                -- 相对钓点区域的 Y 偏移
     fishEnsureAuto = true,          -- 自动确保"内置自动捕鱼"处于开启状态
-    fishStallSeconds = 20,          -- 捕获计数多久不涨就重新点《点击开始钓鱼》
+    fishStallSeconds = 45,          -- 多久没出现"有鱼上钩"就重按《点击开始钓鱼》(15~180)
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
     pollHold = 0.5,
@@ -1213,10 +1213,19 @@ local function hotbarTick()
     end
 end
 
+-- 前向声明：fishTick 的真实定义在后面的「自动钓鱼」模块里（tick 比它更早定义）
+local fishTick
+
 local function tick()
     local now = os.clock()
     takeoverClientInsertHooks()
-    pcall(fishTick)          -- 自动钓鱼维护（独立于事件逻辑，任何事件期间都生效）
+    local okFish, errFish = pcall(fishTick)   -- 自动钓鱼维护（不吞错误，便于排查）
+    if not okFish and cfg.autoFish then
+        if (os.clock() - (R._lastFishErrLog or 0)) > 10 then
+            R._lastFishErrLog = os.clock()
+            log("自动钓鱼出错: " .. tostring(errFish), Color3.fromRGB(255, 120, 120))
+        end
+    end
 
     if not R._lastEventPoll or now - R._lastEventPoll > 2 then
         R._lastEventPoll = now
@@ -1507,6 +1516,13 @@ end
 -- ⭐ 钓鱼会话是否进行中。实测可靠的判据（不要用 [N] 计数，它会在 0/1 之间闪）：
 --   ① 身边有 FishBall（鱼漂，浮标）—— 正常钓鱼时就在 20 格左右
 --   ② 文本是两种钓鱼态之一："Waiting for Catch..." / "Click To Catch!"
+-- ⭐ 判断钓鱼会话是否活着。
+-- ⚠ 踩过的坑：鱼漂(FishBall)在钓鱼结束后**会留在水里**，所以"身边有鱼漂"不能当会话活着的判据，
+--   否则离开河岸、会话已死时脚本会一直以为还在钓，永远不重新点按钮（用户实测踩到）。
+--   文本 "Waiting for Catch..." 在"没开始钓鱼"和"正在等鱼咬钩"两种情况下都出现，也不能单独用。
+--   ✅ 唯一能确定会话活着的强信号：文本出现 "Click To Catch!"（有鱼上钩了）。
+--   （注意：本函数必须定义在 fishText 之后，否则捕获不到那个局部函数）
+
 local function nearestFishBallDist()
     local hrp = rootPart()
     if not hrp then return -1 end
@@ -1528,6 +1544,12 @@ local function fishText()
     return t
 end
 
+-- ✅ 唯一能确定"钓鱼会话活着"的强信号：文本出现 "Click To Catch!"（有鱼上钩了）
+local function fishHasBite()
+    local t = fishText()
+    return (t:find("Click To Catch") ~= nil), t
+end
+
 local function fishSessionActive()
     local d = nearestFishBallDist()
     if d >= 0 and d <= 60 then return true, ("鱼漂 " .. string.format("%.0f", d) .. " 格") end
@@ -1536,34 +1558,53 @@ local function fishSessionActive()
     return false, ("无会话（鱼漂=" .. string.format("%.0f", d) .. " 文本='" .. t .. "'）")
 end
 
-local function fishTick()
+function fishTick()
     if not cfg.autoFish then return end
     local now = os.clock()
     if (now - (FISH.lastAct or 0)) < 2 then return end     -- 动作冷却
 
-    local active, why = fishSessionActive()
-    FISH.lastSession = active
-    FISH.lastWhy = why
+    -- 记录"最后一次看到有鱼上钩"的时间（会话活着的唯一强证据）
+    local bite, txt = fishHasBite()
+    if bite then
+        FISH.lastBite = now
+        FISH.sawBite = true
+    end
+    if (FISH.lastBite or 0) == 0 then FISH.lastBite = now end
 
-    -- ① 没有钓鱼会话 -> 点一次《点击开始钓鱼》。
-    --    实测：游戏会自己把你传送到钓点并开始钓鱼（已在钓点旁就不传送）。
-    if not active then
+    local stall = tonumber(cfg.fishStallSeconds) or 45
+    local idleFor = now - FISH.lastBite
+    FISH.lastWhy = string.format("距上次上钩 %.0f 秒（文本='%s'）", idleFor, txt)
+
+    -- ① 太久没鱼上钩 -> 会话已死（或从没开始）-> 点一次《点击开始钓鱼》。
+    --    实测：不在钓鱼时点它是安全的；游戏通常会自己把你传送到钓点（已在岸边则不传送）。
+    if idleFor > stall then
+        FISH.lastBite = now            -- 重置计时，避免连续点
         FISH.lastAct = now
+        FISH.missCount = (FISH.missCount or 0) + 1
         if clickFish() then
             FISH.starts = (FISH.starts or 0) + 1
-            log("点了一次《点击开始钓鱼》：" .. tostring(why), Color3.fromRGB(140, 220, 255))
+            log("点了一次《点击开始钓鱼》（已 " .. string.format("%.0f", idleFor) .. " 秒没鱼上钩）",
+                Color3.fromRGB(140, 220, 255))
         end
-        task.delay(2.5, function()
-            if isCurrent() and cfg.autoFish and autoFishOn() == false then
-                if setAutoFish(true) then
-                    log("已开启游戏内置自动钓鱼（Auto Fish）", Color3.fromRGB(120, 255, 140))
+        -- 游戏有时不会传送（用户实测：离开河岸后点了也没回去）-> 连续两次没恢复就自己补一次传送
+        if (FISH.missCount or 0) >= 2 and cfg.autoFishTeleport ~= false then
+            local pos, pname, dist = nearestPondPoint()
+            if pos and dist and dist > 5 then
+                if teleportToPond(pos) then
+                    FISH.tp = (FISH.tp or 0) + 1
+                    FISH.missCount = 0
+                    log("连续点了几次都没恢复钓鱼 -> 自己传送到钓点 " .. tostring(pname) ..
+                        "（" .. string.format("%.0f", dist) .. " 格）", Color3.fromRGB(140, 220, 255))
                 end
             end
-        end)
-        return
+        end
+    else
+        FISH.missCount = 0             -- 会话活着 -> 清零
     end
+    -- ⚠ 注意：这里**不能 return**，否则下面的"补开内置自动捕鱼"永远执行不到
+    --   （用户实测踩到：界面显示 AutoFish 已关闭、已补开 0 次）
 
-    -- ② 会话进行中 -> 唯一该做的事：保证内置自动捕鱼开着。
+    -- ② 无论如何都保证内置自动捕鱼开着。
     --    ⚠ 绝不能在这里点 Fish：实测点 Fish = 手动上鱼，而且会把内置自动捕鱼**关掉**！
     --    ⚠ 必须防抖：上鱼动画期间那两个渐变会瞬时闪成"关"，直接补开会导致来回横跳。
     local on = autoFishOn()
@@ -1575,12 +1616,10 @@ local function fishTick()
     if (FISH.offStreak or 0) >= 3 and cfg.fishEnsureAuto ~= false
         and (now - (FISH.lastEnsure or 0)) > 4 then
         FISH.lastEnsure = now
-        FISH.lastAct = now
         if setAutoFish(true) then
             FISH.ensured = FISH.ensured + 1
             FISH.offStreak = 0
-            log("已补开游戏内置自动钓鱼（Auto Fish）（连续 " .. FISH.ensured .. " 次确认关闭）",
-                Color3.fromRGB(120, 255, 140))
+            log("已补开游戏内置自动钓鱼（Auto Fish）", Color3.fromRGB(120, 255, 140))
         end
     end
 end
@@ -1653,7 +1692,7 @@ local function applyCfgToUI()
         if E.tAutoFish then E.tAutoFish:SetValue(cfg.autoFish == true) end
         if E.tFishEnsure then E.tFishEnsure:SetValue(cfg.fishEnsureAuto ~= false) end
         if E.sFishStall then E.sFishStall:SetValue(tonumber(cfg.fishStallSeconds) or 15) end
-        if E.tFishTp then E.tFishTp:SetValue(cfg.autoFishTeleport == true) end
+        if E.tFishTp then E.tFishTp:SetValue(cfg.autoFishTeleport ~= false) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -1755,6 +1794,7 @@ end
 R.cleanupStaleUI = cleanupStaleObsidianUI
 
 local function buildUI()
+    R.uiError = nil          -- 清掉上一版遗留的错误串（R 跨重载复用，否则会一直显示旧错误）
     -- ⚠ 必须在加载 Obsidian 之前清扫：库在 loadstring 执行时就会创建自己的
     --   "Obsidian" ScreenGui，若在之后清扫会把新建的也一起删掉（导致 UI 消失）
     local stale = cleanupStaleObsidianUI()
@@ -1988,14 +2028,15 @@ local function buildUI()
             Tooltip = "每 2 秒复查一次；发现被关掉了就自动点回去",
         })
         E.sFishStall = fg:AddSlider("fishStallSeconds", {
-            Text = "卡住多久后重按钓鱼", Default = tonumber(cfg.fishStallSeconds) or 15,
-            Min = 5, Max = 120, Rounding = 0, Suffix = " 秒",
-            Tooltip = "捕获计数长时间不涨就认为卡住，重新点一次钓鱼按钮",
+            Text = "多久没鱼上钩就重按钓鱼", Default = tonumber(cfg.fishStallSeconds) or 45,
+            Min = 15, Max = 180, Rounding = 0, Suffix = " 秒",
+            Tooltip = "钓鱼结束后鱼漂会留在水里，所以只能用「多久没出现 Click To Catch!」判断会话是否还活着。"
+                .. "超过这个时间没鱼上钩，就重新点一次《点击开始钓鱼》（游戏会自己传送回钓点）。",
         })
         E.tFishTp = fg:AddToggle("autoFishTeleport", {
-            Text = "自己传送钓点（一般不需要）", Default = cfg.autoFishTeleport == true,
-            Tooltip = "实测：点《点击开始钓鱼》游戏自己会把你传送到钓点，所以默认关闭。"
-                .. "只有在游戏没传送、或你想手动换钓点时再打开。",
+            Text = "游戏没传送时自己补一次 ★", Default = cfg.autoFishTeleport ~= false,
+            Tooltip = "实测点《点击开始钓鱼》游戏通常会自己传送回钓点，但有时不会（尤其你离开河岸后）。"
+                .. "开启后：连续点了几次都没恢复钓鱼，脚本就自己把你传回最近的钓点。",
         })
         E.lFishPond = fg:AddLabel("钓点: —", true)
         fg:AddDivider()
@@ -2272,15 +2313,17 @@ local function buildUI()
         -- 钓鱼状态
         if E.lFish then
             local on = autoFishOn()
-            local active, why = fishSessionActive()
+            local bite = fishHasBite()
+            local idle = os.clock() - (FISH.lastBite or os.clock())
             local state = (on == true) and '<font color="rgb(120,255,140)">已开启</font>'
                 or (on == false) and '<font color="rgb(255,200,90)">已关闭</font>'
                 or '<font color="rgb(160,160,180)">读不到</font>'
-            E.lFish:SetText(string.format('自动钓鱼: %s · 内置AutoFish %s\n会话: %s（%s）\n已开始 %d 次 · 已补开 %d 次',
+            E.lFish:SetText(string.format('自动钓鱼: %s · 内置AutoFish %s\n状态: %s · 距上次上钩 %.0f 秒（阈值 %d 秒）\n重按钓鱼 %d 次 · 补开自动捕鱼 %d 次 · 补传送 %d 次',
                 cfg.autoFish and '<font color="rgb(120,255,140)">运行中</font>' or '<font color="rgb(160,160,180)">未启用</font>',
                 state,
-                active and '<font color="rgb(120,255,140)">进行中</font>' or '<font color="rgb(255,200,90)">无</font>',
-                tostring(why), FISH.starts or 0, FISH.ensured))
+                bite and '<font color="rgb(120,255,140)">有鱼上钩</font>' or '<font color="rgb(255,200,90)">等待中</font>',
+                idle, tonumber(cfg.fishStallSeconds) or 45,
+                FISH.starts or 0, FISH.ensured, FISH.tp or 0))
         end
 
         -- 钓点状态
@@ -2473,9 +2516,10 @@ end
 R.clearSelection = function() return clientClearSelection() end
 -- 自动钓鱼 API
 R.fishStatus = function()
-    local active, why = fishSessionActive()
-    return { enabled = cfg.autoFish, autoFishOn = autoFishOn(), sessionActive = active, sessionWhy = why,
-             ballDist = nearestFishBallDist(), text = fishText(),
+    local bite, txt = fishHasBite()
+    return { enabled = cfg.autoFish, autoFishOn = autoFishOn(), hasBite = bite, text = txt,
+             ballDist = nearestFishBallDist(),
+             idleSec = os.clock() - (FISH.lastBite or os.clock()),
              clicks = FISH.clicks, ensured = FISH.ensured, starts = FISH.starts or 0 }
 end
 R.fishOn = function(v)
