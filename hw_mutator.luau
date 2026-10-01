@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 54
+local VERSION = 56
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -204,14 +204,16 @@ local DEFAULT_CONFIG = {
     fishEnsureAuto = true,          -- 自动确保"内置自动捕鱼"处于开启状态
     fishStallSeconds = 45,          -- 多久没出现"有鱼上钩"就重按《点击开始钓鱼》(15~180)
     solarEnabled = true,            -- Solar 陨石雨模块
-    solarTargets = { Mars = true }, -- 想要的 Solar 突变（默认只要火星，倍数 6 最高）
+    solarTargets = { Mars = true, Angelic = true }, -- 想要的突变（Solar→Mars 6x / Heaven→Angelic 天使 6x）
     solarRarities = { Ancient = true, Celestial = true },   -- Solar 用哪些品质的角色去赌
     solarTeleport = true,           -- 陨石一生成就传送到它的落点
     solarMaxHold = 30,              -- 同一只手持多久没被砸中就换下一只
     solarPoll = 0.25,               -- Solar 期间主循环间隔（秒）—— 陨石只有 0.5~2 秒窗口，必须快
-    holdBurst = true,               -- 手持前先「取消 -> 再拿出」一次，强制游戏刷新跟随角色
-    holdBurstGap = 0.05,            -- 取消与再拿出之间的间隔（秒）
+    holdBurst = true,               -- 手持前做「取消 -> 再拿出」循环，强制游戏刷新跟随角色
+    holdBurstGap = 0.02,            -- 每步之间的间隔（秒）—— 要"超快"，默认 0.02
+    holdBurstCycles = 2,            -- 循环轮数：2 轮 = 连点 4 下（实测无缝衔接）
     solarHoldEveryMeteor = true,    -- 每颗陨石都强制刷新一次手持（解决游戏"误触"导致角色不到身后）
+    fallMinY = 110,                 -- 判定"高空掉落物"的 Y 阈值（Solar 陨石/Heaven 流星通用）
     solarPauseFishing = true,       -- Solar 期间暂停并取消自动钓鱼（否则会被拉回钓点）
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
@@ -590,20 +592,24 @@ local function clientClearSelection()
 end
 
 --============================================================== 手持强制刷新
--- 游戏自带 bug：包里有多只同品质角色时，紧接着再手持会被判定成"误触"，
---   角色不走完整的"消失 -> 重新出现在身后"循环（表现为角色不消失、而是一路跑过去）。
--- 实测对策（用户发现）：**先取消手持、再把角色拿出来一次**就能刷新。
---   （注意不是"手持两次"—— 游戏需要先看到角色回到背包，才会走完整循环。）
--- 最终状态一定是"持有着"，否则落地判定收不到。
+-- 游戏自带 bug：包里有多只同品质角色、或相邻两颗陨石太近时，紧接着再手持会被判定成"误触"，
+--   角色不走完整的"消失 -> 重新出现在身后"循环（表现为角色不消失、而是一路慢慢跑过来）。
+-- 实测对策（用户发现）：**超快速地连点 4 下 = 做两轮「取消 -> 再拿出」** 可以无缝衔接、瞬间掏出角色。
+--   单轮太快不够，游戏要看到"回到背包 + 再拿出"完整两次才会走完刷新。
+-- 最终状态一定是"持有着"，否则落地判定收不到（循环以 doHold 结尾）。
 local function doHoldRefresh(key)
     if cfg.holdBurst == false then
         doHold(key)
         return
     end
-    local gap = tonumber(cfg.holdBurstGap) or 0.05
-    doRelease()                       -- ① 先取消（让游戏看到角色回背包）
-    if gap > 0 then task.wait(gap) end
-    doHold(key)                       -- ② 再拿出来 -> 触发完整的刷新循环
+    local gap = tonumber(cfg.holdBurstGap) or 0.02
+    local cycles = math.max(1, math.floor(tonumber(cfg.holdBurstCycles) or 2))
+    for _ = 1, cycles do
+        doRelease()                      -- 取消（让游戏看到角色回背包）
+        if gap > 0 then task.wait(gap) end
+        doHold(key)                      -- 再拿出来
+        if gap > 0 then task.wait(gap) end
+    end
 end
 
 --============================================================== 手持控制
@@ -1172,16 +1178,28 @@ local function eventRemaining()
 end
 R.eventRemaining = eventRemaining
 
--- Solar 活动（陨石雨）：完全独立的机制 —— 不是手持每秒 roll，而是**陨石落点范围判定**
+-- 天降类活动（掉落物砸中手持角色 -> 突变）。两者机制相同，合并成一个模块：
+--   Solar  ：陨石 Meteorite，FallSpeed=50，ImpactRadius=50，每 5 秒一颗
+--   Heaven ：流星 Falling Star，**FallSpeed=190（快得多！）**，每 10 秒一颗
+--           另有 Impact 机制（每 7.5 秒在玩家 35 格内生成、持续 7 秒）
+-- 目标突变：Solar -> Mars(6x)；Heaven -> Angelic(天使, 用户实测 x6)
+local FALL_EVENTS = { Solar = true, Heaven = true }
+local function fallEventName()
+    if not (R.event.active and R.event.name) then return nil end
+    if not FALL_EVENTS[R.event.name] then return nil end
+    if eventRemaining() <= 0 then return nil end
+    return R.event.name
+end
+
 local function isSolar()
     -- ⚠ 强制测试时同样要让位于真实事件（绝不为测试把角色暴露在真实突变里）
     if R._force and os.clock() < (R._force.until_ or 0) then
-        if R.event.active and R.event.name and R.event.name ~= "Solar" and eventRemaining() > 0 then
+        if R.event.active and R.event.name and not FALL_EVENTS[R.event.name] and eventRemaining() > 0 then
             return false
         end
-        return R._force.name == "Solar"
+        return R._force.name == "Solar" or R._force.name == "Heaven"
     end
-    return R.event.active and R.event.name == "Solar" and eventRemaining() > 0
+    return fallEventName() ~= nil
 end
 
 local function isHalloween()
@@ -1881,7 +1899,21 @@ solarStart = solarStart_impl
 solarStop = solarStop_impl
 
 -- 陨石生成回调：事件驱动、零延迟（轮询绝对来不及）
-local function solarOnMeteor(d)    if not cfg.solarEnabled or d.Name ~= "Meteorite" then return end
+local function solarOnMeteor(d)
+    if not cfg.solarEnabled then return end
+    -- ⭐ 按高度识别掉落物：Solar 的叫 Meteorite，Heaven 的流星名字未知，
+    --    统一规则 = "新出现的高空物体"（Threshold 可调 cfg.fallMinY，默认 110）。
+    if d.Name ~= "Meteorite" then
+        local q
+        if d:IsA("BasePart") then q = d
+        elseif d:IsA("Model") then pcall(function() q = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart") end) end
+        if not q then return end
+        local okY, y = pcall(function() return q.Position.Y end)
+        if not okY or type(y) ~= "number" then return end
+        if y < (tonumber(cfg.fallMinY) or 110) then return end
+        -- 玩家自己的角色不算
+        if game:GetService("Players"):GetPlayerFromCharacter(d) then return end
+    end
     -- 我们自己造的假陨石：无条件走传送路径（用于测试）。
     -- 它是本地造的假对象，不会触发服务端判定，所以没有"被别的突变烧掉"的风险。
     local isTest = (R._solarTestActive == true) or (R._testMeteor ~= nil and d == R._testMeteor)
@@ -2087,7 +2119,8 @@ local function applyCfgToUI()
         if E.tSolarPauseFish then E.tSolarPauseFish:SetValue(cfg.solarPauseFishing ~= false) end
         if E.tSolarBurst then E.tSolarBurst:SetValue(cfg.solarHoldEveryMeteor ~= false) end
         if E.tBurst then E.tBurst:SetValue(cfg.holdBurst ~= false) end
-        if E.sBurstGap then E.sBurstGap:SetValue(tonumber(cfg.holdBurstGap) or 0.05) end
+        if E.sBurstGap then E.sBurstGap:SetValue(tonumber(cfg.holdBurstGap) or 0.02) end
+        if E.sBurstCycles then E.sBurstCycles:SetValue(tonumber(cfg.holdBurstCycles) or 2) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -2137,7 +2170,8 @@ local function readUIIntoCfg()
         if E.tSolarPauseFish then cfg.solarPauseFishing = E.tSolarPauseFish.Value == true end
         if E.tSolarBurst then cfg.solarHoldEveryMeteor = E.tSolarBurst.Value == true end
         if E.tBurst then cfg.holdBurst = E.tBurst.Value == true end
-        if E.sBurstGap then cfg.holdBurstGap = tonumber(E.sBurstGap.Value) or 0.05 end
+        if E.sBurstGap then cfg.holdBurstGap = tonumber(E.sBurstGap.Value) or 0.02 end
+        if E.sBurstCycles then cfg.holdBurstCycles = math.max(1, math.floor(tonumber(E.sBurstCycles.Value) or 2)) end
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
         cfg.autoFillCandidates = E.tFill.Value == true
@@ -2495,8 +2529,10 @@ local function buildUI()
         sg:AddDivider()
         E.dSolarTargets = sg:AddDropdown("solarTargets", {
             Text = "想要的 Solar 突变",
-            Values = { Mars = "Mars 火星（倍数 6，最高）★", Lava = "Lava 岩浆（2）",
-                       Gold = "Gold 黄金（1.25）", Solar = "Solar", Blood = "Blood", Honey = "Honey" },
+            Values = { Mars = "Mars 火星（Solar，倍数 6）★", Angelic = "Angelic 天使（Heaven，倍数 6）★",
+                       Lava = "Lava 岩浆（2）", Gold = "Gold 黄金（1.25）",
+                       Solar = "Solar", Blood = "Blood", Honey = "Honey",
+                       Nightmare = "Nightmare", Diamond = "Diamond", Ghost = "Ghost", Slime = "Slime" },
             Multi = true, Default = cfg.solarTargets or { Mars = true },
         })
         -- Solar 专属品质选择（与万圣节的品质勾选独立）
@@ -2539,9 +2575,14 @@ local function buildUI()
             Tooltip = "对所有手持生效（Solar + 万圣节通用）。关闭则退化成单次手持。",
         })
         E.sBurstGap = sg:AddSlider("holdBurstGap", {
-            Text = "取消→拿出 的间隔", Default = tonumber(cfg.holdBurstGap) or 0.05,
-            Min = 0, Max = 0.4, Rounding = 2, Suffix = " 秒",
-            Tooltip = "太小可能被游戏判定成误触、太大可能落地前来不及；默认 0.05 秒。",
+            Text = "每步间隔", Default = tonumber(cfg.holdBurstGap) or 0.02,
+            Min = 0, Max = 0.3, Rounding = 2, Suffix = " 秒",
+            Tooltip = "取消/拿出之间等多久。要『超快』就调小（默认 0.02）；被判定成误触就调大。",
+        })
+        E.sBurstCycles = sg:AddSlider("holdBurstCycles", {
+            Text = "刷新手持轮数", Default = tonumber(cfg.holdBurstCycles) or 2,
+            Min = 1, Max = 4, Rounding = 0, Suffix = " 轮",
+            Tooltip = "1 轮 = 取消+拿出（2 次发包）；2 轮 = 连点 4 下，实测能无缝衔接快速掏出角色（默认 2）。",
         })
         sg:AddDivider()
         sg:AddButton({ Text = "★ 完整模拟测试（假陨石）", Icon = "flask-conical", Func = function()
@@ -2717,7 +2758,10 @@ local function buildUI()
         end)
     end
     if E.sBurstGap then
-        E.sBurstGap:OnChanged(function(v) cfg.holdBurstGap = tonumber(v) or 0.05 end)
+        E.sBurstGap:OnChanged(function(v) cfg.holdBurstGap = tonumber(v) or 0.02 end)
+    end
+    if E.sBurstCycles then
+        E.sBurstCycles:OnChanged(function(v) cfg.holdBurstCycles = math.max(1, math.floor(tonumber(v) or 2)) end)
     end
     E.sLead:OnChanged(function(v) cfg.releaseLeadSeconds = tonumber(v) or 0 end)
     E.tPotions:OnChanged(function(v) cfg.autoStorePotions = v == true; manageHotbar(true) end)
