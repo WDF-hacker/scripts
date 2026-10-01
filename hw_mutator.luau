@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 30
+local VERSION = 36
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -196,6 +196,13 @@ local DEFAULT_CONFIG = {
     useNamecallHook = false,        -- ⚠ 默认关：实测它会破坏游戏自身的 FireServer（右键失效）
     pauseHotbar = false,            -- 暂停接管：完全交还控制权，方便手动整理快捷栏
     manualOverrideSeconds = 60,     -- 你一动快捷栏，脚本自动让路这么多秒
+    autoFish = false,               -- 自动钓鱼（点钓鱼按钮 + 开游戏内置自动捕鱼）
+    autoFishTeleport = false,       -- 自己传送钓点（**默认关**：实测点《点击开始钓鱼》游戏会自己传送）
+    pondMargin = 4,                 -- 传送落点距钓点边缘的留白
+    pondUseAreaY = true,            -- 使用钓点区域的 Y（否则保持当前高度）
+    pondYOffset = 4,                -- 相对钓点区域的 Y 偏移
+    fishEnsureAuto = true,          -- 自动确保"内置自动捕鱼"处于开启状态
+    fishStallSeconds = 20,          -- 捕获计数多久不涨就重新点《点击开始钓鱼》
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
     pollHold = 0.5,
@@ -1209,6 +1216,7 @@ end
 local function tick()
     local now = os.clock()
     takeoverClientInsertHooks()
+    pcall(fishTick)          -- 自动钓鱼维护（独立于事件逻辑，任何事件期间都生效）
 
     if not R._lastEventPoll or now - R._lastEventPoll > 2 then
         R._lastEventPoll = now
@@ -1336,6 +1344,247 @@ local function mainLoop()
     end)
 end
 
+--============================================================== 自动钓鱼
+-- 实测（本游戏）：
+--   MainGui.FishAction.Fish      主钓鱼按钮（开始钓鱼）
+--   MainGui.FishAction.AutoFish  「Auto Fish」游戏内置自动钓鱼 —— **免费**（无 Purchase/Robux 子项）
+--   MainGui.FishAction.QuickFish 「Quick Fish」—— **有 Purchase/Robux 子项 = 付费**，本脚本绝不点它
+--   三个按钮各有 1 个 MouseButton1Click / Activated 连接 -> firesignal 可用
+--   开关状态 = AutoFish.Enabled(UIGradient).Enabled==true 且 Disabled.Enabled==false
+--     （实测点击会精确翻转这两个值：true/false -> false/true）
+--   捕获计数在 FishAction.TextLabel 里，形如 "Waiting for Catch... [N]"
+local FISH = { lastCount = nil, lastChange = 0, clicks = 0, ensured = 0, lastEnsure = 0 }
+
+local function fishActionGui()
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local mg = pg and pg:FindFirstChild("MainGui")
+    return mg and mg:FindFirstChild("FishAction")
+end
+
+local function fireClick(btn)
+    if not btn then return false end
+    local ok = false
+    pcall(function()
+        if type(firesignal) == "function" and btn.MouseButton1Click then
+            -- ⚠ 只触发 MouseButton1Click：实测 Activated 那条路对 AutoFish 是空操作，
+            --   同时触发两个信号有"处理器被执行两次"的风险（切换类按钮会互相抵消）。
+            firesignal(btn.MouseButton1Click)
+            ok = true
+        end
+    end)
+    return ok
+end
+
+-- 是否正在钓鱼：CloseBTN（取消钓鱼按钮）只在钓鱼进行中可见
+local function isFishing()
+    local fa = fishActionGui()
+    local cb = fa and fa:FindFirstChild("CloseBTN")
+    if not cb then return nil end
+    local v = nil
+    pcall(function() v = cb.Visible end)
+    return v
+end
+
+--============================================================== 钓点（PONDAREA）
+-- 实测：钓鱼必须在钓点区域内才能开始（不在区域内点按钮毫无反应）。
+--   Workspace.Scripted.PondAreas.PONDAREA<n>          -- 扁平的触发区域（Y 尺寸为 0，且有旋转！）
+--   Workspace.Scripted.PondAreasTeleports.TPPONDAREA<n> -- 1x1 传送垫
+-- 判定必须用 CFrame:PointToObjectSpace（不能用世界坐标直接比，区域是旋转过的）。
+local function pondAreas()
+    local t = {}
+    local s = workspace:FindFirstChild("Scripted")
+    local pa = s and s:FindFirstChild("PondAreas")
+    if pa then
+        for _, d in ipairs(pa:GetChildren()) do
+            if d:IsA("BasePart") then t[#t + 1] = d end
+        end
+    end
+    if #t == 0 then
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("BasePart") and d.Name:upper():find("PONDAREA") and not d.Name:upper():find("^TP") then
+                t[#t + 1] = d
+            end
+        end
+    end
+    return t
+end
+
+local function rootPart()
+    local ch = LocalPlayer.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart")
+end
+
+-- 返回当前所在的钓点名（nil = 不在钓点内）
+local function inPond()
+    local hrp = rootPart()
+    if not hrp then return nil end
+    for _, p in ipairs(pondAreas()) do
+        local rel = p.CFrame:PointToObjectSpace(hrp.Position)
+        if math.abs(rel.X) <= p.Size.X / 2 and math.abs(rel.Z) <= p.Size.Z / 2 then return p.Name end
+    end
+    return nil
+end
+
+-- 区域内的"离玩家最近"的落点（把玩家位置夹进区域，留边距）
+local function nearestPondPoint()
+    local hrp = rootPart()
+    if not hrp then return nil end
+    local areas = pondAreas()
+    if #areas == 0 then return nil end
+    local margin = tonumber(cfg.pondMargin) or 4
+    local bestPos, bestD, bestName
+    for _, p in ipairs(areas) do
+        local hx = math.max(p.Size.X / 2 - margin, 0.5)
+        local hz = math.max(p.Size.Z / 2 - margin, 0.5)
+        local rel = p.CFrame:PointToObjectSpace(hrp.Position)
+        local lp = Vector3.new(math.clamp(rel.X, -hx, hx), 0, math.clamp(rel.Z, -hz, hz))
+        local world = p.CFrame * lp
+        local flat = Vector3.new(world.X, hrp.Position.Y, world.Z)
+        local d = (flat - hrp.Position).Magnitude
+        if not bestD or d < bestD then
+            bestD, bestPos, bestName = d, world, p.Name
+        end
+    end
+    return bestPos, bestName, bestD
+end
+
+local function teleportToPond(pos)
+    local hrp = rootPart()
+    if not hrp or not pos then return false end
+    local y = hrp.Position.Y
+    if cfg.pondUseAreaY ~= false then
+        y = pos.Y + (tonumber(cfg.pondYOffset) or 4)
+    end
+    local ok = pcall(function()
+        hrp.CFrame = CFrame.new(Vector3.new(pos.X, y, pos.Z))
+    end)
+    -- 速度清零，避免惯性把角色带出区域
+    pcall(function()
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+    return ok
+end
+
+local function autoFishOn()
+    local fa = fishActionGui()
+    local b = fa and fa:FindFirstChild("AutoFish")
+    if not b then return nil end
+    local en, dis = b:FindFirstChild("Enabled"), b:FindFirstChild("Disabled")
+    local e1, e2
+    pcall(function() e1 = en.Enabled end)
+    pcall(function() e2 = dis.Enabled end)
+    if e1 == nil and e2 == nil then return nil end
+    return (e1 == true and e2 ~= true)
+end
+
+local function setAutoFish(want)
+    local cur = autoFishOn()
+    if cur == nil then return false, "读不到状态" end
+    if cur == want then return true, "已是目标状态" end
+    local fa = fishActionGui()
+    local ok = fireClick(fa and fa:FindFirstChild("AutoFish"))
+    if ok then FISH.ensured = FISH.ensured + 1 end
+    return ok, (want and "已开启" or "已关闭")
+end
+
+local function fishCatchCount()
+    local fa = fishActionGui()
+    local tl = fa and fa:FindFirstChild("TextLabel")
+    if not tl then return nil end
+    local txt = ""
+    pcall(function() txt = tl.Text end)
+    return tonumber(txt:match("%[(%d+)%]")), txt
+end
+
+local function clickFish()
+    local fa = fishActionGui()
+    local ok = fireClick(fa and fa:FindFirstChild("Fish"))
+    if ok then FISH.clicks = FISH.clicks + 1 end
+    return ok
+end
+
+-- ⭐ 钓鱼会话是否进行中。实测可靠的判据（不要用 [N] 计数，它会在 0/1 之间闪）：
+--   ① 身边有 FishBall（鱼漂，浮标）—— 正常钓鱼时就在 20 格左右
+--   ② 文本是两种钓鱼态之一："Waiting for Catch..." / "Click To Catch!"
+local function nearestFishBallDist()
+    local hrp = rootPart()
+    if not hrp then return -1 end
+    local best = math.huge
+    for _, d in ipairs(workspace:GetChildren()) do
+        if d:IsA("BasePart") and d.Name == "FishBall" then
+            local dist = (d.Position - hrp.Position).Magnitude
+            if dist < best then best = dist end
+        end
+    end
+    return best == math.huge and -1 or best
+end
+
+local function fishText()
+    local fa = fishActionGui()
+    local tl = fa and fa:FindFirstChild("TextLabel")
+    local t = ""
+    if tl then pcall(function() t = tl.Text end) end
+    return t
+end
+
+local function fishSessionActive()
+    local d = nearestFishBallDist()
+    if d >= 0 and d <= 60 then return true, ("鱼漂 " .. string.format("%.0f", d) .. " 格") end
+    local t = fishText()
+    if t:find("Waiting for Catch") or t:find("Click To Catch") then return true, t end
+    return false, ("无会话（鱼漂=" .. string.format("%.0f", d) .. " 文本='" .. t .. "'）")
+end
+
+local function fishTick()
+    if not cfg.autoFish then return end
+    local now = os.clock()
+    if (now - (FISH.lastAct or 0)) < 2 then return end     -- 动作冷却
+
+    local active, why = fishSessionActive()
+    FISH.lastSession = active
+    FISH.lastWhy = why
+
+    -- ① 没有钓鱼会话 -> 点一次《点击开始钓鱼》。
+    --    实测：游戏会自己把你传送到钓点并开始钓鱼（已在钓点旁就不传送）。
+    if not active then
+        FISH.lastAct = now
+        if clickFish() then
+            FISH.starts = (FISH.starts or 0) + 1
+            log("点了一次《点击开始钓鱼》：" .. tostring(why), Color3.fromRGB(140, 220, 255))
+        end
+        task.delay(2.5, function()
+            if isCurrent() and cfg.autoFish and autoFishOn() == false then
+                if setAutoFish(true) then
+                    log("已开启游戏内置自动钓鱼（Auto Fish）", Color3.fromRGB(120, 255, 140))
+                end
+            end
+        end)
+        return
+    end
+
+    -- ② 会话进行中 -> 唯一该做的事：保证内置自动捕鱼开着。
+    --    ⚠ 绝不能在这里点 Fish：实测点 Fish = 手动上鱼，而且会把内置自动捕鱼**关掉**！
+    --    ⚠ 必须防抖：上鱼动画期间那两个渐变会瞬时闪成"关"，直接补开会导致来回横跳。
+    local on = autoFishOn()
+    if on == false then
+        FISH.offStreak = (FISH.offStreak or 0) + 1
+    else
+        FISH.offStreak = 0
+    end
+    if (FISH.offStreak or 0) >= 3 and cfg.fishEnsureAuto ~= false
+        and (now - (FISH.lastEnsure or 0)) > 4 then
+        FISH.lastEnsure = now
+        FISH.lastAct = now
+        if setAutoFish(true) then
+            FISH.ensured = FISH.ensured + 1
+            FISH.offStreak = 0
+            log("已补开游戏内置自动钓鱼（Auto Fish）（连续 " .. FISH.ensured .. " 次确认关闭）",
+                Color3.fromRGB(120, 255, 140))
+        end
+    end
+end
+
 --============================================================== Obsidian 加载
 local LIB_FILES = {
     Library = { file = "obsidian_Library.lua", url = OBSIDIAN_REPO .. "Library.lua" },
@@ -1401,6 +1650,10 @@ local function applyCfgToUI()
         E.tRelease:SetValue(cfg.releaseOnEventEnd ~= false)
         E.tForeign:SetValue(cfg.releaseForeignHold ~= false)
         E.tFrame:SetValue(cfg.nativeSelectionFrame ~= false)
+        if E.tAutoFish then E.tAutoFish:SetValue(cfg.autoFish == true) end
+        if E.tFishEnsure then E.tFishEnsure:SetValue(cfg.fishEnsureAuto ~= false) end
+        if E.sFishStall then E.sFishStall:SetValue(tonumber(cfg.fishStallSeconds) or 15) end
+        if E.tFishTp then E.tFishTp:SetValue(cfg.autoFishTeleport == true) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -1431,6 +1684,10 @@ local function readUIIntoCfg()
         cfg.releaseOnEventEnd = E.tRelease.Value == true
         cfg.releaseForeignHold = E.tForeign.Value == true
         cfg.nativeSelectionFrame = E.tFrame.Value == true
+        if E.tAutoFish then cfg.autoFish = E.tAutoFish.Value == true end
+        if E.tFishEnsure then cfg.fishEnsureAuto = E.tFishEnsure.Value == true end
+        if E.sFishStall then cfg.fishStallSeconds = tonumber(E.sFishStall.Value) or 15 end
+        if E.tFishTp then cfg.autoFishTeleport = E.tFishTp.Value == true end
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
         cfg.autoFillCandidates = E.tFill.Value == true
@@ -1544,6 +1801,7 @@ local function buildUI()
     local Tabs = {
         Main = Window:AddTab("主控", "crosshair"),
         Hotbar = Window:AddTab("快捷栏", "layout-grid"),
+        Fish = Window:AddTab("钓鱼", "fish"),
         Log = Window:AddTab("记录", "scroll-text"),
         Config = Window:AddTab("配置", "settings"),
     }
@@ -1715,6 +1973,63 @@ local function buildUI()
         log(lib and "UI 库已更新（重进/重载脚本后生效）" or "UI 库更新失败")
     end })
 
+    --================ 钓鱼
+    do
+        local fg = Tabs.Fish:AddLeftGroupbox("自动钓鱼", "fish")
+        E.tAutoFish = fg:AddToggle("autoFish", {
+            Text = "启用自动钓鱼 ★", Default = cfg.autoFish == true,
+            Tooltip = "自动点游戏的钓鱼按钮，并打开游戏内置的「Auto Fish」。"
+                .. "注意：只会点免费的那个，绝不碰付费的 Quick Fish。",
+        })
+        E.lFish = fg:AddLabel("状态: —", true)
+        fg:AddDivider()
+        E.tFishEnsure = fg:AddToggle("fishEnsureAuto", {
+            Text = "自动保持内置自动捕鱼开启", Default = cfg.fishEnsureAuto ~= false,
+            Tooltip = "每 2 秒复查一次；发现被关掉了就自动点回去",
+        })
+        E.sFishStall = fg:AddSlider("fishStallSeconds", {
+            Text = "卡住多久后重按钓鱼", Default = tonumber(cfg.fishStallSeconds) or 15,
+            Min = 5, Max = 120, Rounding = 0, Suffix = " 秒",
+            Tooltip = "捕获计数长时间不涨就认为卡住，重新点一次钓鱼按钮",
+        })
+        E.tFishTp = fg:AddToggle("autoFishTeleport", {
+            Text = "自己传送钓点（一般不需要）", Default = cfg.autoFishTeleport == true,
+            Tooltip = "实测：点《点击开始钓鱼》游戏自己会把你传送到钓点，所以默认关闭。"
+                .. "只有在游戏没传送、或你想手动换钓点时再打开。",
+        })
+        E.lFishPond = fg:AddLabel("钓点: —", true)
+        fg:AddDivider()
+        fg:AddButton({ Text = "传送到最近钓点", Icon = "map-pin", Func = function()
+            local pos, name, dist = nearestPondPoint()
+            if not pos then log("找不到钓点区域", Color3.fromRGB(255, 120, 120)) return end
+            teleportToPond(pos)
+            log("已传送到钓点 " .. tostring(name) .. "（" .. string.format("%.0f", dist) .. " 格）")
+        end })
+        fg:AddButton({ Text = "查看钓点状态", Icon = "search", Func = function()
+            local areas = pondAreas()
+            local pos, name, dist = nearestPondPoint()
+            log("钓点区域 " .. #areas .. " 个 · 当前在: " .. tostring(inPond()) ..
+                " · 最近: " .. tostring(name) .. " " .. string.format("%.0f", dist or -1) .. " 格" ..
+                " · 钓鱼中: " .. tostring(isFishing()))
+        end })
+        fg:AddDivider()
+        fg:AddButton({ Text = "立刻开一次钓鱼", Icon = "play", Func = function()
+            local ok = clickFish()
+            setAutoFish(true)
+            log("已点击钓鱼按钮 ok=" .. tostring(ok))
+        end })
+        fg:AddButton({ Text = "切换内置自动捕鱼", Icon = "repeat", Func = function()
+            local cur = autoFishOn()
+            if cur == nil then log("读不到自动捕鱼状态（UI 可能没加载）", Color3.fromRGB(255, 180, 80)) return end
+            local ok, msg = setAutoFish(not cur)
+            log("内置自动捕鱼 -> " .. tostring(msg) .. " ok=" .. tostring(ok))
+        end })
+        fg:AddButton({ Text = "读取当前钓鱼状态", Icon = "search", Func = function()
+            local n, txt = fishCatchCount()
+            log("自动捕鱼=" .. tostring(autoFishOn()) .. " · 计数=" .. tostring(n) .. " · 文本='" .. tostring(txt) .. "'")
+        end })
+    end
+
     --================ 记录
     local lg = Tabs.Log:AddLeftGroupbox("日志", "scroll-text")
     E.lLog = lg:AddLabel("—", true)
@@ -1792,6 +2107,26 @@ local function buildUI()
         cfg.nativeSelectionFrame = v == true
         if not cfg.nativeSelectionFrame then clientClearSelection() end
     end)
+    if E.tAutoFish then
+        E.tAutoFish:OnChanged(function(v)
+            cfg.autoFish = v == true
+            if cfg.autoFish then
+                log("自动钓鱼已开启：保持内置自动捕鱼开启 + 卡住自动重按")
+                task.defer(function() pcall(fishTick) end)
+            else
+                log("自动钓鱼已关闭")
+            end
+        end)
+    end
+    if E.tFishEnsure then
+        E.tFishEnsure:OnChanged(function(v) cfg.fishEnsureAuto = v == true end)
+    end
+    if E.sFishStall then
+        E.sFishStall:OnChanged(function(v) cfg.fishStallSeconds = tonumber(v) or 15 end)
+    end
+    if E.tFishTp then
+        E.tFishTp:OnChanged(function(v) cfg.autoFishTeleport = v == true end)
+    end
     E.sLead:OnChanged(function(v) cfg.releaseLeadSeconds = tonumber(v) or 0 end)
     E.tPotions:OnChanged(function(v) cfg.autoStorePotions = v == true; manageHotbar(true) end)
     E.tFill:OnChanged(function(v) cfg.autoFillCandidates = v == true; manageHotbar(true) end)
@@ -1934,6 +2269,30 @@ local function buildUI()
                     tonumber(R.hotbar.liveCount) or 0, pot, health, uiSlots, uiSync, drive, potState, hits))
             end
         end
+        -- 钓鱼状态
+        if E.lFish then
+            local on = autoFishOn()
+            local active, why = fishSessionActive()
+            local state = (on == true) and '<font color="rgb(120,255,140)">已开启</font>'
+                or (on == false) and '<font color="rgb(255,200,90)">已关闭</font>'
+                or '<font color="rgb(160,160,180)">读不到</font>'
+            E.lFish:SetText(string.format('自动钓鱼: %s · 内置AutoFish %s\n会话: %s（%s）\n已开始 %d 次 · 已补开 %d 次',
+                cfg.autoFish and '<font color="rgb(120,255,140)">运行中</font>' or '<font color="rgb(160,160,180)">未启用</font>',
+                state,
+                active and '<font color="rgb(120,255,140)">进行中</font>' or '<font color="rgb(255,200,90)">无</font>',
+                tostring(why), FISH.starts or 0, FISH.ensured))
+        end
+
+        -- 钓点状态
+        if E.lFishPond then
+            local inside = inPond()
+            local pos, name, dist = nearestPondPoint()
+            E.lFishPond:SetText(string.format('钓点: %s · 最近 %s（%.0f 格）',
+                inside and ('<font color="rgb(120,255,140)">在 ' .. inside .. ' 内</font>')
+                    or '<font color="rgb(255,200,90)">不在钓点内</font>',
+                tostring(name or "?"), tonumber(dist) or 0))
+        end
+
         -- 候选名字下拉（让"移出快捷栏"一键可用）
         if E.dExclude then
             local names = {}
@@ -2112,6 +2471,41 @@ R.selectKey = function(key)
     return clientSetSelected(k)
 end
 R.clearSelection = function() return clientClearSelection() end
+-- 自动钓鱼 API
+R.fishStatus = function()
+    local active, why = fishSessionActive()
+    return { enabled = cfg.autoFish, autoFishOn = autoFishOn(), sessionActive = active, sessionWhy = why,
+             ballDist = nearestFishBallDist(), text = fishText(),
+             clicks = FISH.clicks, ensured = FISH.ensured, starts = FISH.starts or 0 }
+end
+R.fishOn = function(v)
+    cfg.autoFish = (v ~= false)
+    if E.tAutoFish and E.tAutoFish.SetValue then pcall(function() E.tAutoFish:SetValue(cfg.autoFish) end) end
+    log("自动钓鱼 = " .. tostring(cfg.autoFish))
+    return cfg.autoFish
+end
+R.fishStart = function()
+    local a = setAutoFish(true)
+    local b = clickFish()
+    return { auto = a, click = b }
+end
+R.fishToggleAuto = function()
+    local cur = autoFishOn()
+    if cur == nil then return false end
+    return setAutoFish(not cur)
+end
+R.pondInfo = function()
+    local areas = pondAreas()
+    local pos, name, dist = nearestPondPoint()
+    return { count = #areas, inside = inPond(), nearest = name, distance = dist,
+             fishing = isFishing(), autoFishOn = autoFishOn() }
+end
+R.gotoPond = function()
+    local pos, name, dist = nearestPondPoint()
+    if not pos then return false end
+    teleportToPond(pos)
+    return true, name, dist
+end
 R.clientEnvDiag = function()
     local g = clientG()
     if not g then return "客户端环境表未找到（getgc 不可用？）" end
