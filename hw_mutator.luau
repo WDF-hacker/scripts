@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 42
+local VERSION = 45
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -203,6 +203,11 @@ local DEFAULT_CONFIG = {
     pondYOffset = 4,                -- 相对钓点区域的 Y 偏移
     fishEnsureAuto = true,          -- 自动确保"内置自动捕鱼"处于开启状态
     fishStallSeconds = 45,          -- 多久没出现"有鱼上钩"就重按《点击开始钓鱼》(15~180)
+    solarEnabled = true,            -- Solar 陨石雨模块
+    solarTargets = { Mars = true }, -- 想要的 Solar 突变（默认只要火星，倍数 6 最高）
+    solarTeleport = true,           -- 陨石一生成就传送到它的落点
+    solarMaxHold = 30,              -- 同一只手持多久没被砸中就换下一只
+    solarPauseFishing = true,       -- Solar 期间暂停自动钓鱼（否则会被拉回钓点）
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
     pollHold = 0.5,
@@ -1141,6 +1146,18 @@ local function eventRemaining()
 end
 R.eventRemaining = eventRemaining
 
+-- Solar 活动（陨石雨）：完全独立的机制 —— 不是手持每秒 roll，而是**陨石落点范围判定**
+local function isSolar()
+    -- ⚠ 强制测试时同样要让位于真实事件（绝不为测试把角色暴露在真实突变里）
+    if R._force and os.clock() < (R._force.until_ or 0) then
+        if R.event.active and R.event.name and R.event.name ~= "Solar" and eventRemaining() > 0 then
+            return false
+        end
+        return R._force.name == "Solar"
+    end
+    return R.event.active and R.event.name == "Solar" and eventRemaining() > 0
+end
+
 local function isHalloween()
     if R._force then
         if os.clock() < (R._force.until_ or 0) then
@@ -1213,8 +1230,9 @@ local function hotbarTick()
     end
 end
 
--- 前向声明：fishTick 的真实定义在后面的「自动钓鱼」模块里（tick 比它更早定义）
+-- 前向声明：fishTick / solarTick 的真实定义在后面的模块里（tick 比它们更早定义）
 local fishTick
+local solarTick
 
 local function tick()
     local now = os.clock()
@@ -1234,12 +1252,27 @@ local function tick()
 
     if not cfg.enabled then
         if R.hold.key then applyRelease("已停用") end
+        if R.solar and R.solar.active then solarStop("已停用") end
         if not R._lastIdleScan or now - R._lastIdleScan > (tonumber(cfg.rescanIdle) or 10) then
             R._lastIdleScan = now
             refreshCandidates()
         end
         hotbarTick()
         return
+    end
+
+    -- ===== Solar 活动最高优先级：陨石雨机制完全不同，接管一切 =====
+    -- （Solar 与万圣节是互斥事件，不会同时存在，所以这里直接 return 是安全的）
+    if cfg.solarEnabled and isSolar() then
+        if not (R.solar and R.solar.active) then solarStart() end
+        local okS, errS = pcall(solarTick)
+        if not okS then
+            log("Solar 出错: " .. tostring(errS), Color3.fromRGB(255, 120, 120))
+        end
+        hotbarTick()
+        return
+    elseif R.solar and R.solar.active then
+        solarStop("事件结束")
     end
 
     local forced = R._force ~= nil and os.clock() < (R._force.until_ or 0)
@@ -1544,10 +1577,49 @@ local function fishText()
     return t
 end
 
--- ✅ 唯一能确定"钓鱼会话活着"的强信号：文本出现 "Click To Catch!"（有鱼上钩了）
+-- ✅ 上钩信号。踩过的坑：主循环空闲时 3 秒才跑一次，而 "Click To Catch!" 只闪现几百毫秒
+--   -> 低频采样几乎永远采不到，会误判成"很久没上钩"。所以改由 startFishWatcher() 用
+--   0.15 秒的高速线程采样，这里只负责读时间戳。
 local function fishHasBite()
-    local t = fishText()
-    return (t:find("Click To Catch") ~= nil), t
+    return (os.clock() - (FISH.lastBite or 0)) < 1.2, fishText()
+end
+
+-- 收获计数文本（leaderstats.Catches 是缩写字符串，变了就说明有收获）
+local function catchText()
+    local lp = LocalPlayer
+    local ls = lp and lp:FindFirstChild("leaderstats")
+    local c = ls and ls:FindFirstChild("Catches")
+    if not c then return nil end
+    local v = nil
+    pcall(function() v = tostring(c.Value) end)
+    return v
+end
+
+-- ⭐ 高速观察线程：0.15 秒采样一次，负责记录"最后一次上钩/收获"的时间
+local function startFishWatcher()
+    if R._fishWatch then return end
+    R._fishWatch = task.spawn(function()
+        while isCurrent() do
+            if cfg.autoFish then
+                pcall(function()
+                    local t = fishText()
+                    if t:find("Click To Catch") then
+                        FISH.lastBite = os.clock()
+                        FISH.bites = (FISH.bites or 0) + 1
+                    end
+                    local cs = catchText()
+                    if cs ~= nil and cs ~= FISH.lastCatchText then
+                        FISH.lastCatchText = cs
+                        FISH.lastBite = os.clock()
+                        FISH.catches = (FISH.catches or 0) + 1
+                    end
+                end)
+                task.wait(0.15)
+            else
+                task.wait(0.5)
+            end
+        end
+    end)
 end
 
 local function fishSessionActive()
@@ -1560,16 +1632,25 @@ end
 
 function fishTick()
     if not cfg.autoFish then return end
+    -- ⭐ Solar 活动期间**暂停自动钓鱼**：否则游戏/脚本会一直把我们拉回钓点，和陨石抢位置
+    if cfg.solarPauseFishing ~= false and isSolar() then
+        if not R._fishPausedBy then
+            R._fishPausedBy = "Solar"
+            log("⏸ Solar 活动开始 -> 自动钓鱼暂时停手（避免被拉回钓点）", Color3.fromRGB(255, 180, 90))
+        end
+        return
+    elseif R._fishPausedBy == "Solar" then
+        R._fishPausedBy = nil
+        log("▶ Solar 结束 -> 自动钓鱼恢复", Color3.fromRGB(120, 255, 140))
+    end
+    -- 保证高速观察线程在跑（它负责记录"最后一次上钩"）
+    startFishWatcher()
     local now = os.clock()
     if (now - (FISH.lastAct or 0)) < 2 then return end     -- 动作冷却
 
-    -- 记录"最后一次看到有鱼上钩"的时间（会话活着的唯一强证据）
-    local bite, txt = fishHasBite()
-    if bite then
-        FISH.lastBite = now
-        FISH.sawBite = true
-    end
+    -- 上钩时间戳由 startFishWatcher() 以 0.15 秒精度维护，这里只读
     if (FISH.lastBite or 0) == 0 then FISH.lastBite = now end
+    local txt = fishText()
 
     local stall = tonumber(cfg.fishStallSeconds) or 45
     local idleFor = now - FISH.lastBite
@@ -1622,6 +1703,172 @@ function fishTick()
             log("已补开游戏内置自动钓鱼（Auto Fish）", Color3.fromRGB(120, 255, 140))
         end
     end
+end
+
+--============================================================== Solar 活动（陨石雨）
+-- 实测机制（本游戏，已用真实 Solar 活动抓包验证）：
+--   * 陨石实体 = workspace 下名为 "Meteorite" 的 Model（含 Base/Neon 两个 MeshPart）
+--     **Anchored = true** —— 服务端用 CFrame 驱动下落，所以"未锚定"不能当判据；
+--     必须靠 workspace.ChildAdded 事件（零延迟）+ Y 变化来判断。
+--   * 生成高度 Y≈182，**垂直下落 -> 落点就是生成时的 (X,Z)**；从生成到落地只有约 0.5~2 秒。
+--   * Constants.TypeEvents.Events.Solar.Meteorites.ImpactRadius = 50（判定半径；
+--     跟随模型在身侧约 10 格，所以站到落点就足够）。
+--   * 目标突变倍数 Constants.TypeSystem.Multipliers：**Mars=6（最高）**、Lava=2、Gold=1.25。
+--   * 判定对象：被砸到的**手持/已装备角色**（workspace.CarriedCharacters / EquippedFollowers）。
+-- 流程：Solar 一开 -> 先手持好 -> 陨石一生成立刻传送到落点 -> 落地判定 -> 命中就换下一只。
+local function solarState()
+    if not R.solar then
+        R.solar = { active = false, meteors = 0, tp = 0, hits = 0, targets = 0, lastMeteor = 0, lastHit = 0 }
+    end
+    return R.solar
+end
+solarState()
+
+local function solarTargetSet()
+    local set = {}
+    if type(cfg.solarTargets) == "table" then
+        for k, v in pairs(cfg.solarTargets) do if v then set[k] = true end end
+    end
+    if not next(set) then set.Mars = true end      -- 默认只要火星（倍数最高）
+    return set
+end
+
+local function solarStart()
+    local S = solarState()
+    if S.active then return end
+    S.active = true
+    S.startedAt = os.clock()
+    log("☄ Solar 活动开始 -> 进入陨石模式（自动钓鱼已让路）", Color3.fromRGB(255, 180, 90))
+    -- 立刻先手持一只，不要等第一颗陨石（陨石间隔只有 5 秒）
+    refreshCandidates()
+    if not R.hold.key and R.candidates[1] then
+        local pick = R.candidates[1]
+        applyHold(pick.key, pick.name, pick.rarity)
+        log("Solar 手持 " .. pick.name .. " [" .. pick.rarity .. "]")
+    end
+end
+
+local function solarStop(reason)
+    local S = solarState()
+    if not S.active then return end
+    S.active = false
+    if R.hold.key then applyRelease("Solar " .. tostring(reason or "结束")) end
+    log("☄ Solar 结束（" .. tostring(reason or "") .. "）：陨石 " .. S.meteors ..
+        " 颗 · 传送 " .. S.tp .. " 次 · 突变 " .. S.hits .. " 次（目标 " .. S.targets .. "）",
+        Color3.fromRGB(160, 220, 255))
+end
+
+-- 陨石生成回调：事件驱动、零延迟（轮询绝对来不及）
+local function solarOnMeteor(d)
+    if not cfg.solarEnabled or d.Name ~= "Meteorite" then return end
+    if not isSolar() then return end
+    local S = solarState()
+    if not S.active then solarStart() end
+    local p
+    if d:IsA("BasePart") then p = d else pcall(function() p = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart") end) end
+    if not p then return end
+    local now = os.clock()
+    if now - (S.lastMeteor or 0) < 0.15 then return end    -- 同一颗的多个子对象去重
+    S.lastMeteor = now
+    S.meteors = S.meteors + 1
+    if cfg.solarTeleport == false then return end
+    local hrp = rootPart()
+    if not hrp then return end
+    local pos = p.Position
+    local ok = pcall(function()
+        hrp.CFrame = CFrame.new(Vector3.new(pos.X, hrp.Position.Y, pos.Z))
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if ok then
+        S.tp = S.tp + 1
+        S.lastTpAt = now
+        log(string.format("☄ 陨石 #%d -> 传送到落点 (%.0f, %.0f)", S.meteors, pos.X, pos.Z),
+            Color3.fromRGB(255, 180, 90))
+    end
+end
+
+function solarTick()
+    local S = solarState()
+    if not cfg.solarEnabled then
+        if S.active then solarStop("已停用") end
+        return
+    end
+    local now = os.clock()
+
+    if (not R._lastSummaryAt) or (now - R._lastSummaryAt >= (tonumber(cfg.pollSummary) or 1)) then
+        refreshCandidates()
+    end
+
+    -- ① 命中检测（复用万圣节那套已验证的 diff：baseline 里同名 key 出现 ty~="" 且数量增加）
+    if R.hold.key and R.hold.baseline and R.summary then
+        local hits = detectMutation(R.hold.baseline, R.summary, R.hold.name)
+        if #hits > 0 then
+            local targets = solarTargetSet()
+            local names, gotTarget = {}, false
+            for _, h in ipairs(hits) do
+                names[#names + 1] = h.ty
+                S.hits = S.hits + 1
+                if targets[h.ty] then gotTarget = true; S.targets = S.targets + 1 end
+            end
+            local who = R.hold.name
+            if gotTarget then
+                log("★★ Solar 命中目标！" .. who .. " -> " .. table.concat(names, ", "),
+                    Color3.fromRGB(120, 255, 140))
+            else
+                log("Solar 突变 " .. who .. " -> " .. table.concat(names, ", ") .. "（非目标）",
+                    Color3.fromRGB(255, 200, 90))
+            end
+            S.lastHit = now
+            applyRelease("Solar 已突变")
+            refreshCandidates()
+            R._lastSummaryAt = now
+            -- 立刻换下一只（陨石每 5 秒一颗，不能等）
+            if R.candidates[1] then
+                local pick = R.candidates[1]
+                applyHold(pick.key, pick.name, pick.rarity)
+                log("Solar 换手持 " .. pick.name .. " [" .. pick.rarity .. "]")
+            end
+            return
+        end
+    end
+
+    -- ② 手持超时保护：一直没被砸中就换一只，避免死守
+    if R.hold.key then
+        local limit = tonumber(cfg.solarMaxHold) or 30
+        if (now - (R.hold.since or now)) > limit then
+            log("Solar 手持 " .. tostring(R.hold.name) .. " 已 " .. limit .. " 秒没被砸中 -> 换下一只",
+                Color3.fromRGB(255, 200, 90))
+            applyRelease("Solar 超时")
+        end
+    end
+
+    -- ③ 手持丢失检测
+    if R.hold.key then
+        local curName = heldName()
+        if curName ~= R.hold.name and (now - (R.hold.since or 0)) > 2 then
+            applyRelease("Solar 手持丢失")
+        end
+    end
+
+    -- ④ 保证一直持有着（陨石落地那一刻必须已经拿在手上）
+    if not R.hold.key then
+        if #R.candidates == 0 then refreshCandidates() end
+        local pick = R.candidates[1]
+        if pick then
+            applyHold(pick.key, pick.name, pick.rarity)
+            log("Solar 手持 " .. pick.name .. " [" .. pick.rarity .. "]")
+        end
+    end
+end
+
+-- 陨石监听（只建一次）
+if not R._solarConn then
+    R._solarConn = workspace.ChildAdded:Connect(function(d)
+        if not isCurrent() then return end
+        pcall(solarOnMeteor, d)
+    end)
+    R.connections[#R.connections + 1] = R._solarConn
 end
 
 --============================================================== Obsidian 加载
@@ -1693,6 +1940,11 @@ local function applyCfgToUI()
         if E.tFishEnsure then E.tFishEnsure:SetValue(cfg.fishEnsureAuto ~= false) end
         if E.sFishStall then E.sFishStall:SetValue(tonumber(cfg.fishStallSeconds) or 15) end
         if E.tFishTp then E.tFishTp:SetValue(cfg.autoFishTeleport ~= false) end
+        if E.tSolar then E.tSolar:SetValue(cfg.solarEnabled ~= false) end
+        if E.dSolarTargets then E.dSolarTargets:SetValue(cfg.solarTargets or { Mars = true }) end
+        if E.tSolarTp then E.tSolarTp:SetValue(cfg.solarTeleport ~= false) end
+        if E.sSolarHold then E.sSolarHold:SetValue(tonumber(cfg.solarMaxHold) or 30) end
+        if E.tSolarPauseFish then E.tSolarPauseFish:SetValue(cfg.solarPauseFishing ~= false) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -1727,6 +1979,14 @@ local function readUIIntoCfg()
         if E.tFishEnsure then cfg.fishEnsureAuto = E.tFishEnsure.Value == true end
         if E.sFishStall then cfg.fishStallSeconds = tonumber(E.sFishStall.Value) or 15 end
         if E.tFishTp then cfg.autoFishTeleport = E.tFishTp.Value == true end
+        if E.tSolar then cfg.solarEnabled = E.tSolar.Value == true end
+        if E.dSolarTargets then
+            local v = E.dSolarTargets.Value
+            cfg.solarTargets = (type(v) == "table") and v or {}
+        end
+        if E.tSolarTp then cfg.solarTeleport = E.tSolarTp.Value == true end
+        if E.sSolarHold then cfg.solarMaxHold = tonumber(E.sSolarHold.Value) or 30 end
+        if E.tSolarPauseFish then cfg.solarPauseFishing = E.tSolarPauseFish.Value == true end
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
         cfg.autoFillCandidates = E.tFill.Value == true
@@ -1842,6 +2102,7 @@ local function buildUI()
         Main = Window:AddTab("主控", "crosshair"),
         Hotbar = Window:AddTab("快捷栏", "layout-grid"),
         Fish = Window:AddTab("钓鱼", "fish"),
+        Solar = Window:AddTab("Solar", "flame"),
         Log = Window:AddTab("记录", "scroll-text"),
         Config = Window:AddTab("配置", "settings"),
     }
@@ -2071,6 +2332,53 @@ local function buildUI()
         end })
     end
 
+    --================ Solar
+    do
+        local sg = Tabs.Solar:AddLeftGroupbox("Solar 陨石雨", "flame")
+        E.tSolar = sg:AddToggle("solarEnabled", {
+            Text = "启用 Solar 模块 ★", Default = cfg.solarEnabled ~= false,
+            Tooltip = "Solar 活动期间：陨石一生成立刻传送到落点，并保持手持候选角色（落地时判定突变）。"
+                .. "活动期间自动钓鱼会自动让路，不会把你拉回钓点。",
+        })
+        E.lSolar = sg:AddLabel("Solar: —", true)
+        sg:AddDivider()
+        E.dSolarTargets = sg:AddDropdown("solarTargets", {
+            Text = "想要的 Solar 突变",
+            Values = { Mars = "Mars 火星（倍数 6，最高）★", Lava = "Lava 岩浆（2）",
+                       Gold = "Gold 黄金（1.25）", Solar = "Solar", Blood = "Blood", Honey = "Honey" },
+            Multi = true, Default = cfg.solarTargets or { Mars = true },
+        })
+        E.tSolarTp = sg:AddToggle("solarTeleport", {
+            Text = "陨石生成就传送到落点", Default = cfg.solarTeleport ~= false,
+            Tooltip = "实测：陨石垂直下落，落点就是生成时的 (X,Z)，生成到落地只有 0.5~2 秒",
+        })
+        E.sSolarHold = sg:AddSlider("solarMaxHold", {
+            Text = "同一只最多手持", Default = tonumber(cfg.solarMaxHold) or 30,
+            Min = 5, Max = 120, Rounding = 0, Suffix = " 秒",
+            Tooltip = "一直没被砸中就换下一只候选",
+        })
+        E.tSolarPauseFish = sg:AddToggle("solarPauseFishing", {
+            Text = "Solar 期间暂停自动钓鱼 ★", Default = cfg.solarPauseFishing ~= false,
+            Tooltip = "必须开：否则自动钓鱼会把你拉回钓点，和陨石抢位置",
+        })
+        sg:AddDivider()
+        sg:AddButton({ Text = "模拟 Solar（30 秒）", Icon = "flask-conical", Func = function()
+            R.debugForce("Solar", 30)
+            log("已强制 Solar 30 秒（真实活动不可制造，这里只是让判定生效）")
+        end })
+        sg:AddButton({ Text = "查看 Solar 状态", Icon = "search", Func = function()
+            local S = solarState()
+            log(string.format("Solar: 启用=%s 进行中=%s 事件=%s | 陨石 %d 颗 · 传送 %d 次 · 突变 %d 次（目标 %d）",
+                tostring(cfg.solarEnabled), tostring(S.active), tostring(R.event.name),
+                S.meteors, S.tp, S.hits, S.targets))
+            log("空中陨石数=" .. tostring((function()
+                local n = 0
+                for _, d in ipairs(workspace:GetChildren()) do if d.Name == "Meteorite" then n = n + 1 end end
+                return n
+            end)()))
+        end })
+    end
+
     --================ 记录
     local lg = Tabs.Log:AddLeftGroupbox("日志", "scroll-text")
     E.lLog = lg:AddLabel("—", true)
@@ -2167,6 +2475,31 @@ local function buildUI()
     end
     if E.tFishTp then
         E.tFishTp:OnChanged(function(v) cfg.autoFishTeleport = v == true end)
+    end
+    if E.tSolar then
+        E.tSolar:OnChanged(function(v)
+            cfg.solarEnabled = v == true
+            if not cfg.solarEnabled and R.solar and R.solar.active then solarStop("已停用") end
+            log("Solar 模块 = " .. tostring(cfg.solarEnabled))
+        end)
+    end
+    if E.dSolarTargets then
+        E.dSolarTargets:OnChanged(function(v)
+            cfg.solarTargets = (type(v) == "table") and v or {}
+            local names = {}
+            for k, on in pairs(cfg.solarTargets) do if on then names[#names + 1] = k end end
+            table.sort(names)
+            log("Solar 目标突变 = " .. (#names > 0 and table.concat(names, ", ") or "（空，默认 Mars）"))
+        end)
+    end
+    if E.tSolarTp then
+        E.tSolarTp:OnChanged(function(v) cfg.solarTeleport = v == true end)
+    end
+    if E.sSolarHold then
+        E.sSolarHold:OnChanged(function(v) cfg.solarMaxHold = tonumber(v) or 30 end)
+    end
+    if E.tSolarPauseFish then
+        E.tSolarPauseFish:OnChanged(function(v) cfg.solarPauseFishing = v == true end)
     end
     E.sLead:OnChanged(function(v) cfg.releaseLeadSeconds = tonumber(v) or 0 end)
     E.tPotions:OnChanged(function(v) cfg.autoStorePotions = v == true; manageHotbar(true) end)
@@ -2318,11 +2651,12 @@ local function buildUI()
             local state = (on == true) and '<font color="rgb(120,255,140)">已开启</font>'
                 or (on == false) and '<font color="rgb(255,200,90)">已关闭</font>'
                 or '<font color="rgb(160,160,180)">读不到</font>'
-            E.lFish:SetText(string.format('自动钓鱼: %s · 内置AutoFish %s\n状态: %s · 距上次上钩 %.0f 秒（阈值 %d 秒）\n重按钓鱼 %d 次 · 补开自动捕鱼 %d 次 · 补传送 %d 次',
+            E.lFish:SetText(string.format('自动钓鱼: %s · 内置AutoFish %s\n状态: %s · 距上次上钩 %.0f 秒（阈值 %d 秒）\n上钩累计 %d 次 · 收获计数 %s\n重按钓鱼 %d 次 · 补开自动捕鱼 %d 次 · 补传送 %d 次',
                 cfg.autoFish and '<font color="rgb(120,255,140)">运行中</font>' or '<font color="rgb(160,160,180)">未启用</font>',
                 state,
-                bite and '<font color="rgb(120,255,140)">有鱼上钩</font>' or '<font color="rgb(255,200,90)">等待中</font>',
+                bite and '<font color="rgb(120,255,140)">刚上钩</font>' or '<font color="rgb(255,200,90)">等待中</font>',
                 idle, tonumber(cfg.fishStallSeconds) or 45,
+                FISH.bites or 0, tostring(FISH.lastCatchText or "?"),
                 FISH.starts or 0, FISH.ensured, FISH.tp or 0))
         end
 
@@ -2334,6 +2668,24 @@ local function buildUI()
                 inside and ('<font color="rgb(120,255,140)">在 ' .. inside .. ' 内</font>')
                     or '<font color="rgb(255,200,90)">不在钓点内</font>',
                 tostring(name or "?"), tonumber(dist) or 0))
+        end
+
+        -- Solar 状态
+        if E.lSolar then
+            local S = solarState()
+            local air = 0
+            for _, d in ipairs(workspace:GetChildren()) do if d.Name == "Meteorite" then air = air + 1 end end
+            E.lSolar:SetText(string.format('Solar: %s · 空中陨石 %d 颗\n陨石 %d · 传送 %d · 突变 %d（目标 %d）\n目标突变: %s',
+                S.active and '<font color="rgb(120,255,140)">进行中</font>'
+                    or (isSolar() and '<font color="rgb(255,200,90)">事件在但未激活</font>')
+                    or '<font color="rgb(160,160,180)">未开始</font>',
+                air, S.meteors, S.tp, S.hits, S.targets,
+                (function()
+                    local n = {}
+                    for k, on in pairs(solarTargetSet()) do if on then n[#n + 1] = k end end
+                    table.sort(n)
+                    return table.concat(n, ", ")
+                end)()))
         end
 
         -- 候选名字下拉（让"移出快捷栏"一键可用）
@@ -2520,7 +2872,9 @@ R.fishStatus = function()
     return { enabled = cfg.autoFish, autoFishOn = autoFishOn(), hasBite = bite, text = txt,
              ballDist = nearestFishBallDist(),
              idleSec = os.clock() - (FISH.lastBite or os.clock()),
-             clicks = FISH.clicks, ensured = FISH.ensured, starts = FISH.starts or 0 }
+             bites = FISH.bites or 0, catches = FISH.catches or 0, catchText = tostring(FISH.lastCatchText),
+             watcher = R._fishWatch ~= nil,
+             clicks = FISH.clicks, ensured = FISH.ensured, starts = FISH.starts or 0, tp = FISH.tp or 0 }
 end
 R.fishOn = function(v)
     cfg.autoFish = (v ~= false)
