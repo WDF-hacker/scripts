@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 58
+local VERSION = 59
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -214,6 +214,10 @@ local DEFAULT_CONFIG = {
     holdBurstCycles = 2,            -- 循环轮数：2 轮 = 连点 4 下（实测无缝衔接）
     solarHoldEveryMeteor = true,    -- 每颗陨石都强制刷新一次手持（解决游戏"误触"导致角色不到身后）
     fallMinY = 110,                 -- 判定"高空掉落物"的 Y 阈值（Solar 陨石/Heaven 流星通用）
+    -- ===== 去突变（Depolarizer）=====
+    washEnabled = false,            -- ⚠ 默认关闭（操作不可撤销，必须你亲自打开）
+    washTypes = {},                 -- 要洗掉的突变（默认空 = 什么都不洗）★ 由你勾选
+    washRarities = {},              -- 参与的品质（默认空 = 什么都不洗）★ 由你勾选
     solarPauseFishing = true,       -- Solar 期间暂停并取消自动钓鱼（否则会被拉回钓点）
     hotbarExcludeChars = "",        -- 逗号分隔：这些角色不会被自动塞进快捷栏
     menuKeybind = "RightShift",     -- 菜单开关快捷键（可在 UI 里改）
@@ -1281,6 +1285,7 @@ local fishTick
 local solarTick
 local solarStart
 local solarStop
+local washTick
 
 local function tick()
     local now = os.clock()
@@ -1340,6 +1345,17 @@ local function tick()
         return
     elseif R.solar and R.solar.active then
         solarStop("事件结束")
+    end
+
+    -- ===== 去突变（Depolarizer）：天降 / 万圣节期间让路（陨石是时间敏感的）=====
+    if cfg.washEnabled and not isHalloween() then
+        local okW, errW = pcall(washTick)
+        if not okW then
+            if (now - (R._lastWashErr or 0)) > 10 then
+                R._lastWashErr = now
+                log("去突变出错: " .. tostring(errW), Color3.fromRGB(255, 120, 120))
+            end
+        end
     end
 
     local forced = R._force ~= nil and os.clock() < (R._force.until_ or 0)
@@ -2070,6 +2086,213 @@ do
     R._solarConn = conn
 end
 
+--============================================================== 去突变（Depolarizer）
+local function fmtCps(n)
+    n = tonumber(n) or 0
+    if n >= 1e18 then return string.format("%.2fQi", n / 1e18) end
+    if n >= 1e15 then return string.format("%.2fQa", n / 1e15) end
+    if n >= 1e12 then return string.format("%.2fT", n / 1e12) end
+    if n >= 1e9 then return string.format("%.2fB", n / 1e9) end
+    if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
+    if n >= 1e3 then return string.format("%.2fK", n / 1e3) end
+    return string.format("%.0f", n)
+end
+-- 实测机制（本游戏，已真机验证）：
+--   * 机器 = workspace.PlayerPlots.Plot<N>.Purchases.Depolarizer（自己的地块靠 OwnerUserId 认）
+--   * 交互 = CharacterInsert.PromptPart.ProximityPrompt，**ActionText 就是状态指示器**：
+--       "Equip Character First! [With an Type]" -> 机器空闲
+--       "Place"                                 -> 已手持带突变角色，可以放上去
+--       "Skip (Robux)"                          -> **正在洗**（付费跳过，绝不点！）
+--   * 操作 = 手持【带突变】的角色 -> fireproximityprompt(prompt) -> 角色被收进机器
+--       服务器回传 DepolarizrUI{action="HotbarFrom"}（走 prompt 路径**不需要确认框**）
+--   * 耗时 = **数小时**（实测一个 Ancient Gold = 11h25m），显示在 TimePart.StatsGui.Frame.TimeLeft
+--   * 期间角色**不在背包**（背包总数 -1，机器内也看不到 Humanoid），
+--     洗完自动以无突变状态回背包（游戏行为，脚本无需处理）
+-- ⚠ 所以"自动洗" = **机器一空闲就自动补位**；一次只能洗一个，无法加速。
+local function depoFolder()
+    local plots = workspace:FindFirstChild("PlayerPlots")
+    if not plots then return nil end
+    local uid = LocalPlayer.UserId
+    for _, p in ipairs(plots:GetChildren()) do
+        if tonumber(p:GetAttribute("OwnerUserId") or -1) == uid then
+            local pu = p:FindFirstChild("Purchases")
+            local d = pu and pu:FindFirstChild("Depolarizer")
+            if d then return d end
+        end
+    end
+    return nil
+end
+
+local function depoPrompt()
+    local d = depoFolder()
+    if not d then return nil end
+    return d:FindFirstChild("ProximityPrompt", true)
+end
+
+-- 机器状态："idle"（空闲）/ "ready"（手持了可放的）/ "busy"（正在洗）/ "none"（没这台机器）
+local function depoState()
+    local p = depoPrompt()
+    if not p then return "none", "" end
+    local a = ""
+    pcall(function() a = p.ActionText end)
+    if a:find("Skip") then return "busy", a end
+    if a:find("Place") then return "ready", a end
+    if a:find("Equip") then return "idle", a end
+    return "unknown", a
+end
+
+local function depoTimeLeft()
+    local d = depoFolder()
+    if not d then return nil end
+    local tp = d:FindFirstChild("TimePart", true)
+    local g = tp and tp:FindFirstChild("StatsGui")
+    local fr = g and g:FindFirstChild("Frame")
+    local holder = fr and fr:FindFirstChild("TimeLeft")
+    if not holder then return nil end
+    local lbl = holder:IsA("TextLabel") and holder or holder:FindFirstChildWhichIsA("TextLabel")
+    if not lbl then return nil end
+    local t = nil
+    pcall(function() t = lbl.Text end)
+    return t
+end
+
+local function depoStandPos()
+    local d = depoFolder()
+    if not d then return nil end
+    local pp = d:FindFirstChild("PromptPart", true)
+    local pos = pp and pp.Position
+    if not pos then return nil end
+    return Vector3.new(pos.X, pos.Y + 4, pos.Z)
+end
+
+local function depoFire(prompt)
+    if not prompt then return false end
+    if type(fireproximityprompt) == "function" then
+        local ok = pcall(fireproximityprompt, prompt)
+        if ok then return true end
+    end
+    local ok = pcall(function()
+        prompt:InputHoldBegin()
+        task.wait(0.08)
+        prompt:InputHoldEnd()
+    end)
+    return ok
+end
+
+-- 挑"该洗的角色"：品质 ∈ cfg.washRarities 且 突变 ∈ cfg.washTypes，按 CPS 从高到低
+local function washTargets()
+    local allowR, allowT = cfg.washRarities or {}, cfg.washTypes or {}
+    local list = {}
+    if type(R.summary) ~= "table" then return list end
+    for key, v in pairs(R.summary) do
+        if type(v) == "table" then
+            local ty = tostring(v.ty or "")
+            local ra = tostring(v.ra or "")
+            if ty ~= "" and allowT[ty] and allowR[ra] then
+                list[#list + 1] = { key = key, name = tostring(v.n or "?"), rarity = ra, ty = ty,
+                                    cps = tonumber(v.bc) or 0 }
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.cps > b.cps end)
+    return list
+end
+
+local WASH = { placed = 0, lastPlace = 0, lastKey = nil, lastErr = nil }
+
+washTick = function()
+    if not cfg.washEnabled then return end
+    local now = os.clock()
+    local state = depoState()
+    local tl = depoTimeLeft()
+
+    if state == "none" then
+        if not WASH._noMachLog or now - WASH._noMachLog > 60 then
+            WASH._noMachLog = now
+            log("⚠ 去突变：你的地块上没有 Depolarizer 机器", Color3.fromRGB(255, 180, 80))
+        end
+        return
+    end
+
+    -- 机器在洗 -> 什么都不做（⚠ 绝不去点 Skip (Robux)，那是付费的）
+    if state == "busy" then
+        WASH.done = WASH.done or 0
+        return
+    end
+
+    -- 刷新背包并挑目标
+    if (not R._lastSummaryAt) or (now - R._lastSummaryAt >= (tonumber(cfg.pollSummary) or 1)) then
+        refreshCandidates()
+    end
+    local targets = washTargets()
+    if #targets == 0 then return end
+
+    -- 限流：两次放置之间至少 3 秒（机器状态刷新有延迟）
+    if now - (WASH.lastPlace or 0) < 3 then return end
+
+    local pick = targets[1]
+    if WASH.lastKey == pick.key and now - (WASH.lastPlace or 0) < 30 then return end
+
+    -- ⭐ 安全校验（吸取教训）：必须是【带突变】的角色，且品质/突变都在勾选里，绝不越界
+    if pick.ty == "" or not (cfg.washTypes or {})[pick.ty] or not (cfg.washRarities or {})[pick.rarity] then
+        log("⚠ 去突变 安全拦截：跳过 " .. pick.name .. " [" .. pick.rarity .. "/" .. pick.ty .. "]",
+            Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    -- ① 手持它
+    applyHold(pick.key, pick.name, pick.rarity)
+    WASH.lastKey = pick.key
+    WASH.lastPlace = now
+
+    -- ② 传送到机器旁并放上去
+    task.spawn(function()
+        local hrp = rootPart()
+        local pos = depoStandPos()
+        if not hrp or not pos then return end
+        pcall(function()
+            hrp.CFrame = CFrame.new(pos)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end)
+        task.wait(0.35)
+        local prompt = depoPrompt()
+        if not prompt then return end
+        local en = false
+        pcall(function() en = prompt.Enabled end)
+        if not en then
+            log("⚠ 去突变：" .. pick.name .. " 的 prompt 未启用（可能没手持成功）", Color3.fromRGB(255, 180, 80))
+            return
+        end
+        depoFire(prompt)
+        WASH.placed = WASH.placed + 1
+        WASH.lastPlacedName = pick.name
+        log(string.format("🧼 已放入 Depolarizer：%s [%s] 突变=%s $%s/s  -> 开始清洗（预计 %s）",
+            pick.name, pick.rarity, pick.ty, fmtCps(pick.cps), tostring(depoTimeLeft() or "数小时")),
+            Color3.fromRGB(120, 255, 140))
+        -- 角色已被机器收走 -> 清掉本地手持状态
+        task.wait(1.2)
+        if R.hold.key == pick.key then applyRelease("去突变：已交付机器") end
+    end)
+end
+
+-- DepolarizrUI 事件（服务器 -> 客户端）：用于状态提示
+do
+    local Rm = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local ev = Rm and Rm:FindFirstChild("DepolarizrUI")
+    if ev then
+        local c = ev.OnClientEvent:Connect(function(p)
+            if not isCurrent() then return end
+            local a = type(p) == "table" and tostring(p.action) or tostring(p)
+            if a == "HotbarFrom" then
+                log("🧼 Depolarizer 已接收角色，开始清洗", Color3.fromRGB(120, 255, 140))
+            elseif a == "HideConfirm" then
+                -- 忽略
+            end
+        end)
+        R.connections[#R.connections + 1] = c
+    end
+end
+
 --============================================================== Obsidian 加载
 local LIB_FILES = {
     Library = { file = "obsidian_Library.lua", url = OBSIDIAN_REPO .. "Library.lua" },
@@ -2150,6 +2373,9 @@ local function applyCfgToUI()
         if E.tBurst then E.tBurst:SetValue(cfg.holdBurst ~= false) end
         if E.sBurstGap then E.sBurstGap:SetValue(tonumber(cfg.holdBurstGap) or 0.02) end
         if E.sBurstCycles then E.sBurstCycles:SetValue(tonumber(cfg.holdBurstCycles) or 2) end
+        if E.tWash then E.tWash:SetValue(cfg.washEnabled == true) end
+        if E.dWashTypes then E.dWashTypes:SetValue(cfg.washTypes or {}) end
+        if E.dWashRar then E.dWashRar:SetValue(cfg.washRarities or {}) end
         E.sLead:SetValue(tonumber(cfg.releaseLeadSeconds) or 1)
         E.tPotions:SetValue(cfg.autoStorePotions ~= false)
         E.tFill:SetValue(cfg.autoFillCandidates ~= false)
@@ -2201,6 +2427,15 @@ local function readUIIntoCfg()
         if E.tBurst then cfg.holdBurst = E.tBurst.Value == true end
         if E.sBurstGap then cfg.holdBurstGap = tonumber(E.sBurstGap.Value) or 0.02 end
         if E.sBurstCycles then cfg.holdBurstCycles = math.max(1, math.floor(tonumber(E.sBurstCycles.Value) or 2)) end
+        if E.tWash then cfg.washEnabled = E.tWash.Value == true end
+        if E.dWashTypes then
+            local v = E.dWashTypes.Value
+            cfg.washTypes = (type(v) == "table") and v or {}
+        end
+        if E.dWashRar then
+            local v = E.dWashRar.Value
+            cfg.washRarities = (type(v) == "table") and v or {}
+        end
         cfg.releaseLeadSeconds = tonumber(E.sLead.Value) or 0
         cfg.autoStorePotions = E.tPotions.Value == true
         cfg.autoFillCandidates = E.tFill.Value == true
@@ -2317,6 +2552,7 @@ local function buildUI()
         Hotbar = Window:AddTab("快捷栏", "layout-grid"),
         Fish = Window:AddTab("钓鱼", "fish"),
         Solar = Window:AddTab("Solar", "flame"),
+        Wash = Window:AddTab("去突变", "sparkles"),
         Log = Window:AddTab("记录", "scroll-text"),
         Config = Window:AddTab("配置", "settings"),
     }
@@ -2543,6 +2779,83 @@ local function buildUI()
         fg:AddButton({ Text = "读取当前钓鱼状态", Icon = "search", Func = function()
             local n, txt = fishCatchCount()
             log("自动捕鱼=" .. tostring(autoFishOn()) .. " · 计数=" .. tostring(n) .. " · 文本='" .. tostring(txt) .. "'")
+        end })
+    end
+
+    --================ 去突变（Depolarizer）
+    do
+        local wg = Tabs.Wash:AddLeftGroupbox("Depolarizer 去突变", "sparkles")
+        E.lWash = wg:AddLabel("去突变: —", true)
+        wg:AddDivider()
+        E.tWash = wg:AddToggle("washEnabled", {
+            Text = "启用自动去突变", Default = cfg.washEnabled == true,
+            Tooltip = "⚠ 洗突变【不可撤销】！机器一次只能洗一个、耗时数小时。"
+                .. "开启后：机器一空闲就自动把符合下面条件的角色放上去洗。",
+        })
+        wg:AddDivider()
+        E.dWashTypes = wg:AddDropdown("washTypes", {
+            Text = "要洗掉的突变 ★（必须选）",
+            Values = { Gold = "Gold 黄金", Lava = "Lava 岩浆", Honey = "Honey 蜂蜜", Blood = "Blood 血",
+                       Diamond = "Diamond 钻石", Ghost = "Ghost 幽灵", Slime = "Slime 史莱姆",
+                       Frozen = "Frozen 冰", Electric = "Electric 电", Zombie = "Zombie 僵尸",
+                       Nightmare = "Nightmare 噩梦", Dracula = "Dracula 德古拉", Demonic = "Demonic 恶魔",
+                       Angelic = "Angelic 天使", Mars = "Mars 火星", Solar = "Solar 太阳",
+                       Lunar = "Lunar 月", Party = "Party", Complexity = "Complexity", Toxic = "Toxic" },
+            Multi = true, Default = cfg.washTypes or {},
+        })
+        E.dWashRar = wg:AddDropdown("washRarities", {
+            Text = "参与品质 ★（必须选）",
+            Values = (function()
+                local rarVals = {}
+                for name in pairs(RARITY_RANK) do rarVals[#rarVals + 1] = name end
+                table.sort(rarVals, function(a, b) return (RARITY_RANK[a] or 0) < (RARITY_RANK[b] or 0) end)
+                return rarVals
+            end)(),
+            Multi = true, Default = cfg.washRarities or {},
+            Tooltip = "只有【这两个选择都命中】的角色才会被放进机器（双重保险）",
+        })
+        wg:AddDivider()
+        wg:AddButton({ Text = "预览：会洗哪些角色", Icon = "search", Func = function()
+            refreshCandidates()
+            local t = washTargets()
+            log("—— 去突变预览（共 " .. #t .. " 个符合条件）——")
+            for i = 1, math.min(#t, 12) do
+                local c = t[i]
+                log(string.format("%d) %s [%s] 突变=%s $%s/s", i, c.name, c.rarity, c.ty, fmtCps(c.cps)))
+            end
+            if #t == 0 then
+                log("（没有符合条件的角色 —— 检查上面两个多选是否都勾了）", Color3.fromRGB(255, 180, 80))
+            end
+        end })
+        wg:AddButton({ Text = "查看机器状态", Icon = "search", Func = function()
+            local st, act = depoState()
+            local tl = depoTimeLeft()
+            local names = { idle = "空闲（可以放）", ready = "已手持可放", busy = "正在洗", none = "没有这台机器",
+                            unknown = "未知" }
+            log("Depolarizer: " .. tostring(names[st] or st) .. " · prompt='" .. tostring(act) ..
+                "' · 剩余=" .. tostring(tl or "-") .. " · 本次已放入=" .. tostring(WASH.placed) ..
+                " 个 · 上一个=" .. tostring(WASH.lastPlacedName or "-"))
+            if st == "busy" then
+                log("⚠ 正在洗的时候提示会变成『Skip (Robux)』—— 那是付费跳过，脚本绝不会点它",
+                    Color3.fromRGB(255, 180, 80))
+            end
+        end })
+        wg:AddButton({ Text = "手动洗：当前手持的角色", Icon = "sparkles", Func = function()
+            local st = depoState()
+            if st == "busy" then log("机器正在洗，不能放第二个", Color3.fromRGB(255, 180, 80)) return end
+            if not R.hold.key then log("你还没有手持角色", Color3.fromRGB(255, 180, 80)) return end
+            local hrp = rootPart()
+            local pos = depoStandPos()
+            if hrp and pos then
+                pcall(function() hrp.CFrame = CFrame.new(pos) end)
+            end
+            task.wait(0.4)
+            local prompt = depoPrompt()
+            local en = false
+            pcall(function() en = prompt and prompt.Enabled end)
+            if not en then log("prompt 未启用（角色可能没有突变）", Color3.fromRGB(255, 180, 80)) return end
+            depoFire(prompt)
+            log("已尝试把 " .. tostring(R.hold.name) .. " 放进 Depolarizer", Color3.fromRGB(120, 255, 140))
         end })
     end
 
@@ -2792,6 +3105,41 @@ local function buildUI()
     if E.sBurstCycles then
         E.sBurstCycles:OnChanged(function(v) cfg.holdBurstCycles = math.max(1, math.floor(tonumber(v) or 2)) end)
     end
+    if E.tWash then
+        E.tWash:OnChanged(function(v)
+            cfg.washEnabled = v == true
+            if cfg.washEnabled then
+                local nt = 0
+                for _ in pairs(cfg.washTypes or {}) do nt = nt + 1 end
+                local nr = 0
+                for _ in pairs(cfg.washRarities or {}) do nr = nr + 1 end
+                log("去突变已开启（突变勾选 " .. nt .. " 项 · 品质勾选 " .. nr .. " 项）")
+                if nt == 0 or nr == 0 then
+                    log("⚠ 你还没勾选突变或品质 -> 脚本不会洗任何角色", Color3.fromRGB(255, 180, 80))
+                end
+            else
+                log("去突变已关闭")
+            end
+        end)
+    end
+    if E.dWashTypes then
+        E.dWashTypes:OnChanged(function(v)
+            cfg.washTypes = (type(v) == "table") and v or {}
+            local n = {}
+            for k, on in pairs(cfg.washTypes) do if on then n[#n + 1] = k end end
+            table.sort(n)
+            log("要洗掉的突变 = " .. (#n > 0 and table.concat(n, ", ") or "（空 —— 不会洗任何角色）"))
+        end)
+    end
+    if E.dWashRar then
+        E.dWashRar:OnChanged(function(v)
+            cfg.washRarities = (type(v) == "table") and v or {}
+            local n = {}
+            for k, on in pairs(cfg.washRarities) do if on then n[#n + 1] = k end end
+            table.sort(n, function(a, b) return (RARITY_RANK[a] or 0) > (RARITY_RANK[b] or 0) end)
+            log("去突变参与品质 = " .. (#n > 0 and table.concat(n, " > ") or "（空 —— 不会洗任何角色）"))
+        end)
+    end
     E.sLead:OnChanged(function(v) cfg.releaseLeadSeconds = tonumber(v) or 0 end)
     E.tPotions:OnChanged(function(v) cfg.autoStorePotions = v == true; manageHotbar(true) end)
     E.tFill:OnChanged(function(v) cfg.autoFillCandidates = v == true; manageHotbar(true) end)
@@ -2977,6 +3325,22 @@ local function buildUI()
                     table.sort(n)
                     return table.concat(n, ", ")
                 end)()))
+        end
+
+        -- 去突变状态
+        if E.lWash then
+            local st, act = depoState()
+            local tl = depoTimeLeft()
+            local names = { idle = '<font color="rgb(120,255,140)">空闲</font>',
+                            ready = '<font color="rgb(120,255,140)">已手持可放</font>',
+                            busy = '<font color="rgb(255,200,90)">正在洗</font>',
+                            none = '<font color="rgb(255,120,120)">没有机器</font>',
+                            unknown = '<font color="rgb(160,160,180)">未知</font>' }
+            local nt, nr = 0, 0
+            for _ in pairs(cfg.washTypes or {}) do nt = nt + 1 end
+            for _ in pairs(cfg.washRarities or {}) do nr = nr + 1 end
+            E.lWash:SetText(string.format('去突变: %s · 剩余 %s\n本次已放入 %d 个 · 上一个: %s\n勾选: 突变 %d 项 · 品质 %d 项',
+                names[st] or st, tostring(tl or "-"), WASH.placed, tostring(WASH.lastPlacedName or "-"), nt, nr))
         end
 
         -- 候选名字下拉（让"移出快捷栏"一键可用）
@@ -3285,6 +3649,17 @@ end
 --============================================================== 彻底清理
 -- 一键清掉本脚本产生的一切残留：实例（按魔数识别）、UI（按标记识别）、
 -- 以及所有后台观察器线程（用代号让旧循环全部失效）。
+R.washStatus = function()
+    local st, act = depoState()
+    return { enabled = cfg.washEnabled, state = st, actionText = act, timeLeft = depoTimeLeft(),
+             placed = WASH.placed, last = WASH.lastPlacedName,
+             types = cfg.washTypes, rarities = cfg.washRarities, targets = #washTargets() }
+end
+R.washOn = function(v)
+    cfg.washEnabled = v ~= false
+    log("去突变 = " .. tostring(cfg.washEnabled))
+end
+
 R.panicCleanup = function()
     local n = 0
     -- ① 所有"我们的"状态实例
