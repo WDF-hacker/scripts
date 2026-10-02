@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 65
+local VERSION = 73
 local PLACE_ID = 74729868188364
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
@@ -1407,8 +1407,9 @@ local function tick()
         solarStop("事件结束")
     end
 
-    -- ===== 去突变（Depolarizer）：天降 / 万圣节期间让路（陨石是时间敏感的）=====
-    if cfg.washEnabled and not isHalloween() then
+    -- ===== 去突变（Depolarizer）：只在【没有任何活动】时工作 =====
+    -- （有事件时必须让路：否则"事件放手策略"会和我们抢角色，且带突变角色可能被二次突变）
+    if cfg.washEnabled and not (R.event.active and R.event.name and eventRemaining() > 0) then
         local okW, errW = pcall(washTick)
         if not okW then
             if (now - (R._lastWashErr or 0)) > 10 then
@@ -2248,25 +2249,62 @@ local function depoFolder()
     return nil
 end
 
+-- ⚠⚠ 必须用【精确路径】取 prompt！机器上有 **两个** ProximityPrompt：
+--   CharacterInsert.ButtonModel.Button.ProximityPrompt  = "Start (Hold F)"  ← 不是我们要的
+--   CharacterInsert.PromptPart.ProximityPrompt          = "Equip / Place / Pick Up" ← 这个才是
+-- 用 FindFirstChild("ProximityPrompt", true) 递归查找会**随机命中前者**（子对象顺序会变），
+-- 表现就是用户实测的："人 TP 到机器上了，但角色没被放上去"（触发了 Start 提示，什么也没发生）。
 local function depoPrompt()
     local d = depoFolder()
     if not d then return nil end
-    return d:FindFirstChild("ProximityPrompt", true)
+    local ci = d:FindFirstChild("CharacterInsert")
+    local pp = ci and ci:FindFirstChild("PromptPart")
+    if not pp then return nil end
+    return pp:FindFirstChild("ProximityPrompt")
 end
 
--- 机器状态："idle"（空闲）/ "ready"（手持了可放的）/ "busy"（正在洗）/ "none"（没这台机器）
+-- 机器是【两步】操作（实测）：
+--   ① CharacterInsert.PromptPart.ProximityPrompt        "Place"  -> 把角色放上机器（之后变 "Pick Up"）
+--   ② CharacterInsert.ButtonModel.Button.ProximityPrompt "Start" (Hold 0.5) -> **按住启动清洗**
+-- 只做第①步的话角色会停在机器上不开始洗（提示停在 "Pick Up"，没有 TimeLeft 倒计时）。
+local function depoStartPrompt()
+    local d = depoFolder()
+    if not d then return nil end
+    local ci = d:FindFirstChild("CharacterInsert")
+    local bm = ci and ci:FindFirstChild("ButtonModel")
+    local btn = bm and bm:FindFirstChild("Button")
+    if not btn then return nil end
+    return btn:FindFirstChild("ProximityPrompt")
+end
+
+-- 机器状态：
+--   "idle"（空闲，没手持）/"ready"（手持了可放）/"pickup"（机器上有角色可取回）
+--   "busy"（正在洗）/"none"（没机器）/"unknown"
+--   注：取 prompt 的 ActionText 作为状态（这是最可靠的信号）
+-- 前向声明（depoState 要用它，但它的定义在后面 —— 顺序错了会报 "attempt to call a nil value"）
+local depoTimeLeft
+
 local function depoState()
+    -- ⭐ 最可靠的判据是 TimeLeft 倒计时：**洗的时候 PromptPart 的 ProximityPrompt 会被移除**，
+    --   此时 prompt 读不到（ActionText=''），只看 prompt 会误判成 unknown。
+    local tl = depoTimeLeft()
+    local washing = (tl ~= nil and tl ~= "" and tl ~= "?")
     local p = depoPrompt()
-    if not p then return "none", "" end
+    if not p then
+        if washing then return "busy", "(倒计时中)" end
+        return depoFolder() and "unknown" or "none", ""
+    end
     local a = ""
     pcall(function() a = p.ActionText end)
-    if a:find("Skip") then return "busy", a end
+    if washing or a:find("Skip") then return "busy", a end
     if a:find("Place") then return "ready", a end
+    if a:find("Pick Up") then return "pickup", a end
     if a:find("Equip") then return "idle", a end
+    if a:find("Start") then return "idle", a end
     return "unknown", a
 end
 
-local function depoTimeLeft()
+depoTimeLeft = function()
     local d = depoFolder()
     if not d then return nil end
     local tp = d:FindFirstChild("TimePart", true)
@@ -2292,6 +2330,10 @@ end
 
 local function depoFire(prompt)
     if not prompt then return false end
+    -- ⭐ 武装"自动确认"：机器的某些操作（Pick Up / 启动清洗）服务器会回
+    --   DepolarizrUI{action="ShowConfirm"} 弹确认框，必须回 DepolarizrConfirm(true) 才继续。
+    --   这里给它一个 8 秒窗口，收到 ShowConfirm 就自动点『是的』。
+    R._depoAutoConfirmUntil = os.clock() + 8
     if type(fireproximityprompt) == "function" then
         local ok = pcall(fireproximityprompt, prompt)
         if ok then return true end
@@ -2301,6 +2343,28 @@ local function depoFire(prompt)
         task.wait(0.08)
         prompt:InputHoldEnd()
     end)
+    return ok
+end
+
+-- 自动点『是的』（仅限去突变流程自己触发的那次，绝不乱点别人的确认框）
+local function depoAutoConfirm()
+    if (R._depoAutoConfirmUntil or 0) <= os.clock() then return false end
+    R._depoAutoConfirmUntil = 0
+    local Rm = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local rc = Rm and Rm:FindFirstChild("DepolarizrConfirm")
+    if not rc then return false end
+    -- 优先点游戏自己的「是的」按钮（走它原本的逻辑，最安全）
+    local lp = LocalPlayer
+    local pg = lp and lp:FindFirstChild("PlayerGui")
+    local mg = pg and pg:FindFirstChild("MainGui")
+    local cg = mg and mg:FindFirstChild("ConfirmationGUI")
+    local ui = cg and cg:FindFirstChild("UI")
+    local yes = ui and ui:FindFirstChild("Yes")
+    if yes then
+        local ok = pcall(function() firesignal(yes.MouseButton1Click) end)
+        if ok then return true end
+    end
+    local ok = pcall(function() rc:FireServer(true) end)
     return ok
 end
 
@@ -2327,6 +2391,20 @@ local WASH = { placed = 0, lastPlace = 0, lastKey = nil, lastErr = nil }
 
 washTick = function()
     if not cfg.washEnabled then return end
+    -- ⭐ 只在【没有任何活动运行】时才洗。理由有两个，都很硬：
+    --   ① 你的策略是"任何事件运行时连手动持有的角色都放手" -> 一持有就被释放，
+    --      prompt 退回 "Equip Character First!"，fireproximityprompt 打空（用户实测的"只TP不放"）。
+    --   ② 安全：洗的目标本身就是【带突变的角色】，手持期间若来了突变事件，
+    --      它会被二次突变（不可逆）-> 必须避开所有事件。
+    if R.event.active and R.event.name and eventRemaining() > 0 then
+        if not WASH._pausedLogged then
+            WASH._pausedLogged = true
+            log("⏸ 去突变暂停：当前有活动（" .. tostring(R.event.name) .. "）在跑，等活动结束再洗",
+                Color3.fromRGB(255, 200, 90))
+        end
+        return
+    end
+    WASH._pausedLogged = nil
     local now = os.clock()
     local state = depoState()
     local tl = depoTimeLeft()
@@ -2342,6 +2420,24 @@ washTick = function()
     -- 机器在洗 -> 什么都不做（⚠ 绝不去点 Skip (Robux)，那是付费的）
     if state == "busy" then
         WASH.done = WASH.done or 0
+        return
+    end
+
+    -- ⭐ 机器上【已经坐着一个角色但还没开始洗】-> 按『启动』按钮，绝不再放第二个
+    --   （这是实测漏掉的一步：只 Place 不 Start，角色会一直停在机器上不动）
+    if state == "pickup" then
+        local tl = depoTimeLeft()
+        if not (tl and tl ~= "" and tl ~= "?") then
+            if now - (WASH.lastStart or 0) > 5 then
+                WASH.lastStart = now
+                if depoFire(depoStartPrompt()) then
+                    log("🧼 机器上已有角色 -> 已按『启动』开始清洗", Color3.fromRGB(120, 255, 140))
+                    WASH.placed = WASH.placed + 1
+                end
+            end
+        else
+            WASH.placed = WASH.placed + 1
+        end
         return
     end
 
@@ -2370,33 +2466,93 @@ washTick = function()
     WASH.lastKey = pick.key
     WASH.lastPlace = now
 
-    -- ② 传送到机器旁并放上去
+    -- ② 传送到机器旁并放上去（逐步等待 + 校验 + 失败重试）
     task.spawn(function()
-        local hrp = rootPart()
-        local pos = depoStandPos()
-        if not hrp or not pos then return end
-        pcall(function()
-            hrp.CFrame = CFrame.new(pos)
-            hrp.AssemblyLinearVelocity = Vector3.zero
-        end)
-        task.wait(0.35)
-        local prompt = depoPrompt()
-        if not prompt then return end
-        local en = false
-        pcall(function() en = prompt.Enabled end)
-        if not en then
-            log("⚠ 去突变：" .. pick.name .. " 的 prompt 未启用（可能没手持成功）", Color3.fromRGB(255, 180, 80))
+        local key, nm, ra, ty = pick.key, pick.name, pick.rarity, pick.ty
+        local cps = pick.cps
+        -- ⚠ 实测教训：只等 0.35 秒是不够的 —— 服务器还没确认"手持"这个动作，
+        --   此时 prompt 仍是禁用状态（ActionText = "Equip Character First!"），
+        --   fireproximityprompt 打上去等于空放。
+        --   表现就是用户看到的："人 TP 到机器上了，但角色没被放上去"。
+        -- 步骤 1：等服务器确认手持生效
+        local t0 = os.clock()
+        while isCurrent() and (os.clock() - t0) < 3 do
+            if heldName() == nm then break end
+            task.wait(0.15)
+        end
+        if heldName() ~= nm then
+            log("⚠ 去突变：" .. nm .. " 手持未生效（服务器没确认）-> 本轮放弃，稍后重试",
+                Color3.fromRGB(255, 180, 80))
+            WASH.lastKey = nil
             return
         end
-        depoFire(prompt)
-        WASH.placed = WASH.placed + 1
-        WASH.lastPlacedName = pick.name
-        log(string.format("🧼 已放入 Depolarizer：%s [%s] 突变=%s $%s/s  -> 开始清洗（预计 %s）",
-            pick.name, pick.rarity, pick.ty, fmtCps(pick.cps), tostring(depoTimeLeft() or "数小时")),
-            Color3.fromRGB(120, 255, 140))
-        -- 角色已被机器收走 -> 清掉本地手持状态
-        task.wait(1.2)
-        if R.hold.key == pick.key then applyRelease("去突变：已交付机器") end
+        -- 步骤 2：传送到机器
+        local hrp, pos = rootPart(), depoStandPos()
+        if hrp and pos then
+            pcall(function()
+                hrp.CFrame = CFrame.new(pos)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+        -- 步骤 3：等 prompt 就绪（ActionText 变成 "Place"）
+        local ready = false
+        t0 = os.clock()
+        while isCurrent() and (os.clock() - t0) < 4 do
+            local st, act = depoState()
+            if act and act:find("Place") then ready = true break end
+            if st == "busy" then ready = true break end          -- 已经被收走了
+            if st == "pickup" then
+                -- 角色已经在机器上但还没开始洗 -> 按【启动按钮】(第②步)
+                if (os.clock() - t0) > 0.8 then
+                    if depoFire(depoStartPrompt()) then
+                        log("🧼 角色已上机器 -> 已按『启动』开始清洗", Color3.fromRGB(120, 255, 140))
+                    end
+                    task.wait(1.5)
+                    t0 = os.clock()
+                end
+            end
+            if (os.clock() - t0) > 1.5 and heldName() ~= nm then
+                pcall(function() doHold(key) end)               -- 补一次手持
+            end
+            task.wait(0.2)
+        end
+        if not ready then
+            local st, act = depoState()
+            log("⚠ 去突变：" .. nm .. " 的 prompt 没就绪（状态=" .. tostring(st) ..
+                " Action='" .. tostring(act) .. "'）-> 本轮放弃，稍后重试", Color3.fromRGB(255, 180, 80))
+            WASH.lastKey = nil
+            return
+        end
+        -- 步骤 4：触发
+        local okFire = depoFire(depoPrompt())
+        -- 步骤 5：验证真的开始洗了（TimeLeft 出现倒计时 / prompt 变 "Skip (Robux)"）
+        local placed = false
+        t0 = os.clock()
+        while isCurrent() and (os.clock() - t0) < 6 do
+            local st2 = depoState()
+            local tl = depoTimeLeft()
+            if st2 == "busy" or (tl and tl ~= "" and tl ~= "?") then placed = true break end
+            -- 还停在 pickup -> 补按一次启动按钮（Hold 0.5 可能需要多次）
+            if st2 == "pickup" and (os.clock() - t0) > 1.5 then
+                depoFire(depoStartPrompt())
+                t0 = os.clock()
+            end
+            task.wait(0.3)
+        end
+        if placed then
+            WASH.placed = WASH.placed + 1
+            WASH.lastPlacedName = nm
+            log(string.format("🧼 已放入 Depolarizer：%s [%s] 突变=%s $%s/s  -> 开始清洗（预计 %s）",
+                nm, ra, ty, fmtCps(cps), tostring(depoTimeLeft() or "数小时")),
+                Color3.fromRGB(120, 255, 140))
+            task.wait(1.2)
+            if R.hold.key == key then applyRelease("去突变：已交付机器") end
+        else
+            log("⚠ 去突变：" .. nm .. " 放上机器了但没启动成功（fire=" .. tostring(okFire) ..
+                "）-> 稍后重试", Color3.fromRGB(255, 180, 80))
+            WASH.lastKey = nil
+        end
     end)
 end
 
@@ -2410,6 +2566,18 @@ do
             local a = type(p) == "table" and tostring(p.action) or tostring(p)
             if a == "HotbarFrom" then
                 log("🧼 Depolarizer 已接收角色，开始清洗", Color3.fromRGB(120, 255, 140))
+            elseif a == "ShowConfirm" then
+                -- ⭐ 服务器要求确认（"确定要去掉这个突变吗？"）-> 只有在我们自己发起的流程里才自动点『是的』
+                if (R._depoAutoConfirmUntil or 0) > os.clock() then
+                    local cn = tostring((type(p) == "table" and p.charName) or "?")
+                    local ct = tostring((type(p) == "table" and p.charType) or "?")
+                    if depoAutoConfirm() then
+                        log("🧼 已自动确认去突变：" .. cn .. " [" .. ct .. "]",
+                            Color3.fromRGB(120, 255, 140))
+                    else
+                        log("⚠ 去突变确认框自动点击失败 —— 请手动点『是的』", Color3.fromRGB(255, 120, 120))
+                    end
+                end
             elseif a == "HideConfirm" then
                 -- 忽略
             end
@@ -2997,8 +3165,8 @@ local function buildUI()
         wg:AddButton({ Text = "查看机器状态", Icon = "search", Func = function()
             local st, act = depoState()
             local tl = depoTimeLeft()
-            local names = { idle = "空闲（可以放）", ready = "已手持可放", busy = "正在洗", none = "没有这台机器",
-                            unknown = "未知" }
+            local names = { idle = "空闲（可以放）", ready = "已手持可放", busy = "正在洗",
+                            pickup = "有待取回角色", none = "没有这台机器", unknown = "未知" }
             log("Depolarizer: " .. tostring(names[st] or st) .. " · prompt='" .. tostring(act) ..
                 "' · 剩余=" .. tostring(tl or "-") .. " · 本次已放入=" .. tostring(WASH.placed) ..
                 " 个 · 上一个=" .. tostring(WASH.lastPlacedName or "-"))
@@ -3017,13 +3185,33 @@ local function buildUI()
             if hrp and pos then
                 pcall(function() hrp.CFrame = CFrame.new(pos) end)
             end
-            task.wait(0.4)
+            task.wait(0.6)
+            -- 第①步：放上去
             local prompt = depoPrompt()
             local en = false
             pcall(function() en = prompt and prompt.Enabled end)
-            if not en then log("prompt 未启用（角色可能没有突变）", Color3.fromRGB(255, 180, 80)) return end
+            if not en then log("Place 提示未启用（角色可能没有突变）", Color3.fromRGB(255, 180, 80)) return end
             depoFire(prompt)
-            log("已尝试把 " .. tostring(R.hold.name) .. " 放进 Depolarizer", Color3.fromRGB(120, 255, 140))
+            log("已放入 " .. tostring(R.hold.name) .. "，等待上机器…", Color3.fromRGB(120, 255, 140))
+            -- 第②步：按启动按钮（角色上机器后 prompt 会变成 Pick Up）
+            task.spawn(function()
+                local t0 = os.clock()
+                while isCurrent() and (os.clock() - t0) < 8 do
+                    local st2 = depoState()
+                    local tl = depoTimeLeft()
+                    if st2 == "busy" or (tl and tl ~= "" and tl ~= "?") then
+                        log("🧼 已开始清洗！剩余 " .. tostring(tl), Color3.fromRGB(120, 255, 140))
+                        return
+                    end
+                    if st2 == "pickup" then
+                        depoFire(depoStartPrompt())
+                        task.wait(1.5)
+                    else
+                        task.wait(0.4)
+                    end
+                end
+                log("⚠ 没检测到开始清洗（检查机器状态）", Color3.fromRGB(255, 180, 80))
+            end)
         end })
     end
 
@@ -3618,6 +3806,7 @@ local function buildUI()
             local tl = depoTimeLeft()
             local names = { idle = '<font color="rgb(120,255,140)">空闲</font>',
                             ready = '<font color="rgb(120,255,140)">已手持可放</font>',
+                            pickup = '<font color="rgb(160,220,255)">有待取回角色</font>',
                             busy = '<font color="rgb(255,200,90)">正在洗</font>',
                             none = '<font color="rgb(255,120,120)">没有机器</font>',
                             unknown = '<font color="rgb(160,160,180)">未知</font>' }
