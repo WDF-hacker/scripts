@@ -25,7 +25,7 @@
 ================================================================================
 ]]
 
-local VERSION = 363
+local VERSION = 375
 local PREFIX = "[HW]"
 local CONFIG_FILE = "hw_mutator_config.json"
 local EVENT_NAME = "Halloween"
@@ -321,6 +321,11 @@ local DEFAULT_CONFIG = {
     autoDrinkDryRun = true,         -- ★ v345 只预演不真喝（默认开）
     autoDrinkList = {},             -- ★ v345 允许自动喝的药水名（多选，UI 动态填充）
     autoDrinkInterval = 30,         -- ★ v345 同一瓶药水最短间隔（秒）
+    autoDrinkKeep = {},             -- ★ v369 保留清单（运行时派生；见下面两个真正的控件值）
+    -- ★★★ v374：保留清单必须是**控件值**才能被库的配置系统保存！
+    --   （原来只有纯 cfg 表 autoDrinkKeep ⇒ 「Overwrite config」存不下来 ⇒ 用户报的 bug）
+    autoDrinkKeepList = {},         -- ★ v374 要保留哪些药水（多选下拉，库会保存）
+    autoDrinkKeepNum = 3,           -- ★ v374 每瓶保留数量（滑块，库会保存）
     autoDrinkKeepRod = true,        -- ★ v345 喝完后把原来的手持（鱼竿）换回来（仅兜底路径用）
     autoDrinkMap = {},              -- ★ v350 自学习：药水名 -> 它对应的 Boosts 条目名（精确到期判定）
                                     --   ⚠ 这是**运行时学习**的、不落盘（配置系统已改成库的控件制，
@@ -4274,6 +4279,43 @@ local function tick()
             R._foreignLogged = nil
         end
 
+-- ⚡⚡ 防闪电"硬放手"状态（单一来源：tick 与 UI 共用，避免两处逻辑漂移）
+--   规则（用户要求）：只要当前活动**不是我们故意要持有的那个**，就不许有任何角色留在手上。
+--   "故意持有"只认两种：
+--     ① 活动 = 万圣节（本脚本的主业：手持角色等 Dracula/Demonic）
+--     ② 活动 = Solar **且** Solar 模块开着（Solar 模块的本职就是手持角色等 Mars）
+--   ⇒ Thunder / Slime Rain / Blizzard / Blood / Party / Toxic Wasteland … 一律硬放手。
+--   返回: 活动在跑?, 活动名, 是否故意持有
+--   ⚠⚠ 位置很重要：必须定义在 `EVENT_NAME` / `eventRemaining` 声明**之后**。
+--      v366 就是把它插到了文件前段（第 1193 行）⇒ 那两个 local 尚未声明、解析成全局 nil ⇒
+--      运行时报 `:1202: attempt to call a nil value`。本文件早就记过同类坑（AST 那段长注释）。
+R.hardReleaseState = function()
+    local evName = R.event.active and R.event.name or nil
+    local evLive = (evName ~= nil) and (eventRemaining() > 0)
+    local holdIntent = false
+    if evLive then
+        if evName == EVENT_NAME then
+            holdIntent = true
+        elseif evName == "Solar" and cfg.solarEnabled and type(R.solarTick) == "function" then
+            holdIntent = true
+        end
+    end
+    return evLive, evName, holdIntent
+end
+
+        -- ⚡⚡ v364：**非目标活动 = 无条件硬放手**（用户要求，实测背景见文件头注释）
+        --   Thunder（电力）活动会落闪电，打到手持/旁边的角色就变【电力】突变 ⇒
+        --   只要当前活动不是"我们故意持有的那个"，就不许有任何角色留在手上。
+        --   ⚠ 这里**故意不看** cfg.releaseOnEventEnd / cfg.releaseForeignHold 两个开关：
+        --     安全优先（那两个开关仍然管"无活动间隙"的行为）。
+        local evLiveH, evNameH, holdIntent = R.hardReleaseState()
+        local hardRelease = evLiveH and (not holdIntent) and (holdingOurs or curName ~= nil)
+        if hardRelease and R._hardRelLogged ~= tostring(evNameH) then
+            R._hardRelLogged = tostring(evNameH)
+            log("⚡ 活动 " .. tostring(evNameH) .. " 期间强制放手（非万圣节 / 防闪电突变）",
+                Color3.fromRGB(255, 200, 90))
+        end
+
         -- ⚠⚠ 严格限次（用户实测踩到严重副作用，必须这么写）：
         --   症状：日志被"放手 Goka（非万圣节事件）"每 3 秒刷屏，而且**有概率把快捷栏
         --         最后一格的物品卡在背包里、进入死循环拿不出来**。
@@ -4283,7 +4325,7 @@ local function tick()
         --   对策：① 只在"确实有目标"时才放手（没持有就什么都不做）
         --         ② 同一个角色最多只发 maxTries 次，达不到就**停手并告警**，绝不无限循环
         --         ③ 停手后进入冷却期，给服务器时间稳定（避免刚冷却完又开始刷）
-        if (holdingOurs or releaseForeign) and cfg.releaseOnEventEnd then
+        if hardRelease or ((holdingOurs or releaseForeign) and cfg.releaseOnEventEnd) then
           -- ★★★ 自动配置角色的"持有豁免窗口"（v196）★★★
           -- 用户实测抓到的冲突：非万圣节分支会**立即放手**。
           --   而"把角色放到台子上"必须**先手持** —— 我一手持，这个分支立刻把它放掉，
@@ -4292,6 +4334,16 @@ local function tick()
           -- ⇒ 自动配置在"手持 -> 放置"这段关键窗口内置位 `R._astHoldGrace`，
           --   放手逻辑见到它就整段跳过，等放置完成再恢复正常行为。
           local astGrace = (R._astHoldGrace or 0) > os.clock()
+          if astGrace and hardRelease then
+            -- ⚡ 活动期间连"自动配置的持有（手持->放置台子）"这几秒也不放过：
+            --   放在台子上的角色同样会被闪电打到。明确告知用户，免得以为自动配置坏了。
+            if R._astGraceOverridden ~= tostring(evNameH) then
+              R._astGraceOverridden = tostring(evNameH)
+              log("⚡ 活动 " .. tostring(evNameH) .. " 期间暂停自动配置的持有（防闪电）· 活动结束后再配置即可",
+                  Color3.fromRGB(255, 200, 90))
+            end
+            astGrace = false
+          end
           if not astGrace then
             local relTarget = R.hold.key and R.hold.name or R.hold.foreignName or curName
             local nowR = os.clock()
@@ -4312,7 +4364,8 @@ local function tick()
                         local s = fetchSummary()
                         if s then R.summary = s; checkMutation(s) end
                     end
-                    applyRelease(ending and "事件即将结束" or "非万圣节事件")
+                    applyRelease(ending and "事件即将结束"
+                        or ("非万圣节活动 " .. tostring(evNameH or "?")))
                 elseif not R._relGaveUpLogged or R._relGaveUpLogged ~= relTarget then
                     -- 达到上限还放不掉 -> 停手告警 + 冷却，绝不无限循环
                     R._relGaveUpLogged = relTarget
@@ -6157,6 +6210,113 @@ end
     -- ★ v355：清单 = **背包里现有的** ∪ **Constants 里定义的全部药水种类**
     --   （用户要"显示所有药水种类"；原来只列背包现成的，种类不全）
     --   不在背包里的也能勾：真到喝的时候找不到就跳过（不会报错）
+    -- ★★★ v372：**药水是堆叠的** —— 真实数量在游戏客户端的背包数据表里。
+    --   实测定位：`Remotes.BackpackCharSummaryDelta.OnClientEvent` 处理器的 upvalue 中有一张表，
+    --   键形如 `T|<药水名>`（T = Tool），每项含 `count` 字段
+    --   （旁证：游戏自己的 ClanClient 就是 `math.max(1, p.item.count or 1)` 来显示 `x N`）。
+    --   通过 getconnections + getupvalues 取出该表（只读；缓存，失效自动重建）。
+    --   ⚠ 这是唯一能反映"堆叠数量"的来源：Tool 实例只有一个，属性里也没有数量。
+    A.invTable = function()
+        local cached = A._inv
+        if type(cached) == "table" then
+            local alive = false
+            pcall(function()
+                for k in pairs(cached) do
+                    if type(k) == "string" and k:sub(1, 2) == "T|" then alive = true break end
+                end
+            end)
+            if alive then return cached end
+        end
+        A._inv = nil
+        if type(getconnections) ~= "function" or type(getupvalues) ~= "function" then return nil end
+        local rem = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+        local ev = rem and rem:FindFirstChild("BackpackCharSummaryDelta")
+        if not ev then return nil end
+        local okc, conns = pcall(getconnections, ev.OnClientEvent)
+        if not okc or type(conns) ~= "table" then return nil end
+        for _, c in ipairs(conns) do
+            local oku, ups = pcall(getupvalues, c.Function)
+            if oku and type(ups) == "table" then
+                for _, v in pairs(ups) do
+                    if type(v) == "table" then
+                        local hit = false
+                        pcall(function()
+                            for k in pairs(v) do
+                                if type(k) == "string" and k:sub(1, 2) == "T|" then
+                                    hit = true
+                                    break
+                                end
+                            end
+                        end)
+                        if hit then
+                            A._inv = v
+                            return v
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    -- 数某瓶药水现在有几瓶（① 背包数据表 .count ② 背包卡片 Amount ③ 数实例）
+    A.potionCount = function(name)
+        -- ① 权威：客户端背包数据表（含堆叠）
+        local inv = A.invTable()
+        if inv then
+            local item = inv["T|" .. tostring(name)]
+            if type(item) == "table" then
+                local c = tonumber(item.count)
+                if c then return c end
+            elseif type(item) == "number" then
+                return item
+            end
+        end
+        -- ② 背包卡片（只有背包面板打开时才存在）
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local mg = pg and pg:FindFirstChild("MainGui")
+        local bg = mg and mg:FindFirstChild("BackpackGUI")
+        local sf = bg and bg:FindFirstChild("ScrollFrame", true)
+        if sf then
+            for _, card in ipairs(sf:GetChildren()) do
+                local ln = card:FindFirstChild("LabelName", true)
+                local amt = card:FindFirstChild("Amount", true)
+                if ln and amt and tostring(ln.Text) == name then
+                    local n = tostring(amt.Text):match("(%d+)")
+                    if n then return tonumber(n) end
+                end
+            end
+        end
+        -- ③ 兜底：数实例（未堆叠时正确）
+        local cnt = 0
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        for _, t in ipairs((bp and bp:GetChildren()) or {}) do
+            if t:IsA("Tool") and tostring(t.Name) == name then cnt = cnt + 1 end
+        end
+        local ch = LocalPlayer.Character
+        for _, t in ipairs((ch and ch:GetChildren()) or {}) do
+            if t:IsA("Tool") and tostring(t.Name) == name then cnt = cnt + 1 end
+        end
+        return cnt
+    end
+
+    -- ★ v374：某瓶药水要保留几瓶（由两个控件值派生，默认 0 = 不保留）
+    A.keepCount = function(name)
+        local set = cfg.autoDrinkKeepList
+        if type(set) == "table" and set[name] == true then
+            -- ⚠ v375：数量读不到时按 3 保守处理（宁可少喝，不可多喝掉人家留着的那几瓶）
+            return math.max(0, math.floor(tonumber(cfg.autoDrinkKeepNum) or 3))
+        end
+        return 0
+    end
+
+    -- ★★★ v375：**启动宽限期** —— 脚本刚加载时库还没把配置恢复完（实测约 1~2 秒甚至更久），
+    --   此时 cfg.autoDrinkKeep* / autoDrinkList / autoStoreOn* 都还是默认值 ⇒
+    --   会"按默认配置"做出不可逆动作（实测：重载后 2 秒就喝掉了一瓶用户要留的药水 ✗）。
+    --   ⇒ 加载后 20 秒内不自动喝药、不自动购买。
+    A.graceUntil = os.clock() + 20
+    A.graceSaid = false
+
     A.potionNames = function()
         local seen, names = {}, {}
         local function add(n)
@@ -6197,6 +6357,27 @@ end
         end
         if type(cfg.autoDrinkList) == "table" then
             pcall(function() R.dDrinkList:SetValue(cfg.autoDrinkList) end)
+        end
+        -- ★ v369：保留清单的选择器 + 实时状态行（每 10 秒刷新一次）
+        if R.dKeepList then pcall(function() R.dKeepList:SetValues(names) end) end
+        if R.dKeepList and type(cfg.autoDrinkKeepList) == "table" then
+            pcall(function() R.dKeepList:SetValue(cfg.autoDrinkKeepList) end)
+        end
+        if E.lKeep then
+            local keepN = math.max(0, math.floor(tonumber(cfg.autoDrinkKeepNum) or 3))
+            local parts, cnt = {}, 0
+            for name, on in pairs(cfg.autoDrinkKeepList or {}) do
+                if on then
+                    cnt = cnt + 1
+                    parts[#parts + 1] = string.format("%s 留%d（现有 %d）", tostring(name), keepN,
+                        A.potionCount(name))
+                end
+            end
+            table.sort(parts)
+            pcall(function()
+                E.lKeep:SetText("保留清单(" .. tostring(cnt) .. "): "
+                    .. ((#parts > 0) and table.concat(parts, " | ") or "（空 — 选好药水后点「➕ 加入」）"))
+            end)
         end
     end
 
@@ -6374,6 +6555,8 @@ end
 
     A.drinkTick = function()
         if cfg.autoDrinkEnabled ~= true then return end
+        -- ★ v375：启动宽限期内不喝（配置恢复完再动手）
+        if os.clock() < (A.graceUntil or 0) then return end
         -- 🛡 安全闸门：免手持之后不再占位，所以只保留"脚本正在手持角色时不喝"
         if R.hold and R.hold.key then return end
         local list = cfg.autoDrinkList or {}
@@ -6382,14 +6565,34 @@ end
         local bp = LocalPlayer:FindFirstChild("Backpack")
         if not bp then return end
         A.drinkAt = A.drinkAt or {}
+        -- ★★★ v373：**必须拆成两个时间戳**！
+        --   原来"跳过"和"真喝"共用 `A.drinkAt` ⇒ 每次跳过都把它刷新 ⇒
+        --   `isPotionActive` 的"时长兜底"永远认为"时长没走完" ⇒ **再也喝不了** ✗✗
+        --   （用户实测：Luck Lvl.3 明明还剩 3 瓶可喝，脚本却一直不喝）
+        --   tryAt   = 上次"尝试/跳过"的时间（只用于间隔节流）
+        --   drinkAt = 上次**真喝成功**的时间（只用于"到期才续"的时长兜底）
+        A.tryAt = A.tryAt or {}
         local st = A.potionState()          -- ★ v356：源码直读的生效状态（type/key + 剩余秒）
+        -- ★ v374：保留量改由 A.keepCount() 从**控件值**派生（纯 cfg 表存不下来）
         for _, tool in ipairs(bp:GetChildren()) do
-            if tool:IsA("Tool") and list[tool.Name] and (now - (A.drinkAt[tool.Name] or 0)) > gap then
+            if tool:IsA("Tool") and list[tool.Name] and (now - (A.tryAt[tool.Name] or 0)) > gap then
+                -- ★★★ v369「保留 N 瓶」：库存 <= 保留量 -> 一滴都不喝（留给 admin abuse 这类活动）
+                --   只有**超出**保留量时才会喝（例：留 3 瓶，有几瓶就喝掉第 4、5… 瓶直到剩 3）
+                local keepN = A.keepCount(tool.Name)
+                local haveN = A.potionCount(tool.Name)
+                if keepN > 0 and haveN <= keepN then
+                    A.tryAt[tool.Name] = now
+                    if not (A.keepSaid and A.keepSaid[tool.Name] == haveN) then
+                        A.keepSaid = A.keepSaid or {}
+                        A.keepSaid[tool.Name] = haveN
+                        say("🧴 「%s」只剩 %d 瓶（保留 %d 瓶）-> 不喝，留着", tool.Name, haveN, keepN)
+                    end
+                else
                 local isOn, why = A.isPotionActive(tool.Name, st)
                 if isOn then
-                    A.drinkAt[tool.Name] = now      -- 还在生效 -> 跳过，等它到期
+                    A.tryAt[tool.Name] = now        -- 还在生效 -> 只记"尝试"，不动 drinkAt（否则兜底自我维持）
                 elseif cfg.autoDrinkDryRun ~= false then
-                    A.drinkAt[tool.Name] = now
+                    A.tryAt[tool.Name] = now
                     local ks = {}
                     for k in pairs(st.byKey) do ks[#ks + 1] = k end
                     table.sort(ks)
@@ -6397,19 +6600,23 @@ end
                         (#ks > 0) and table.concat(ks, ",") or "无")
                 else
                     if R.busySuggest then pcall(R.busySuggest, "AutoPotion", "自动喝药水") end
-                    A.drinkAt[tool.Name] = now
+                    A.tryAt[tool.Name] = now
                     local ok, why2 = A.drink(tool)
                     if R.busyClear then pcall(R.busyClear, "AutoPotion") end
                     local def = A.potionDefs()[tool.Name]
                     local extra = def and ("，key=" .. tostring(def.key)
                         .. (def.dur and ("，时长 " .. tostring(def.dur) .. "s") or "")) or ""
                     if ok then
+                        -- ★ v373：只有**真喝成功**才记 drinkAt（时长兜底只认它，避免自我维持）
+                        A.drinkAt[tool.Name] = now
+                        A.keepSaid = nil
                         say("已喝「%s」（免手持%s）", tool.Name, extra)
                     else
                         say("喝「%s」失败：%s", tool.Name, tostring(why2 or "?"))
                     end
                     task.wait(0.8)                  -- 一次只喝一瓶，喝完让服务器刷新状态
                 end
+                end                                  -- ← v369 保留判定的 else 收尾
             end
         end
     end
@@ -6417,6 +6624,12 @@ end
     -- 购买
     local function buyTick()
         if cfg.autoBuyEnabled ~= true then return end
+        -- ★ v375：启动宽限期内不买（避免"默认配置"下花错钱）
+        if os.clock() < (A.graceUntil or 0) then return end
+        if not A.graceSaid then
+            A.graceSaid = true
+            say("启动宽限期结束（20 秒）-> 自动喝药 / 自动购买 开始按配置工作")
+        end
         if (os.clock() - (A.itemsAt or 0)) > 8 then A.discover() end
         local want = cfg.autoBuyList or {}
         local cash, gems = A.cash(), A.gems()
@@ -10595,6 +10808,8 @@ local function buildUI()
     local st = Tabs.Main:AddLeftGroupbox("运行状态", "activity")
     E.lEvent = st:AddLabel("事件: 初始化…", true)
     E.lHeld = st:AddLabel("手持: 无", true)
+    -- ⚡ v366：实时显示"防闪电硬放手"是否武装（Thunder/Slime/Blizzard 这类活动期间必须武装）
+    E.lHardRel = st:AddLabel("防闪电硬放手: —", true)
     E.lStats = st:AddLabel("—", true)
     st:AddDivider()
     st:AddLabel("候选角色（优先级 高 → 低，最多显示 10）", true)
@@ -10903,18 +11118,51 @@ local function buildUI()
             Text = "喝完把手持换回来", Default = cfg.autoDrinkKeepRod ~= false,
             Tooltip = "喝完立刻把原来的手持（一般是鱼竿）换回去，避免手空着影响钓鱼",
         })
+        -- ===== ★ v374 保留清单：留几瓶不喝（给 admin abuse 这类活动留着）=====
+        --   ⚠⚠ 这两个控件就是"保留清单"的**唯一真源**：库的配置系统保存控件值，
+        --      点「Overwrite config」后它们会被存下来并在下次启动恢复。
+        --      （v369 那版用"按钮写入纯 cfg 表"的做法**存不下来** —— 用户实测踩到。）
+        g2:AddDivider()
+        R.dKeepList = g2:AddDropdown("autoDrinkKeepList", {
+            Text = "要保留的药水（多选；选中的才会保留）", Values = {}, Multi = true,
+            Tooltip = "勾选你想留着的药水（清单来自背包 + 游戏常量表，每 10 秒刷新）\n"
+                .. "配合下面的「每瓶保留数量」一起生效",
+        })
+        E.sKeepNum = g2:AddSlider("autoDrinkKeepNum", {
+            Text = "每瓶保留数量", Default = 3, Min = 1, Max = 50, Rounding = 0, Suffix = " 瓶",
+            Tooltip = "选中的药水至少留这么多瓶不喝；只有**超过**这个数量时才会自动喝掉多出来的\n"
+                .. "例：留 5 瓶 Luck Potion Lvl. 3 —— 剩 5 瓶时一滴不喝；有第 6 瓶才喝那第 6 瓶",
+        })
+        E.lKeep = g2:AddLabel("保留清单: （空）", true)
         E.lDrink = g2:AddLabel("当前生效增益: —", true)
         g2:AddButton({ Text = "💊 立即喝一瓶（手动测试）", Icon = "flask-round",
             Tooltip = "立刻喝一瓶勾选清单里最靠前的药水（忽略预演开关，真的喝）—— 用来验证机制",
             Func = function()
                 local list = cfg.autoDrinkList or {}
                 local bp = LocalPlayer:FindFirstChild("Backpack")
-                local pick
+                local pick, blocked
                 for _, t in ipairs((bp and bp:GetChildren()) or {}) do
-                    if t:IsA("Tool") and list[t.Name] then pick = t break end
+                    if t:IsA("Tool") and list[t.Name] then
+                        -- ★ v370：手动测试也**尊重保留量** —— 优先挑"库存超过保留量"的那瓶，
+                        --   全都被保留挡住时才提示（免得手滑把留着的那瓶喝掉）
+                        local keepN = R.auto.keepCount(t.Name)
+                        if keepN <= 0 or R.auto.potionCount(t.Name) > keepN then
+                            pick = t
+                            break
+                        else
+                            blocked = blocked or {}
+                            blocked[#blocked + 1] = string.format("%s（%d 瓶 = 保留量）", t.Name,
+                                R.auto.potionCount(t.Name))
+                        end
+                    end
                 end
                 if not pick then
-                    log("💊 没有可喝的：先在上面多选里勾一瓶药水", Color3.fromRGB(255, 180, 80))
+                    if blocked and #blocked > 0 then
+                        log("🧴 勾选的药水都在保留量内，不喝：" .. table.concat(blocked, "、")
+                            .. "（想强行喝就先在「保留清单」里清掉它）", Color3.fromRGB(255, 180, 80))
+                    else
+                        log("💊 没有可喝的：先在上面多选里勾一瓶药水", Color3.fromRGB(255, 180, 80))
+                    end
                     return
                 end
                 log("💊 手动喝：" .. pick.Name, Color3.fromRGB(170, 220, 255))
@@ -11027,6 +11275,16 @@ local function buildUI()
         bind(E.tDrink, "autoDrinkEnabled")
         bind(E.tDrinkDry, "autoDrinkDryRun")
         bind(E.sDrinkGap, "autoDrinkInterval")
+        -- ★ v374：保留清单的两个控件 —— 它们才是被库保存的真源
+        bind(E.sKeepNum, "autoDrinkKeepNum")
+        if R.dKeepList then
+            pcall(function()
+                R.dKeepList:OnChanged(function(v)
+                    cfg.autoDrinkKeepList = normMulti(v)
+                    if type(R.auto.syncPotionUI) == "function" then pcall(R.auto.syncPotionUI, true) end
+                end)
+            end)
+        end
         bind(E.tDrinkRod, "autoDrinkKeepRod")
         if R.dDrinkList then
             pcall(function()
@@ -12317,11 +12575,36 @@ local function buildUI()
             E.lEvent:SetText('事件: 无')
         end
 
-        if h.key then
-            E.lHeld:SetText(string.format('<font color="rgb(120,255,140)">手持: %s [%s]</font>  (%.0fs)',
-                tostring(h.name), tostring(h.rarity), os.clock() - (h.since or os.clock())))
-        else
-            E.lHeld:SetText('手持: 无')
+        -- ★★★ v365：显示"**真实**手上有什么"，并区分是谁持的
+        --   原来只看 R.hold.key（脚本自己的持有）⇒ 你手动持着时也显示"手持: 无"，
+        --   看起来像"判定坏了"，其实放手判定用的是 heldName()（查 ToolFollowers + 角色里的 Tool），
+        --   它一直是好的（历史日志：「事件 Party 运行中，你手动手持的 Zera Two 可能被突变 -> 自动放手」）。
+        do
+            local realHeld = heldName()
+            if h.key then
+                E.lHeld:SetText(string.format('<font color="rgb(120,255,140)">手持: %s [%s]</font>  (%.0fs)',
+                    tostring(h.name), tostring(h.rarity), os.clock() - (h.since or os.clock())))
+            elseif realHeld then
+                E.lHeld:SetText(string.format(
+                    '<font color="rgb(255,200,90)">手持: %s（你手动持有 · 脚本未接管）</font>', tostring(realHeld)))
+            else
+                E.lHeld:SetText('手持: 无')
+            end
+            -- ⚡ 防闪电硬放手状态（Thunder/Slime/Blizzard… 期间应为「武装中」）
+            if E.lHardRel and type(R.hardReleaseState) == "function" then
+                local evLive2, evN, intent = R.hardReleaseState()
+                if not evLive2 then
+                    E.lHardRel:SetText('<font color="rgb(150,150,170)">防闪电硬放手: 待命（当前无活动）</font>')
+                elseif intent then
+                    E.lHardRel:SetText(string.format(
+                        '<font color="rgb(255,200,90)">防闪电硬放手: 不适用（%s = 故意持有：万圣节/Solar模块）</font>',
+                        tostring(evN)))
+                else
+                    E.lHardRel:SetText(string.format(
+                        '<font color="rgb(120,255,140)">防闪电硬放手: 武装中（活动 %s 非目标 ⇒ 手上角色一律放掉）</font>',
+                        tostring(evN)))
+                end
+            end
         end
 
         E.lStats:SetText(string.format('候选 %d 个  |  Dracula %d · Demonic %d · 其他 %d · 尝试 %d',
