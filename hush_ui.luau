@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 8
-_G.HUSH_UI_VERSION = 8
+local VERSION = 9
+_G.HUSH_UI_VERSION = 9
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -337,7 +337,9 @@ local function listAlive()
                     head = headPos,
                     neck = neck,
                     chest = chest,
-                    pos = root.Position
+                    pos = root.Position,
+                    center = root.Position + Vector3.new(0, 1.15 * scale, 0),
+                    scale = scale
                 }
             end
         end
@@ -591,13 +593,24 @@ renderConn = RunService.RenderStepped:Connect(function()
         for _, z in ipairs(listAlive()) do
             local dist = (z.pos - hrp.Position).Magnitude
             if dist <= cfg.espMaxDist then
-                local sp, depth = project(z.head)
+                local sp, depth = project(z.center or z.head)
                 if sp and used < POOL then
                     used = used + 1
                     local s = pool[used]
-                    local h = math.clamp(1500 / math.max(depth, 1), 24, 200)
+                    -- 槽位换目标时重置平滑，避免把上一个目标的坐标带过来
+                    if s.model ~= z.model then
+                        s.model = z.model
+                        s.lx, s.ly = nil, nil
+                    end
+                    local tx, ty = sp.X, sp.Y
+                    if s.lx and math.abs(tx - s.lx) + math.abs(ty - s.ly) < 260 then
+                        tx = s.lx + (tx - s.lx) * 0.45
+                        ty = s.ly + (ty - s.ly) * 0.45
+                    end
+                    s.lx, s.ly = tx, ty
+                    local h = math.clamp(1500 * (z.scale or 1) / math.max(depth, 1), 24, 220)
                     local w = h * 0.6
-                    local x, y = sp.X - w / 2, sp.Y - h / 2
+                    local x, y = tx - w / 2, ty - h / 2
                     local isAimTarget = aimTargetId ~= nil and z.id == aimTargetId and (os.clock() - aimTargetAt) < 1.2
                     local c = isAimTarget and Color3.fromRGB(255, 55, 55) or cfg.espColor
                     if cfg.style == "corner" then
@@ -616,13 +629,13 @@ renderConn = RunService.RenderStepped:Connect(function()
                     if cfg.espName then parts[#parts + 1] = "#" .. tostring(z.id) end
                     if cfg.espDist then parts[#parts + 1] = string.format("%.0fm", dist) end
                     s.text.Text = table.concat(parts, " ")
-                    s.text.Position = Vector2.new(sp.X, y - 16)
+                    s.text.Position = Vector2.new(tx, y - 16)
                     s.text.Size = cfg.textSize
                     s.text.Color = c
                     s.text.Visible = true
                     if cfg.tracer then
                         s.tracer.From = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
-                        s.tracer.To = Vector2.new(sp.X, sp.Y + h / 2)
+                        s.tracer.To = Vector2.new(tx, ty + h / 2)
                         s.tracer.Color = c
                         s.tracer.Visible = true
                     else
