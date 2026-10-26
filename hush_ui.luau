@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 12
-_G.HUSH_UI_VERSION = 12
+local VERSION = 13
+_G.HUSH_UI_VERSION = 13
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -104,6 +104,8 @@ local cfg = {
     warnWatched = true,
     bossBias = 0,
     bossAim = true,
+    bossAutoCal = true,
+    bossFallbackTorso = false,
 
     esp = true,
     style = "corner",
@@ -117,6 +119,10 @@ local cfg = {
     espColor = Color3.fromRGB(120, 255, 140)
 }
 _G.HUSH_UI_CFG = cfg
+
+-- Boss 命中箱自校准数据: id -> { head = {relY...}, torso = {...}, h, t }
+local bossCalib = {}
+local aimTargetId, aimTargetAt, aimTargetRootY = nil, 0, 0
 
 --============ 配置持久化 ============
 local HttpService = game:GetService("HttpService")
@@ -190,6 +196,19 @@ pcall(function()
                 logLine(string.format("HIT %s part=%s dmg=%s kind=%s watched=%s%s",
                     os.date("!%H:%M:%S"), tostring(d.part), tostring(d.dmg),
                     tostring(d.kind), tostring(lp:GetAttribute("Watched")), posTxt))
+                -- Boss 命中箱采样（只采样最近 1.5s 内锁定的目标）
+                if cfg.bossAutoCal and aimTargetId ~= nil and (os.clock() - aimTargetAt) < 1.5 and typeof(d.pos) == "Vector3" then
+                    local c = bossCalib[aimTargetId] or { head = {}, torso = {}, h = 0, t = 0 }
+                    local rel = d.pos.Y - (aimTargetRootY or 0)
+                    if tostring(d.part) == "head" then
+                        table.insert(c.head, rel); c.h = c.h + 1
+                        if #c.head > 40 then table.remove(c.head, 1) end
+                    elseif tostring(d.part) == "torso" then
+                        table.insert(c.torso, rel); c.t = c.t + 1
+                        if #c.torso > 40 then table.remove(c.torso, 1) end
+                    end
+                    bossCalib[aimTargetId] = c
+                end
             end)
         end)
     end
@@ -327,8 +346,26 @@ local function listAlive()
                 else
                     headPos = hp.Position
                 end
-                if cfg.bossBias and cfg.bossBias ~= 0 and string.find(string.lower(tostring(rec.kind)), "boss") then
-                    headPos = headPos + Vector3.new(0, cfg.bossBias, 0)
+                if isBoss then
+                    local cal = cfg.bossAutoCal and bossCalib[rec.id]
+                    local used = false
+                    if cal and (cal.h + cal.t) >= 6 then
+                        local src = cal.head
+                        if cfg.bossFallbackTorso and cal.t > cal.h and #cal.torso > 0 then
+                            src = cal.torso
+                        end
+                        if #src > 0 then
+                            local s = {}
+                            for i = 1, #src do s[i] = src[i] end
+                            table.sort(s)
+                            local med = s[math.floor((#s + 1) / 2)]
+                            headPos = Vector3.new(headPos.X, root.Position.Y + med, headPos.Z)
+                            used = true
+                        end
+                    end
+                    if not used and cfg.bossBias and cfg.bossBias ~= 0 then
+                        headPos = headPos + Vector3.new(0, cfg.bossBias, 0)
+                    end
                 end
                 local chest = root.Position + Vector3.new(0, 0.35 * scale, 0)
                 local neck = headPos - Vector3.new(0, 0.35 * scale, 0)
@@ -350,7 +387,7 @@ local function listAlive()
     end
     return out
 end
-_G.HUSH_UI = { cfg = cfg, listAlive = listAlive }
+_G.HUSH_UI = { cfg = cfg, listAlive = listAlive, calib = bossCalib }
 
 local function aimPointOf(z)
     if cfg.part == "neck" then return z.neck end
@@ -482,8 +519,6 @@ end
 
 --============ 静默瞄准 ============
 local currentTargetId = nil
-local aimTargetId = nil
-local aimTargetAt = 0
 local raidKey = ""
 local corrections = 0
 local restoreFire = nil
@@ -559,6 +594,7 @@ if Net then
                 corrections = (corrections or 0) + 1
                 aimTargetId = z.id
                 aimTargetAt = os.clock()
+                aimTargetRootY = z.root.Position.Y
                 payload.d = nd
                 payload.ay = -math.atan2(nd.X, -nd.Z)
                 logLine(string.format("FIRE %s#%s px=%.0f dist=%.0f ang=%.1f sp=%.2f watched=%s n=%d",
@@ -818,6 +854,16 @@ if Library then
         Text = "Boss 专用瞄准点", Default = cfg.bossAim,
         Tooltip = "开启后，名字含 boss 的目标瞄准游戏给定的 parts[head]（LowerTorso）；普通僵尸始终瞄视觉头部",
         Callback = function(v) cfg.bossAim = v end
+    })
+    A.bossAutoCal = gA:AddToggle("bossAutoCal", {
+        Text = "Boss 命中箱自校准", Default = cfg.bossAutoCal,
+        Tooltip = "用 combat.hit 的落点自动学习头部判定区高度，至少 6 次命中后生效；比手动偏移更准",
+        Callback = function(v) cfg.bossAutoCal = v end
+    })
+    A.bossFallback = gA:AddToggle("bossFallbackTorso", {
+        Text = "小箱回退躯干", Default = cfg.bossFallbackTorso,
+        Tooltip = "如果一个 boss 的躯干命中数多于头部，就自动改打躯干（保证伤害下限）",
+        Callback = function(v) cfg.bossFallbackTorso = v end
     })
     A.bossBias = gA:AddSlider("bossBias", {
         Text = "Boss 瞄准偏移", Default = cfg.bossBias, Min = -4, Max = 4, Rounding = 1, Suffix = " studs",
