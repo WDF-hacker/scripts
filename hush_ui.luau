@@ -79,6 +79,7 @@ local cfg = {
     debug = false,
     streamproof = true,
     warnWatched = true,
+    bossBias = 0,
 
     esp = true,
     style = "corner",
@@ -158,9 +159,13 @@ pcall(function()
         r.OnClientEvent:Connect(function(d)
             pcall(function()
                 if type(d) ~= "table" then return end
-                logLine(string.format("HIT %s part=%s dmg=%s kind=%s watched=%s",
+                local posTxt = ""
+                if typeof(d.pos) == "Vector3" then
+                    posTxt = string.format(" pos=%.1f,%.1f,%.1f", d.pos.X, d.pos.Y, d.pos.Z)
+                end
+                logLine(string.format("HIT %s part=%s dmg=%s kind=%s watched=%s%s",
                     os.date("!%H:%M:%S"), tostring(d.part), tostring(d.dmg),
-                    tostring(d.kind), tostring(lp:GetAttribute("Watched"))))
+                    tostring(d.kind), tostring(lp:GetAttribute("Watched")), posTxt))
             end)
         end)
     end
@@ -278,9 +283,26 @@ local function listAlive()
             if model and root and root.Parent and root.Position.Y > -100 then
                 local scale = (type(rig) == "table" and tonumber(rig.scale)) or 1
                 local headPos = root.Position + Vector3.new(0, 1.55 * scale, 0)
-                local head = model:FindFirstChild("Head")
-                if head and head:IsA("BasePart") and math.abs(head.Position.Y - root.Position.Y) < 4 then
-                    headPos = head.Position
+                -- 优先用游戏自己的 head 索引（rig.parts[rec.head]）
+                -- boss_conductor 的 head 索引指向 LowerTorso（y≈5.7），不是视觉头部（y≈9.4）
+                local hp = nil
+                local parts = type(rig) == "table" and rig.parts
+                local idx = rec.head
+                if type(parts) == "table" and type(idx) == "number" then
+                    local cand = parts[idx]
+                    if typeof(cand) == "Instance" and cand:IsA("BasePart") then
+                        hp = cand
+                    end
+                end
+                if not hp then
+                    local mh = model:FindFirstChild("Head")
+                    if mh and mh:IsA("BasePart") then hp = mh end
+                end
+                if hp then
+                    headPos = hp.Position
+                end
+                if cfg.bossBias and cfg.bossBias ~= 0 and string.find(string.lower(tostring(rec.kind)), "boss") then
+                    headPos = headPos + Vector3.new(0, cfg.bossBias, 0)
                 end
                 local chest = root.Position + Vector3.new(0, 0.35 * scale, 0)
                 local neck = headPos - Vector3.new(0, 0.35 * scale, 0)
@@ -730,6 +752,11 @@ if Library then
             saveCfg()
             if Library and Library.Notify then Library:Notify("已套用低姿态预设，配置已保存", 5) end
         end
+    })
+    A.bossBias = gA:AddSlider("bossBias", {
+        Text = "Boss 瞄准偏移", Default = cfg.bossBias, Min = -4, Max = 4, Rounding = 1, Suffix = " studs",
+        Tooltip = "只对名字含 boss 的目标生效。游戏给 boss_conductor 定的 head 在 LowerTorso(y≈5.7)，比视觉头部低约 3.6 studs；打不中时用这个上下微调",
+        Callback = function(v) cfg.bossBias = v end
     })
     A.fovColorToggle = gA:AddToggle("fovColorOn", {
         Text = "FOV 圈颜色", Default = true,
