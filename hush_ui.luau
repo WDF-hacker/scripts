@@ -69,6 +69,12 @@ local cfg = {
     pauseWatched = false,
     onlyOnScreen = true,
 
+    -- 隐蔽设置
+    chance = 100,
+    maxAngle = 90,
+    jitter = 0,
+    rateLimit = 0,
+
     esp = true,
     style = "corner",
     espName = true,
@@ -81,6 +87,53 @@ local cfg = {
     espColor = Color3.fromRGB(120, 255, 140)
 }
 _G.HUSH_UI_CFG = cfg
+
+--============ 配置持久化 ============
+local HttpService = game:GetService("HttpService")
+local CFG_FILE = "hush_ui_config.json"
+
+local function cfgToTable()
+    local t = {}
+    for k, v in pairs(cfg) do
+        if typeof(v) == "Color3" then
+            t[k] = { math.floor(v.R * 255 + 0.5), math.floor(v.G * 255 + 0.5), math.floor(v.B * 255 + 0.5) }
+        elseif type(v) == "boolean" or type(v) == "number" or type(v) == "string" then
+            t[k] = v
+        end
+    end
+    return t
+end
+
+local function applyTable(t)
+    if type(t) ~= "table" then return end
+    for k, v in pairs(t) do
+        local cur = cfg[k]
+        if cur ~= nil then
+            if typeof(cur) == "Color3" then
+                if type(v) == "table" and #v == 3 then
+                    cfg[k] = Color3.fromRGB(v[1], v[2], v[3])
+                end
+            elseif type(v) == type(cur) then
+                cfg[k] = v
+            end
+        end
+    end
+end
+
+local function saveCfg()
+    pcall(function()
+        writefile(CFG_FILE, HttpService:JSONEncode(cfgToTable()))
+    end)
+end
+
+local function loadCfg()
+    if not (isfile and isfile(CFG_FILE)) then return false end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(CFG_FILE)) end)
+    if ok then applyTable(data) end
+    return ok
+end
+
+loadCfg()
 
 --============ 僵尸注册表 ============
 local function scoreReg(t)
@@ -296,7 +349,32 @@ if Net then
                     local vel = z.root.AssemblyLinearVelocity
                     ap = ap + vel * cfg.lead
                 end
+
+                -- 隐蔽判定开始
+                local rate = cfg.rateLimit or 0
+                if rate > 0 then
+                    shotTimes = shotTimes or {}
+                    local nowT = os.clock()
+                    local cnt = 0
+                    for i = #shotTimes, 1, -1 do
+                        if nowT - shotTimes[i] > 1 then table.remove(shotTimes, i) else cnt = cnt + 1 end
+                    end
+                    if cnt >= rate then return end
+                    table.insert(shotTimes, nowT)
+                end
                 local nd = (ap - payload.o).Unit
+                local ang = math.deg(math.acos(math.clamp(nd:Dot(payload.d), -1, 1)))
+                if ang > (cfg.maxAngle or 90) then return end
+                if (cfg.chance or 100) < 100 and (math.random() * 100 > cfg.chance) then return end
+                local jit = cfg.jitter or 0
+                if jit > 0 then
+                    local rx = math.rad((math.random() - 0.5) * 2 * jit)
+                    local ry = math.rad((math.random() - 0.5) * 2 * jit)
+                    local cf = CFrame.new(Vector3.zero, nd)
+                    nd = (cf * CFrame.Angles(rx, ry, 0)).LookVector
+                end
+                -- 隐蔽判定结束
+
                 payload.d = nd
                 payload.ay = -math.atan2(nd.X, -nd.Z)
             end)
@@ -439,6 +517,43 @@ if Library then
         Tooltip = "检测到 Watched=true（抽样录像）时停止改写",
         Callback = function(v) cfg.pauseWatched = v end
     })
+
+    local gK = Tabs.Aim:AddLeftGroupbox("隐蔽设置", "shield")
+    A.chance = gK:AddSlider("chancePct", {
+        Text = "修正概率", Default = cfg.chance, Min = 0, Max = 100, Rounding = 0, Suffix = " %",
+        Tooltip = "只按这个概率修正弹道。65% 会把爆头率压回接近真人水平，100% 就是每发都修",
+        Callback = function(v) cfg.chance = v end
+    })
+    A.maxAngle = gK:AddSlider("angleCap", {
+        Text = "角度上限", Default = cfg.maxAngle, Min = 1, Max = 45, Rounding = 1, Suffix = "°",
+        Tooltip = "原弹道与目标夹角超过这个值就放弃修正。3° 以内基本看不出来",
+        Callback = function(v) cfg.maxAngle = v end
+    })
+    A.jitter = gK:AddSlider("jitterDeg", {
+        Text = "瞄准抖动", Default = cfg.jitter, Min = 0, Max = 2, Rounding = 2, Suffix = "°",
+        Tooltip = "修正后加一点随机偏移，避免每发都像素级完美",
+        Callback = function(v) cfg.jitter = v end
+    })
+    A.rate = gK:AddSlider("rateCap", {
+        Text = "每秒最多修正", Default = cfg.rateLimit, Min = 0, Max = 10, Rounding = 0, Suffix = " 次",
+        Tooltip = "0 = 不限制；限制后更像真人的开枪节奏",
+        Callback = function(v) cfg.rateLimit = v end
+    })
+    gK:AddButton({
+        Text = "套用低姿态预设（主号推荐）",
+        Tooltip = "一键设置：65% 概率 / ≤3° / 抖动0.2° / 每秒2次 / FOV140 / 80studs / 被观察时暂停",
+        Func = function()
+            cfg.chance = 65
+            cfg.maxAngle = 3
+            cfg.jitter = 0.2
+            cfg.rateLimit = 2
+            cfg.fov = 140
+            cfg.maxDist = 80
+            cfg.pauseWatched = true
+            saveCfg()
+            if Library and Library.Notify then Library:Notify("已套用低姿态预设，配置已保存", 5) end
+        end
+    })
     A.fovColorToggle = gA:AddToggle("fovColorOn", {
         Text = "FOV 圈颜色", Default = true,
         Tooltip = "点击右侧色块调整 FOV 圈颜色",
@@ -517,9 +632,25 @@ if Library then
     A.lblWatched = gS:AddLabel("Watched: -")
     A.lblMode = gS:AddLabel("部位: head")
 
+    local gC = Tabs.Status:AddLeftGroupbox("配置", "save")
+    gC:AddButton({
+        Text = "立即保存配置", Tooltip = "写入 hush_ui_config.json",
+        Func = function() saveCfg(); if Library and Library.Notify then Library:Notify("配置已保存", 3) end end
+    })
+    gC:AddButton({
+        Text = "重载配置", Tooltip = "从文件读取（部分控件需重开面板才刷新显示）",
+        Func = function() loadCfg(); if Library and Library.Notify then Library:Notify("已重载配置", 3) end end
+    })
+
     task.spawn(function()
+        local saveAcc = 0
         while true do
             task.wait(0.4)
+            saveAcc = saveAcc + 0.4
+            if saveAcc >= 5 then
+                saveAcc = 0
+                saveCfg()
+            end
             pcall(function()
                 A.lblTrack:SetText("追踪: " .. tostring(#listAlive()) .. " 只活僵尸")
                 A.lblTarget:SetText("目标: " .. lastTargetName)
