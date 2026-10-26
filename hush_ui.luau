@@ -74,6 +74,10 @@ local cfg = {
     maxAngle = 90,
     jitter = 0,
     rateLimit = 0,
+    switchPenalty = 0.25,
+    maxPerRaid = 60,
+    debug = false,
+    streamproof = true,
 
     esp = true,
     style = "corner",
@@ -257,7 +261,11 @@ local function pickTarget(o)
             local sp = project(aimPointOf(z))
             if sp then
                 local dpx = (sp - mp).Magnitude
-                if dpx <= cfg.fov and dpx < bestD then
+                local eff = dpx
+                if currentTargetId ~= nil and z.id == currentTargetId then
+                    eff = dpx * (1 - (cfg.switchPenalty or 0))
+                end
+                if dpx <= cfg.fov and eff < bestD then
                     if (not cfg.los) or los(o, aimPointOf(z)) then
                         best, bestD = { z = z, px = dpx, dist = dist }, dpx
                     end
@@ -265,11 +273,17 @@ local function pickTarget(o)
             end
         end
     end
+    if best then currentTargetId = best.z.id end
     return best
 end
 
 --============ FOV 圈 ============
+local function protect(d)
+    pcall(function() d.Streamproof = true end)
+end
+
 local fovCircle = Drawing.new("Circle")
+protect(fovCircle)
 fovCircle.Thickness = 1.5
 fovCircle.Filled = false
 fovCircle.Transparency = 0.9
@@ -298,6 +312,8 @@ for i = 1, POOL do
     s.tracer = Drawing.new("Line")
     s.tracer.Thickness = 1
     s.tracer.Visible = false
+    protect(s.text); protect(s.square); protect(s.tracer)
+    for j = 1, 8 do protect(s.lines[j]) end
     pool[i] = s
 end
 
@@ -328,6 +344,12 @@ local function drawCorner(s, x, y, w, h, c)
 end
 
 --============ 静默瞄准 ============
+local currentTargetId = nil
+local raidKey = ""
+local corrections = 0
+local restoreFire = nil
+local renderConn = nil
+
 local Net
 do
     local hush = RS:FindFirstChild("Hush")
@@ -337,6 +359,7 @@ end
 
 if Net then
     local oldFire = Net.fire
+    restoreFire = function() Net.fire = oldFire end
     Net.fire = function(name, payload)
         if cfg.silent and name == "combat.fire" and type(payload) == "table" and payload.o and payload.d then
             pcall(function()
@@ -362,6 +385,12 @@ if Net then
                     if cnt >= rate then return end
                     table.insert(shotTimes, nowT)
                 end
+                local rk = tostring(lp:GetAttribute("Place")) .. "|" .. game.JobId
+                if rk ~= raidKey then
+                    raidKey = rk
+                    corrections = 0
+                end
+                if cfg.maxPerRaid and cfg.maxPerRaid > 0 and corrections >= cfg.maxPerRaid then return end
                 local nd = (ap - payload.o).Unit
                 local ang = math.deg(math.acos(math.clamp(nd:Dot(payload.d), -1, 1)))
                 if ang > (cfg.maxAngle or 90) then return end
@@ -375,6 +404,7 @@ if Net then
                 end
                 -- 隐蔽判定结束
 
+                corrections = (corrections or 0) + 1
                 payload.d = nd
                 payload.ay = -math.atan2(nd.X, -nd.Z)
             end)
@@ -386,7 +416,7 @@ end
 --============ 渲染循环 ============
 local lastTargetName = "-"
 
-RunService.RenderStepped:Connect(function()
+renderConn = RunService.RenderStepped:Connect(function()
     -- FOV 圈
     if cfg.showFov and cfg.silent then
         fovCircle.Position = mousePos()
@@ -455,6 +485,33 @@ RunService.RenderStepped:Connect(function()
     end)
 end)
 
+--============ 卸载 / 紧急停止 ============
+local function cleanup()
+    pcall(function() if renderConn then renderConn:Disconnect() end end)
+    pcall(function() if restoreFire then restoreFire() end end)
+    pcall(function() fovCircle:Remove() end)
+    for _, s in ipairs(pool) do
+        pcall(function() s.text:Remove() end)
+        pcall(function() s.square:Remove() end)
+        pcall(function() s.tracer:Remove() end)
+        for j = 1, 8 do pcall(function() s.lines[j]:Remove() end) end
+    end
+    pool = {}
+    pcall(function()
+        if _G.HUSH_UI and _G.HUSH_UI.uiGui then _G.HUSH_UI.uiGui:Destroy() end
+    end)
+end
+_G.HUSH_UI_CLEANUP = cleanup
+
+pcall(function()
+    UIS.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.End then
+            cleanup()
+        end
+    end)
+end)
+
 --============ UI ============
 local Tabs, A = nil, {}
 if Library then
@@ -465,6 +522,22 @@ if Library then
         Resizable = true,
         ShowCustomCursor = false
     })
+    do
+        local roots = {}
+        if gethui then table.insert(roots, gethui()) end
+        table.insert(roots, game:GetService("CoreGui"))
+        table.insert(roots, lp:FindFirstChild("PlayerGui"))
+        for _, root in ipairs(roots) do
+            if root then
+                for _, g in ipairs(root:GetDescendants()) do
+                    if g:IsA("ScreenGui") and g.Name:find("Obsidian") then
+                        _G.HUSH_UI.uiGui = g
+                    end
+                end
+            end
+        end
+    end
+
     Tabs = {
         Aim = Window:AddTab("静默瞄准", "crosshair"),
         Esp = Window:AddTab("透视", "box"),
@@ -661,4 +734,4 @@ if Library then
     end)
 end
 
-print(PREFIX .. " v" .. VERSION .. " loaded (RightShift)")
+if _G.HUSH_UI_CFG and _G.HUSH_UI_CFG.debug then print(PREFIX .. " loaded") end
