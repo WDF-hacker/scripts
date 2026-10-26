@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 10
-_G.HUSH_UI_VERSION = 10
+local VERSION = 11
+_G.HUSH_UI_VERSION = 11
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -103,6 +103,7 @@ local cfg = {
     streamproof = true,
     warnWatched = true,
     bossBias = 0,
+    bossAim = true,
 
     esp = true,
     style = "corner",
@@ -306,23 +307,24 @@ local function listAlive()
             local root = type(rig) == "table" and rig.root
             if model and root and root.Parent and root.Position.Y > -100 then
                 local scale = (type(rig) == "table" and tonumber(rig.scale)) or 1
+                local isBoss = string.find(string.lower(tostring(rec.kind)), "boss") ~= nil
                 local headPos = root.Position + Vector3.new(0, 1.55 * scale, 0)
-                -- 优先用游戏自己的 head 索引（rig.parts[rec.head]）
-                -- boss_conductor 的 head 索引指向 LowerTorso（y≈5.7），不是视觉头部（y≈9.4）
                 local hp = nil
                 local parts = type(rig) == "table" and rig.parts
-                local idx = rec.head
-                if type(parts) == "table" and type(idx) == "number" then
-                    local cand = parts[idx]
-                    if typeof(cand) == "Instance" and cand:IsA("BasePart") then
-                        hp = cand
-                    end
+                -- 只有 boss 才用游戏给的 parts[rec.head]（boss_conductor 指向 LowerTorso）
+                -- 普通僵尸的 parts[rec.head] 指向 UpperTorso，会打到胸口，必须用视觉头部
+                if isBoss and cfg.bossAim ~= false and type(parts) == "table" and type(rec.head) == "number" then
+                    local cand = parts[rec.head]
+                    if typeof(cand) == "Instance" and cand:IsA("BasePart") then hp = cand end
                 end
                 if not hp then
                     local mh = model:FindFirstChild("Head")
-                    if mh and mh:IsA("BasePart") then hp = mh end
+                    if mh and mh:IsA("BasePart") and math.abs(mh.Position.Y - root.Position.Y) < 8 then hp = mh end
                 end
-                if hp then
+                if not hp then
+                    local face = model:FindFirstChild("FaceCenterAttachment", true)
+                    if face then headPos = face.WorldPosition end
+                else
                     headPos = hp.Position
                 end
                 if cfg.bossBias and cfg.bossBias ~= 0 and string.find(string.lower(tostring(rec.kind)), "boss") then
@@ -339,6 +341,7 @@ local function listAlive()
                     neck = neck,
                     chest = chest,
                     pos = root.Position,
+                    isBoss = isBoss,
                     center = root.Position + Vector3.new(0, 1.15 * scale, 0),
                     scale = scale
                 }
@@ -613,7 +616,8 @@ renderConn = RunService.RenderStepped:Connect(function()
                     local w = h * 0.6
                     local x, y = tx - w / 2, ty - h / 2
                     local isAimTarget = aimTargetId ~= nil and z.id == aimTargetId and (os.clock() - aimTargetAt) < 1.2
-                    local c = isAimTarget and Color3.fromRGB(255, 55, 55) or cfg.espColor
+                    local baseColor = z.isBoss and Color3.fromRGB(255, 165, 60) or cfg.espColor
+                    local c = isAimTarget and Color3.fromRGB(255, 55, 55) or baseColor
                     if cfg.style == "corner" then
                         s.square.Visible = false
                         drawCorner(s, x, y, w, h, c)
@@ -626,7 +630,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                         s.square.Visible = true
                     end
                     local parts = {}
-                    if cfg.espKind then parts[#parts + 1] = z.kind end
+                    if cfg.espKind then parts[#parts + 1] = (z.isBoss and "BOSS " or "") .. z.kind end
                     if cfg.espName then parts[#parts + 1] = "#" .. tostring(z.id) end
                     if cfg.espDist then parts[#parts + 1] = string.format("%.0fm", dist) end
                     s.text.Text = table.concat(parts, " ")
@@ -795,6 +799,11 @@ if Library then
             saveCfg()
             if Library and Library.Notify then Library:Notify("已套用低姿态预设，配置已保存", 5) end
         end
+    })
+    A.bossAim = gA:AddToggle("bossAim", {
+        Text = "Boss 专用瞄准点", Default = cfg.bossAim,
+        Tooltip = "开启后，名字含 boss 的目标瞄准游戏给定的 parts[head]（LowerTorso）；普通僵尸始终瞄视觉头部",
+        Callback = function(v) cfg.bossAim = v end
     })
     A.bossBias = gA:AddSlider("bossBias", {
         Text = "Boss 瞄准偏移", Default = cfg.bossBias, Min = -4, Max = 4, Rounding = 1, Suffix = " studs",
