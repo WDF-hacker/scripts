@@ -139,6 +139,32 @@ end
 
 loadCfg()
 
+--============ 射击日志 ============
+local LOG = "hush_shots.log"
+if not isfile(LOG) then writefile(LOG, "") end
+local function logLine(s)
+    pcall(function() appendfile(LOG, s .. "\n") end)
+end
+logLine(string.format("# SESSION %s user=%s uid=%d job=%s place=%s watched=%s cfg(chance=%d,maxAngle=%.1f,jitter=%.2f,rate=%d,cap=%d,fov=%d)",
+    os.date("!%Y-%m-%dT%H:%M:%S"), lp.Name, lp.UserId, game.JobId,
+    tostring(lp:GetAttribute("Place")), tostring(lp:GetAttribute("Watched")),
+    cfg.chance, cfg.maxAngle, cfg.jitter, cfg.rateLimit, cfg.maxPerRaid, cfg.fov))
+
+pcall(function()
+    local hn = RS:WaitForChild("HushNet", 10)
+    local r = hn and hn:FindFirstChild("combat.hit")
+    if r then
+        r.OnClientEvent:Connect(function(d)
+            pcall(function()
+                if type(d) ~= "table" then return end
+                logLine(string.format("HIT %s part=%s dmg=%s kind=%s watched=%s",
+                    os.date("!%H:%M:%S"), tostring(d.part), tostring(d.dmg),
+                    tostring(d.kind), tostring(lp:GetAttribute("Watched"))))
+            end)
+        end)
+    end
+end)
+
 --============ 僵尸注册表 ============
 local function scoreReg(t)
     if type(t) ~= "table" then return 0 end
@@ -345,6 +371,8 @@ end
 
 --============ 静默瞄准 ============
 local currentTargetId = nil
+local aimTargetId = nil
+local aimTargetAt = 0
 local raidKey = ""
 local corrections = 0
 local restoreFire = nil
@@ -363,9 +391,9 @@ if Net then
     Net.fire = function(name, payload)
         if cfg.silent and name == "combat.fire" and type(payload) == "table" and payload.o and payload.d then
             pcall(function()
-                if cfg.pauseWatched and lp:GetAttribute("Watched") == true then return end
+                if cfg.pauseWatched and lp:GetAttribute("Watched") == true then logLine("SKIP watched"); return end
                 local pick = pickTarget(payload.o)
-                if not pick then return end
+                if not pick then logLine("SKIP no_target"); return end
                 local z = pick.z
                 local ap = aimPointOf(z)
                 if cfg.predict then
@@ -382,7 +410,7 @@ if Net then
                     for i = #shotTimes, 1, -1 do
                         if nowT - shotTimes[i] > 1 then table.remove(shotTimes, i) else cnt = cnt + 1 end
                     end
-                    if cnt >= rate then return end
+                    if cnt >= rate then logLine("SKIP rate"); return end
                     table.insert(shotTimes, nowT)
                 end
                 local rk = tostring(lp:GetAttribute("Place")) .. "|" .. game.JobId
@@ -390,11 +418,20 @@ if Net then
                     raidKey = rk
                     corrections = 0
                 end
-                if cfg.maxPerRaid and cfg.maxPerRaid > 0 and corrections >= cfg.maxPerRaid then return end
+                if cfg.maxPerRaid and cfg.maxPerRaid > 0 and corrections >= cfg.maxPerRaid then
+                    logLine("SKIP cap")
+                    return
+                end
                 local nd = (ap - payload.o).Unit
                 local ang = math.deg(math.acos(math.clamp(nd:Dot(payload.d), -1, 1)))
-                if ang > (cfg.maxAngle or 90) then return end
-                if (cfg.chance or 100) < 100 and (math.random() * 100 > cfg.chance) then return end
+                if ang > (cfg.maxAngle or 90) then
+                    logLine(string.format("SKIP angle=%.1f target=%s#%s", ang, tostring(z.kind), tostring(z.id)))
+                    return
+                end
+                if (cfg.chance or 100) < 100 and (math.random() * 100 > cfg.chance) then
+                    logLine(string.format("SKIP chance target=%s#%s ang=%.1f", tostring(z.kind), tostring(z.id), ang))
+                    return
+                end
                 local jit = cfg.jitter or 0
                 if jit > 0 then
                     local rx = math.rad((math.random() - 0.5) * 2 * jit)
@@ -405,8 +442,13 @@ if Net then
                 -- 隐蔽判定结束
 
                 corrections = (corrections or 0) + 1
+                aimTargetId = z.id
+                aimTargetAt = os.clock()
                 payload.d = nd
                 payload.ay = -math.atan2(nd.X, -nd.Z)
+                logLine(string.format("FIRE %s#%s px=%.0f dist=%.0f ang=%.1f sp=%.2f watched=%s n=%d",
+                    tostring(z.kind), tostring(z.id), pick.px, pick.dist, ang,
+                    tonumber(payload.sp) or -1, tostring(lp:GetAttribute("Watched")), corrections))
             end)
         end
         return oldFire(name, payload)
@@ -447,7 +489,8 @@ renderConn = RunService.RenderStepped:Connect(function()
                     local h = math.clamp(1500 / math.max(depth, 1), 24, 200)
                     local w = h * 0.6
                     local x, y = sp.X - w / 2, sp.Y - h / 2
-                    local c = cfg.espColor
+                    local isAimTarget = aimTargetId ~= nil and z.id == aimTargetId and (os.clock() - aimTargetAt) < 1.2
+                    local c = isAimTarget and Color3.fromRGB(255, 55, 55) or cfg.espColor
                     if cfg.style == "corner" then
                         s.square.Visible = false
                         drawCorner(s, x, y, w, h, c)
