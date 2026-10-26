@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 9
-_G.HUSH_UI_VERSION = 9
+local VERSION = 10
+_G.HUSH_UI_VERSION = 10
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -179,7 +179,7 @@ pcall(function()
     local hn = RS:WaitForChild("HushNet", 10)
     local r = hn and hn:FindFirstChild("combat.hit")
     if r then
-        r.OnClientEvent:Connect(function(d)
+        hitConn = r.OnClientEvent:Connect(function(d)
             pcall(function()
                 if type(d) ~= "table" then return end
                 local posTxt = ""
@@ -229,6 +229,7 @@ pcall(function()
     label.Parent = warnFrame
 end)
 
+local hitConn = nil
 local warnOn = false
 local function setWarn(on)
     warnOn = on and (cfg.warnWatched ~= false)
@@ -666,6 +667,7 @@ local function cleanup()
         if _G.HUSH_UI and _G.HUSH_UI.uiGui then _G.HUSH_UI.uiGui:Destroy() end
     end)
     pcall(function() if warnGui then warnGui:Destroy() end end)
+    pcall(function() if hitConn then hitConn:Disconnect() end end)
 end
 _G.HUSH_UI_CLEANUP = cleanup
 table.insert(_G.__HUSH_CLEANUPS, cleanup)
