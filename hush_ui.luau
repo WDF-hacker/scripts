@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 11
-_G.HUSH_UI_VERSION = 11
+local VERSION = 12
+_G.HUSH_UI_VERSION = 12
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -676,6 +676,20 @@ end
 _G.HUSH_UI_CLEANUP = cleanup
 table.insert(_G.__HUSH_CLEANUPS, cleanup)
 
+local function fullPurge()
+    pcall(cleanup)
+    pcall(function() if Drawing and Drawing.clear then Drawing.clear() end end)
+    pcall(function() if cleardrawcache then cleardrawcache() end end)
+    pcall(function()
+        if Net and _G.__HUSH_ORIG_FIRE then Net.fire = _G.__HUSH_ORIG_FIRE end
+    end)
+    _G.__HUSH_ORIG_FIRE = nil
+    for _, k in ipairs({ "HUSH_UI", "HUSH_UI_CFG", "HUSH_UI_CLEANUP", "HUSH_UI_VERSION", "HUSH_Z", "HUSH_ESP", "HUSH_SILENT_TEST", "HUSH_CURSOR" }) do
+        _G[k] = nil
+    end
+end
+_G.HUSH_UI_PURGE = fullPurge
+
 pcall(function()
     UIS.InputBegan:Connect(function(input, gp)
         if gp then return end
@@ -904,6 +918,13 @@ if Library then
     gC:AddButton({
         Text = "重载配置", Tooltip = "从文件读取（部分控件需重开面板才刷新显示）",
         Func = function() loadCfg(); if Library and Library.Notify then Library:Notify("已重载配置", 3) end end
+    })
+    gC:AddButton({
+        Text = "完全卸载（清绘制 + hook）",
+        Tooltip = "清空所有 Drawing、销毁面板、还原 Net.fire、清全局；v7 之前的旧实例仍需重进才能彻底清除",
+        Func = function()
+            fullPurge()
+        end
     })
 
     task.spawn(function()
