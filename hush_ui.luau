@@ -31,6 +31,28 @@ pcall(function()
     end
 end)
 
+--============ 单实例守卫：清掉上一个实例 ============
+if _G.__HUSH_CLEANUPS then
+    for _, f in ipairs(_G.__HUSH_CLEANUPS) do pcall(f) end
+end
+_G.__HUSH_CLEANUPS = {}
+do
+    local roots = {}
+    if gethui then table.insert(roots, gethui()) end
+    table.insert(roots, game:GetService("CoreGui"))
+    local pg = lp:FindFirstChild("PlayerGui")
+    if pg then table.insert(roots, pg) end
+    for _, root in ipairs(roots) do
+        if root then
+            for _, g in ipairs(root:GetDescendants()) do
+                if g:IsA("ScreenGui") and (g.Name:find("Obsidian") or g.Name == "HushStatus") then
+                    pcall(function() g:Destroy() end)
+                end
+            end
+        end
+    end
+end
+
 --============ UI 库 ============
 local LIB_FILE = "obsidian_Library.lua"
 local Library
@@ -468,7 +490,11 @@ do
 end
 
 if Net then
+    if _G.__HUSH_ORIG_FIRE then
+        pcall(function() Net.fire = _G.__HUSH_ORIG_FIRE end)
+    end
     local oldFire = Net.fire
+    _G.__HUSH_ORIG_FIRE = oldFire
     restoreFire = function() Net.fire = oldFire end
     Net.fire = function(name, payload)
         if cfg.silent and name == "combat.fire" and type(payload) == "table" and payload.o and payload.d then
@@ -628,6 +654,7 @@ local function cleanup()
     pcall(function() if warnGui then warnGui:Destroy() end end)
 end
 _G.HUSH_UI_CLEANUP = cleanup
+table.insert(_G.__HUSH_CLEANUPS, cleanup)
 
 pcall(function()
     UIS.InputBegan:Connect(function(input, gp)
