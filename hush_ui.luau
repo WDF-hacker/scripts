@@ -6,7 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 1
+local VERSION = 8
+_G.HUSH_UI_VERSION = 8
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
