@@ -78,6 +78,7 @@ local cfg = {
     maxPerRaid = 60,
     debug = false,
     streamproof = true,
+    warnWatched = true,
 
     esp = true,
     style = "corner",
@@ -162,6 +163,65 @@ pcall(function()
                     tostring(d.kind), tostring(lp:GetAttribute("Watched"))))
             end)
         end)
+    end
+end)
+
+--============ Watched 警告 ============
+local warnGui, warnFrame
+pcall(function()
+    warnGui = Instance.new("ScreenGui")
+    warnGui.Name = "HushStatus"
+    warnGui.ResetOnSpawn = false
+    warnGui.IgnoreGuiInset = true
+    warnGui.DisplayOrder = 999
+    warnGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+    warnFrame = Instance.new("Frame")
+    warnFrame.Size = UDim2.new(0, 400, 0, 54)
+    warnFrame.Position = UDim2.new(0, 16, 0, 124)
+    warnFrame.BackgroundColor3 = Color3.fromRGB(165, 25, 25)
+    warnFrame.BackgroundTransparency = 0.1
+    warnFrame.BorderSizePixel = 0
+    warnFrame.Visible = false
+    warnFrame.Parent = warnGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = warnFrame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -16, 1, 0)
+    label.Position = UDim2.new(0, 8, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Text = "⚠ WATCHED — 本局正在被录像，建议撤离换一局"
+    label.Parent = warnFrame
+end)
+
+local warnOn = false
+local function setWarn(on)
+    warnOn = on and (cfg.warnWatched ~= false)
+    if warnFrame then
+        warnFrame.Visible = warnOn
+    end
+end
+
+pcall(function()
+    setWarn(lp:GetAttribute("Watched") == true)
+    lp:GetAttributeChangedSignal("Watched"):Connect(function()
+        setWarn(lp:GetAttribute("Watched") == true)
+    end)
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.55)
+        if warnOn and warnFrame and warnFrame.Visible then
+            warnFrame.BackgroundTransparency = (warnFrame.BackgroundTransparency > 0.3) and 0.06 or 0.35
+        end
     end
 end)
 
@@ -543,6 +603,7 @@ local function cleanup()
     pcall(function()
         if _G.HUSH_UI and _G.HUSH_UI.uiGui then _G.HUSH_UI.uiGui:Destroy() end
     end)
+    pcall(function() if warnGui then warnGui:Destroy() end end)
 end
 _G.HUSH_UI_CLEANUP = cleanup
 
@@ -747,6 +808,14 @@ if Library then
     A.lblTarget = gS:AddLabel("目标: -")
     A.lblWatched = gS:AddLabel("Watched: -")
     A.lblMode = gS:AddLabel("部位: head")
+    A.warnToggle = gS:AddToggle("warnWatched", {
+        Text = "Watched 警告弹窗", Default = cfg.warnWatched,
+        Tooltip = "检测到本局被抽样录像时，在左上角弹出红色警告",
+        Callback = function(v)
+            cfg.warnWatched = v
+            setWarn(lp:GetAttribute("Watched") == true)
+        end
+    })
 
     local gC = Tabs.Status:AddLeftGroupbox("配置", "save")
     gC:AddButton({
