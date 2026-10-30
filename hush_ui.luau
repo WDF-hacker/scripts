@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 14
-_G.HUSH_UI_VERSION = 14
+local VERSION = 15
+_G.HUSH_UI_VERSION = 15
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -128,6 +128,9 @@ local BOSS_HEAD_Y = {
     boss_witness = 6.2,
     boss_surgeon = 7.5,
     boss_hale = 6.85,
+    boss_mayor = 6.3,
+    boss_chief = 6.5,
+    boss_major = 6.3,
 }
 _G.HUSH_BOSS_HEAD_Y = BOSS_HEAD_Y
 
