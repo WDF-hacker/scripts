@@ -6,13 +6,15 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 17
-_G.HUSH_UI_VERSION = 17
+local VERSION = 18
+_G.HUSH_UI_VERSION = 18
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
 local RS = game:GetService("ReplicatedStorage")
+local ZT = nil
+pcall(function() ZT = require(RS.Hush.Shared.ZombieTypes) end)
 
 local lp
 do
@@ -359,6 +361,14 @@ local function listAlive()
                 else
                     headPos = hp.Position
                 end
+                local defHeadY = nil
+                if ZT and ZT.get then
+                    local okD, d = pcall(ZT.get, rec.kind)
+                    if okD and type(d) == "table" then defHeadY = tonumber(d.headY) end
+                end
+                if not isBoss and defHeadY then
+                    headPos = Vector3.new(headPos.X, defHeadY, headPos.Z)
+                end
                 if isBoss then
                     local cal = cfg.bossAutoCal and bossCalib[rec.id]
                     local used = false
@@ -382,6 +392,10 @@ local function listAlive()
                             headPos = Vector3.new(headPos.X, ky + (cfg.bossBias or 0), headPos.Z)
                             used = true
                         end
+                    end
+                    if not used and defHeadY then
+                        headPos = Vector3.new(headPos.X, defHeadY + (cfg.bossBias or 0), headPos.Z)
+                        used = true
                     end
                     if not used and cfg.bossBias and cfg.bossBias ~= 0 then
                         headPos = headPos + Vector3.new(0, cfg.bossBias, 0)
