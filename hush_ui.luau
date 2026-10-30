@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 16
-_G.HUSH_UI_VERSION = 16
+local VERSION = 17
+_G.HUSH_UI_VERSION = 17
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -94,7 +94,7 @@ local cfg = {
 
     -- 隐蔽设置
     chance = 85,
-    maxAngle = 10,
+    maxAngle = 20,
     jitter = 0.5,
     rateLimit = 0,
     switchPenalty = 0.25,
