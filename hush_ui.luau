@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 13
-_G.HUSH_UI_VERSION = 13
+local VERSION = 14
+_G.HUSH_UI_VERSION = 14
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -121,6 +121,16 @@ local cfg = {
 _G.HUSH_UI_CFG = cfg
 
 -- Boss 命中箱自校准数据: id -> { head = {relY...}, torso = {...}, h, t }
+local BOSS_HEAD_Y = {
+    boss_conductor = 6.35,
+    boss_colonel = 6.3,
+    boss_foreman = 6.5,
+    boss_witness = 6.2,
+    boss_surgeon = 7.5,
+    boss_hale = 6.85,
+}
+_G.HUSH_BOSS_HEAD_Y = BOSS_HEAD_Y
+
 local bossCalib = {}
 local aimTargetId, aimTargetAt, aimTargetRootY = nil, 0, 0
 
@@ -360,6 +370,13 @@ local function listAlive()
                             table.sort(s)
                             local med = s[math.floor((#s + 1) / 2)]
                             headPos = Vector3.new(headPos.X, root.Position.Y + med, headPos.Z)
+                            used = true
+                        end
+                    end
+                    if not used then
+                        local ky = BOSS_HEAD_Y[string.lower(tostring(rec.kind))]
+                        if ky and cfg.bossAim ~= false then
+                            headPos = Vector3.new(headPos.X, ky + (cfg.bossBias or 0), headPos.Z)
                             used = true
                         end
                     end
