@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 19
-_G.HUSH_UI_VERSION = 19
+local VERSION = 20
+_G.HUSH_UI_VERSION = 20
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -377,9 +377,16 @@ local function listAlive()
                     headPos = Vector3.new(headPos.X, defHeadY, headPos.Z)
                 end
                 if isBoss then
-                    local cal = cfg.bossAutoCal and bossCalib[rec.id]
                     local used = false
-                    if cal and (cal.h + cal.t) >= 6 then
+                    if BOSS_HEAD_MODEL[string.lower(tostring(rec.kind))] then
+                        local mh = model:FindFirstChild("Head", true)
+                        if mh and mh:IsA("BasePart") then
+                            headPos = mh.Position + Vector3.new(0, cfg.bossBias or 0, 0)
+                            used = true
+                        end
+                    end
+                    local cal = cfg.bossAutoCal and bossCalib[rec.id]
+                    if not used and cal and (cal.h + cal.t) >= 6 then
                         local src = cal.head
                         if cfg.bossFallbackTorso and cal.t > cal.h and #cal.torso > 0 then
                             src = cal.torso
@@ -390,13 +397,6 @@ local function listAlive()
                             table.sort(s)
                             local med = s[math.floor((#s + 1) / 2)]
                             headPos = Vector3.new(headPos.X, root.Position.Y + med, headPos.Z)
-                            used = true
-                        end
-                    end
-                    if not used and BOSS_HEAD_MODEL[string.lower(tostring(rec.kind))] then
-                        local mh = model:FindFirstChild("Head", true)
-                        if mh and mh:IsA("BasePart") then
-                            headPos = mh.Position + Vector3.new(0, cfg.bossBias or 0, 0)
                             used = true
                         end
                     end
