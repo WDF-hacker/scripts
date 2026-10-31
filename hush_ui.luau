@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 21
-_G.HUSH_UI_VERSION = 21
+local VERSION = 22
+_G.HUSH_UI_VERSION = 22
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -373,7 +373,7 @@ local function listAlive()
                     local okD, d = pcall(ZT.get, rec.kind)
                     if okD and type(d) == "table" then defHeadY = tonumber(d.headY) end
                 end
-                if not isBoss and defHeadY then
+                if not isBoss and not hp and defHeadY then
                     headPos = Vector3.new(headPos.X, defHeadY, headPos.Z)
                 end
                 if isBoss then
