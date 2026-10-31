@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 20
-_G.HUSH_UI_VERSION = 20
+local VERSION = 21
+_G.HUSH_UI_VERSION = 21
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -381,6 +381,13 @@ local function listAlive()
                     if BOSS_HEAD_MODEL[string.lower(tostring(rec.kind))] then
                         local mh = model:FindFirstChild("Head", true)
                         if mh and mh:IsA("BasePart") then
+                            headPos = mh.Position + Vector3.new(0, cfg.bossBias or 0, 0)
+                            used = true
+                        end
+                    end
+                    if not used and defHeadY then
+                        local mh = model:FindFirstChild("Head", true)
+                        if mh and mh:IsA("BasePart") and math.abs(mh.Position.Y - defHeadY) <= 1.5 then
                             headPos = mh.Position + Vector3.new(0, cfg.bossBias or 0, 0)
                             used = true
                         end
