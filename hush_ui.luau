@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 18
-_G.HUSH_UI_VERSION = 18
+local VERSION = 19
+_G.HUSH_UI_VERSION = 19
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -135,6 +135,13 @@ local BOSS_HEAD_Y = {
     boss_major = 6.3,
 }
 _G.HUSH_BOSS_HEAD_Y = BOSS_HEAD_Y
+
+-- 这些 boss 的爆头判定就是视觉头部模型（不套 headY 表）
+local BOSS_HEAD_MODEL = {
+    boss_surgeon = true,
+    boss_hale = true,
+}
+_G.HUSH_BOSS_HEAD_MODEL = BOSS_HEAD_MODEL
 
 local bossCalib = {}
 local aimTargetId, aimTargetAt, aimTargetRootY = nil, 0, 0
@@ -383,6 +390,13 @@ local function listAlive()
                             table.sort(s)
                             local med = s[math.floor((#s + 1) / 2)]
                             headPos = Vector3.new(headPos.X, root.Position.Y + med, headPos.Z)
+                            used = true
+                        end
+                    end
+                    if not used and BOSS_HEAD_MODEL[string.lower(tostring(rec.kind))] then
+                        local mh = model:FindFirstChild("Head", true)
+                        if mh and mh:IsA("BasePart") then
+                            headPos = mh.Position + Vector3.new(0, cfg.bossBias or 0, 0)
                             used = true
                         end
                     end
