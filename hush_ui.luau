@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 23
-_G.HUSH_UI_VERSION = 23
+local VERSION = 24
+_G.HUSH_UI_VERSION = 24
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -145,6 +145,8 @@ local BOSS_HEAD_MODEL = {
 _G.HUSH_BOSS_HEAD_MODEL = BOSS_HEAD_MODEL
 
 local bossCalib = {}
+local headCache = setmetatable({}, { __mode = "k" })
+local kindCache = {}
 local aimTargetId, aimTargetAt, aimTargetRootY = nil, 0, 0
 
 --============ 配置持久化 ============
@@ -360,8 +362,12 @@ local function listAlive()
                     if typeof(cand) == "Instance" and cand:IsA("BasePart") then hp = cand end
                 end
                 if not hp then
-                    local mh = model:FindFirstChild("Head")
-                    if mh and mh:IsA("BasePart") and math.abs(mh.Position.Y - root.Position.Y) < 8 then hp = mh end
+                    local mh = headCache[model]
+                    if mh == nil then
+                        mh = model:FindFirstChild("Head", true) or false
+                        headCache[model] = mh
+                    end
+                    if mh and mh ~= false and mh:IsA("BasePart") and math.abs(mh.Position.Y - root.Position.Y) < 8 then hp = mh end
                 end
                 if not hp then
                     local face = model:FindFirstChild("FaceCenterAttachment", true)
@@ -370,18 +376,29 @@ local function listAlive()
                     headPos = hp.Position
                 end
                 local defHeadY = nil
-                if ZT and ZT.get then
-                    local okD, d = pcall(ZT.get, rec.kind)
-                    if okD and type(d) == "table" then defHeadY = tonumber(d.headY) end
+                local kk = tostring(rec.kind)
+                local cached = kindCache[kk]
+                if cached == nil then
+                    cached = false
+                    if ZT and ZT.get then
+                        local okD, d = pcall(ZT.get, kk)
+                        if okD and type(d) == "table" then cached = tonumber(d.headY) or false end
+                    end
+                    kindCache[kk] = cached
                 end
+                if cached then defHeadY = cached end
                 if not isBoss and not hp and defHeadY then
                     headPos = Vector3.new(headPos.X, defHeadY, headPos.Z)
                 end
                 if isBoss then
                     local used = false
                     if BOSS_HEAD_MODEL[string.lower(tostring(rec.kind))] then
-                        local mh = model:FindFirstChild("Head", true)
-                        if mh and mh:IsA("BasePart") then
+                        local mh = headCache[model]
+                        if mh == nil then
+                            mh = model:FindFirstChild("Head", true) or false
+                            headCache[model] = mh
+                        end
+                        if mh and mh ~= false and mh:IsA("BasePart") then
                             headPos = mh.Position + Vector3.new(0, cfg.bossBias or 0, 0)
                             used = true
                         end
@@ -479,13 +496,14 @@ local function project(pos)
     return Vector2.new(sp.X, sp.Y), sp.Z
 end
 
-local function pickTarget(o)
+local function pickTarget(o, list, mp)
     local cam = workspace.CurrentCamera
     local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
     if not cam or not hrp then return nil end
-    local mp = mousePos()
+    mp = mp or mousePos()
+    list = list or listAlive()
     local best, bestD = nil, math.huge
-    for _, z in ipairs(listAlive()) do
+    for _, z in ipairs(list) do
         local dist = (z.pos - hrp.Position).Magnitude
         if dist <= cfg.maxDist then
             local sp = project(aimPointOf(z))
@@ -598,7 +616,17 @@ if Net then
         if cfg.silent and name == "combat.fire" and type(payload) == "table" and payload.o and payload.d then
             pcall(function()
                 if cfg.pauseWatched and lp:GetAttribute("Watched") == true then logLine("SKIP watched"); return end
-                local pick = pickTarget(payload.o)
+                local mpNow = mousePos()
+                local pick = nil
+                if preTarget and (os.clock() - preTargetAt) < 0.25 then
+                    local spNow = project(aimPointOf(preTarget.z))
+                    if spNow and (spNow - mpNow).Magnitude <= cfg.fov then
+                        pick = preTarget
+                    end
+                end
+                if not pick then
+                    pick = pickTarget(payload.o, frameList, mpNow)
+                end
                 if not pick then logLine("SKIP no_target"); return end
                 local z = pick.z
                 local ap = aimPointOf(z)
@@ -664,8 +692,20 @@ end
 
 --============ 渲染循环 ============
 local lastTargetName = "-"
+local frameList = {}
+local preTarget, preTargetAt = nil, 0
 
 renderConn = RunService.RenderStepped:Connect(function()
+    -- 每帧只算一次僵尸列表，同时预锁定（这样开枪时直接复用，不再现算）
+    local hrpNow = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if hrpNow then
+        frameList = listAlive()
+        local mpNow = mousePos()
+        preTarget = pickTarget(hrpNow.Position + Vector3.new(0, 1.1, 0), frameList, mpNow)
+        preTargetAt = os.clock()
+        lastTargetName = preTarget and (preTarget.z.kind .. " #" .. tostring(preTarget.z.id)) or "-"
+    end
+
     -- FOV 圈
     if cfg.showFov and cfg.silent then
         fovCircle.Position = mousePos()
@@ -686,7 +726,7 @@ renderConn = RunService.RenderStepped:Connect(function()
         local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
         if not cam or not hrp then return end
         local used = 0
-        for _, z in ipairs(listAlive()) do
+        for _, z in ipairs(frameList) do
             local dist = (z.pos - hrp.Position).Magnitude
             if dist <= cfg.espMaxDist then
                 local sp, depth = project(z.center or z.head)
@@ -707,7 +747,8 @@ renderConn = RunService.RenderStepped:Connect(function()
                     local h = math.clamp(1500 * (z.scale or 1) / math.max(depth, 1), 24, 220)
                     local w = h * 0.6
                     local x, y = tx - w / 2, ty - h / 2
-                    local isAimTarget = aimTargetId ~= nil and z.id == aimTargetId and (os.clock() - aimTargetAt) < 1.2
+                    local isAimTarget = (preTarget ~= nil and z.id == preTarget.z.id)
+                        or (aimTargetId ~= nil and z.id == aimTargetId and (os.clock() - aimTargetAt) < 1.2)
                     local baseColor = z.isBoss and Color3.fromRGB(255, 165, 60) or cfg.espColor
                     local c = isAimTarget and Color3.fromRGB(255, 55, 55) or baseColor
                     if cfg.style == "corner" then
@@ -742,8 +783,6 @@ renderConn = RunService.RenderStepped:Connect(function()
             end
         end
         for i = used + 1, POOL do hideSlot(pool[i]) end
-        local pick = pickTarget(hrp.Position + Vector3.new(0, 1.1, 0))
-        lastTargetName = pick and (pick.z.kind .. " #" .. tostring(pick.z.id)) or "-"
     end)
 end)
 
