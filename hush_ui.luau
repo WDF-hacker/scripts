@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 24
-_G.HUSH_UI_VERSION = 24
+local VERSION = 25
+_G.HUSH_UI_VERSION = 25
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -98,6 +98,7 @@ local cfg = {
     chance = 85,
     maxAngle = 20,
     jitter = 0.5,
+    noSpread = false,
     rateLimit = 0,
     switchPenalty = 0.25,
     maxPerRaid = 60,
@@ -614,6 +615,9 @@ if Net then
     restoreFire = function() Net.fire = oldFire end
     Net.fire = function(name, payload)
         if cfg.silent and name == "combat.fire" and type(payload) == "table" and payload.o and payload.d then
+            if cfg.noSpread and type(payload.sp) == "number" and payload.sp ~= 0 then
+                payload.sp = 0
+            end
             pcall(function()
                 if cfg.pauseWatched and lp:GetAttribute("Watched") == true then logLine("SKIP watched"); return end
                 local mpNow = mousePos()
@@ -681,9 +685,10 @@ if Net then
                 aimTargetRootY = z.root.Position.Y
                 payload.d = nd
                 payload.ay = -math.atan2(nd.X, -nd.Z)
-                logLine(string.format("FIRE %s#%s px=%.0f dist=%.0f ang=%.1f sp=%.2f watched=%s n=%d",
+                logLine(string.format("FIRE %s#%s px=%.0f dist=%.0f ang=%.1f sp=%.2f watched=%s n=%d%s",
                     tostring(z.kind), tostring(z.id), pick.px, pick.dist, ang,
-                    tonumber(payload.sp) or -1, tostring(lp:GetAttribute("Watched")), corrections))
+                    tonumber(payload.sp) or -1, tostring(lp:GetAttribute("Watched")), corrections,
+                    cfg.noSpread and " sp0" or ""))
             end)
         end
         return oldFire(name, payload)
@@ -919,6 +924,11 @@ if Library then
         Text = "角度上限", Default = cfg.maxAngle, Min = 1, Max = 45, Rounding = 1, Suffix = "°",
         Tooltip = "原弹道与目标夹角超过这个值就放弃修正。3° 以内基本看不出来",
         Callback = function(v) cfg.maxAngle = v end
+    })
+    A.noSpread = gK:AddToggle("noSpread", {
+        Text = "零散布 (sp = 0)", Default = cfg.noSpread,
+        Tooltip = "把每发的 sp 强制改成 0（100% 射击精度）。测试用；会增加 combat.precision 风险",
+        Callback = function(v) cfg.noSpread = v end
     })
     A.jitter = gK:AddSlider("jitterDeg", {
         Text = "瞄准抖动", Default = cfg.jitter, Min = 0, Max = 2, Rounding = 2, Suffix = "°",
