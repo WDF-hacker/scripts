@@ -148,13 +148,15 @@ local function snapshot()
         local st = buy and btnState(buy)
         local nl = c:FindFirstChild("Name")
         local statusLbl = c:FindFirstChild("Status")
+        local leftLbl = c:FindFirstChild("Left")
         local raw = statusLbl and statusLbl.Text or nil
         cards[#cards + 1] = {
             obj = c,
             name = nl and nl.Text or c.Name,
             buy = buy,
             enabled = (st and st.enabled == true) or false,
-            cd = parseCountdown(raw),
+            cd = parseCountdown(raw),                                  -- Opens in …  = 真正开售
+            resetCd = leftLbl and parseCountdown(leftLbl.Text) or nil,  -- Resets in … = 限购重置
             stText = raw,
         }
     end
@@ -222,7 +224,7 @@ local function buildUI()
         g.Parent = (gethui and gethui()) or game:GetService("CoreGui")
 
         local f = Instance.new("Frame")
-        f.Size = UDim2.new(0, 340, 0, 252)
+        f.Size = UDim2.new(0, 408, 0, 252)
         f.Position = UDim2.new(0, 30, 0, 210)
         f.BackgroundColor3 = Color3.fromRGB(18, 20, 24)
         f.BackgroundTransparency = 0.06
@@ -294,7 +296,7 @@ local function buildUI()
             l.BackgroundTransparency = 1
             l.TextXAlignment = Enum.TextXAlignment.Left
             l.Font = Enum.Font.Code
-            l.TextSize = 12
+            l.TextSize = 11
             l.TextColor3 = Color3.fromRGB(150, 160, 175)
             l.Text = string.format("%d. %s", i, item.label)
             l.Parent = f
@@ -323,28 +325,43 @@ local function buildUI()
             log("running=" .. tostring(state.running))
         end)
 
-        PANEL.buttons.test = mkBtn("测试购买", 80, 82, Color3.fromRGB(122, 84, 40), function()
+        PANEL.buttons.test = mkBtn("测试点一次", 80, 82, Color3.fromRGB(122, 84, 40), function()
+            -- 只点一次 BUY，看按钮有没有反应（不进入确认，不会下单）
             local cards = snapshot()
-            local pick = nil
+            local pickItem, pickRec = nil, nil
             for _, item in ipairs(CFG.targets) do
-                if not state.done[item.name] then
-                    for _, c in ipairs(cards) do
-                        if c.name == item.name and c.enabled then pick = item break end
-                    end
-                    if pick then break end
+                for _, c in ipairs(cards) do
+                    if c.name == item.name then pickItem, pickRec = item, c break end
                 end
+                if pickItem then break end
             end
-            if not pick then
-                PANEL.buttons.test.Text = "无已开售"
-                task.delay(1.3, function() PANEL.buttons.test.Text = "测试购买" end)
-                log("TEST 无已开售目标")
+            if not pickItem then
+                PANEL.buttons.test.Text = "无卡片"
+                task.delay(1.3, function() PANEL.buttons.test.Text = "测试点一次" end)
                 return
             end
-            PANEL.buttons.test.Text = "下单中…"
-            local res = buyOne(pick, cards)
-            log("TEST " .. pick.name .. " -> " .. tostring(res))
-            PANEL.buttons.test.Text = tostring(res):sub(1, 8)
-            task.delay(1.6, function() PANEL.buttons.test.Text = "测试购买" end)
+
+            local btn = pickRec.buy
+            local before = btn:GetAttribute("Armed")
+            click(btn)
+            task.wait(0.25)
+
+            local after = btn:GetAttribute("Armed")
+            local why = btn:GetAttribute("Why")
+            local st2 = btnState(btn)
+            local msg
+            if after == true and before ~= true then
+                msg = "✓ 已响应(Armed)"                 -- 说明点得动，进入确认态
+            elseif why and why ~= "NOT_YET" then
+                msg = "✓ " .. tostring(why)              -- 服务端已回应
+            elseif st2 and st2.enabled then
+                msg = "✓ 已点击(未见变化)"
+            else
+                msg = "未开售(" .. tostring(why or "disabled") .. ")"
+            end
+            log(string.format("TEST_CLICK %s -> %s", pickItem.name, msg))
+            PANEL.buttons.test.Text = msg:sub(1, 12)
+            task.delay(2.0, function() PANEL.buttons.test.Text = "测试点一次" end)
         end)
 
         PANEL.buttons.reset = mkBtn("重置", 168, 66, Color3.fromRGB(60, 64, 74), function()
@@ -352,7 +369,7 @@ local function buildUI()
             log("重置")
         end)
 
-        PANEL.buttons.hide = mkBtn("隐藏", 240, 82, Color3.fromRGB(60, 64, 74), function()
+        PANEL.buttons.hide = mkBtn("隐藏", 240, 80, Color3.fromRGB(60, 64, 74), function()
             PANEL.visible = not PANEL.visible
             f.Visible = PANEL.visible
         end)
@@ -399,7 +416,8 @@ local function step()
                 txt, col = string.format("%d. %s  ● 已开售", i, item.label), Color3.fromRGB(255, 210, 120)
             elseif rec and rec.cd then
                 if not nearest or rec.cd < nearest then nearest = rec.cd end
-                txt = string.format("%d. %s  ⏱ %s", i, item.label, fmtCountdown(rec.cd))
+                txt = string.format("%d. %-12s ⏱%s  ↻%s", i, item.label,
+                    fmtCountdown(rec.cd), fmtCountdown(rec.resetCd))
                 col = (rec.cd <= 10) and Color3.fromRGB(255, 200, 90) or Color3.fromRGB(150, 160, 175)
             elseif not rec then
                 txt, col = string.format("%d. %s  无卡片", i, item.label), Color3.fromRGB(150, 160, 175)
