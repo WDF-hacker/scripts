@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 28
-_G.HUSH_UI_VERSION = 28
+local VERSION = 29
+_G.HUSH_UI_VERSION = 29
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -122,9 +122,7 @@ local cfg = {
 
     -- MSESP（mstudio45's ESP Library）渲染后端
     espLib = true,
-    espType = "Highlight",
-    box2d = true,
-    box3d = false,
+    espPreset = "高亮 + 方框",
     skeleton = false
 }
 _G.HUSH_UI_CFG = cfg
@@ -753,6 +751,21 @@ function ESPB.load()
     return true
 end
 
+-- 显示风格预设：把「本体样式 + 方框组合」压成一个选择，避免多个控件互相打架
+-- hideBody = 把 Highlight 的填充与描边都设为全透明，只留方框
+local ESP_PRESETS = {
+    ["高亮 + 方框"]  = { type = "Highlight",    box2d = true,  box3d = false, hideBody = false },
+    ["仅高亮"]       = { type = "Highlight",    box2d = false, box3d = false, hideBody = false },
+    ["仅方框"]       = { type = "Highlight",    box2d = true,  box3d = false, hideBody = true  },
+    ["线框 + 方框"]  = { type = "SelectionBox", box2d = true,  box3d = false, hideBody = false },
+    ["仅 3D 框"]     = { type = "Highlight",    box2d = false, box3d = true,  hideBody = true  },
+}
+local ESP_PRESET_NAMES = { "高亮 + 方框", "仅高亮", "仅方框", "线框 + 方框", "仅 3D 框" }
+
+local function curPreset()
+    return ESP_PRESETS[cfg.espPreset] or ESP_PRESETS["高亮 + 方框"]
+end
+
 local VALID_ESP_TYPE = {
     highlight = "Highlight",
     selectionbox = "SelectionBox",
@@ -790,22 +803,25 @@ end
 
 local function espB_settings(z)
     local color = espB_color(z)
+    local p = curPreset()
+    local bodyT = p.hideBody and 1 or 0.6
+    local edgeT = p.hideBody and 1 or 0
     return {
         Model = z.model,
         Name = espB_label(z),
-        ESPType = normESPType(cfg.espType),
+        ESPType = normESPType(p.type),
         Color = color,
         MaxDistance = cfg.espMaxDist or 300,
         TextSize = cfg.textSize or 13,
         StudsOffset = Vector3.new(0, 0.6, 0),
         FillColor = color,
         OutlineColor = color,
-        FillTransparency = 0.6,
-        OutlineTransparency = 0,
-        Transparency = 0.35,
+        FillTransparency = bodyT,
+        OutlineTransparency = edgeT,
+        Transparency = p.hideBody and 1 or 0.35,
         Thickness = cfg.thickness or 1,
-        Box2D = { Enabled = cfg.box2d ~= false, Color = color, Thickness = cfg.thickness or 1, Transparency = 0 },
-        Box3D = { Enabled = cfg.box3d == true, Color = color, Thickness = cfg.thickness or 1, Transparency = 0 },
+        Box2D = { Enabled = p.box2d, Color = color, Thickness = cfg.thickness or 1, Transparency = 0 },
+        Box3D = { Enabled = p.box3d, Color = color, Thickness = cfg.thickness or 1, Transparency = 0 },
         Tracer = { Enabled = cfg.tracer == true, Color = color, Thickness = 1, Transparency = 0, From = "Bottom" },
         Skeleton = { Enabled = cfg.skeleton == true, Color = color, Thickness = 1, Transparency = 0 },
     }
@@ -813,6 +829,9 @@ end
 
 -- 组件开关、颜色、名字、距离、字号都走 CurrentSettings 实时写；
 -- 只有 ESPType 是库内只读，必须销毁重建。
+-- 只改可以实时生效的字段。
+-- 组件（Box2D/Box3D/Tracer/Skeleton）在库内只有创建时 Enabled=true 才会被实例化，
+-- 事后写 Enabled 不会创建组件，所以开关类改动统一走「重建」。
 local function espB_apply(rec, z)
     local color = espB_color(z)
     local th = cfg.thickness or 1
@@ -823,24 +842,10 @@ local function espB_apply(rec, z)
     cs.OutlineColor = color
     cs.MaxDistance = cfg.espMaxDist or 300
     cs.TextSize = cfg.textSize or 13
-    if cs.Box2D then
-        cs.Box2D.Enabled = cfg.box2d ~= false
-        cs.Box2D.Color = color
-        cs.Box2D.Thickness = th
-    end
-    if cs.Box3D then
-        cs.Box3D.Enabled = cfg.box3d == true
-        cs.Box3D.Color = color
-        cs.Box3D.Thickness = th
-    end
-    if cs.Tracer then
-        cs.Tracer.Enabled = cfg.tracer == true
-        cs.Tracer.Color = color
-    end
-    if cs.Skeleton then
-        cs.Skeleton.Enabled = cfg.skeleton == true
-        cs.Skeleton.Color = color
-    end
+    if cs.Box2D then cs.Box2D.Color = color; cs.Box2D.Thickness = th end
+    if cs.Box3D then cs.Box3D.Color = color; cs.Box3D.Thickness = th end
+    if cs.Tracer then cs.Tracer.Color = color end
+    if cs.Skeleton then cs.Skeleton.Color = color end
 end
 
 function ESPB.sync(alive)
@@ -849,7 +854,11 @@ function ESPB.sync(alive)
     if (now - ESPB.lastSync) < ESPB.interval then return end
     ESPB.lastSync = now
 
-    local wantType = normESPType(cfg.espType)
+    local wantType = normESPType(curPreset().type)
+    local sig = cfg.espPreset
+        .. "|" .. tostring(cfg.tracer == true)
+        .. "|" .. tostring(cfg.skeleton == true)
+        .. "|" .. tostring(cfg.thickness or 1)
     local seen = {}
     for i = 1, #alive do
         local z = alive[i]
@@ -858,7 +867,8 @@ function ESPB.sync(alive)
             seen[m] = true
             local rec = ESPB.tracked[m]
 
-            if rec and rec.type ~= wantType then
+            -- 预设变了要重建：类型只读，且组件只在创建时按 Enabled 实例化
+            if rec and rec.sig ~= sig then
                 pcall(function() rec.esp:Destroy() end)
                 ESPB.tracked[m] = nil
                 rec = nil
@@ -867,7 +877,7 @@ function ESPB.sync(alive)
             if not rec then
                 local ok, esp = pcall(function() return ESPB.lib:Add(espB_settings(z)) end)
                 if ok and esp then
-                    ESPB.tracked[m] = { esp = esp, boss = z.isBoss, type = wantType, z = z }
+                    ESPB.tracked[m] = { esp = esp, boss = z.isBoss, type = wantType, sig = sig, z = z }
                     ESPB.lastErr = nil
                 else
                     ESPB.lastErr = tostring(esp)
@@ -1381,11 +1391,6 @@ if Library then
         Tooltip = "只画活僵尸（读游戏注册表，尸体自动排除）",
         Callback = function(v) cfg.esp = v end
     })
-    A.style = gE:AddDropdown("espStyle", {
-        Text = "方框样式（内置回落）", Values = { "corner", "box" }, Default = cfg.style,
-        Tooltip = "仅在关闭 MSESP 渲染、退回内置 Drawing 绘制时生效",
-        Callback = function(v) cfg.style = v end
-    })
     A.kind = gE:AddToggle("espKind", {
         Text = "显示类型", Default = cfg.espKind,
         Tooltip = "walker / runner / brute 等",
@@ -1406,20 +1411,16 @@ if Library then
         Tooltip = "从屏幕底部中心到目标的线",
         Callback = function(v) cfg.tracer = v end
     })
-    A.espType = gE:AddDropdown("espLibType", {
-        Text = "ESP 类型", Values = { "Highlight", "SelectionBox", "Adornment" }, Default = cfg.espType,
-        Tooltip = "Highlight=全身高亮透墙；SelectionBox=线框；Adornment=简易挂件。切换会重建对象，约 0.2 秒生效",
-        Callback = function(v) cfg.espType = v end
-    })
-    A.box2d = gE:AddToggle("espBox2D", {
-        Text = "屏幕方框", Default = cfg.box2d,
-        Tooltip = "MSESP 的 2D 包围框（Frame + UIStroke），严格贴合模型包围盒",
-        Callback = function(v) cfg.box2d = v end
-    })
-    A.box3d = gE:AddToggle("espBox3D", {
-        Text = "三维方框", Default = cfg.box3d,
-        Tooltip = "MSESP 的 3D 盒（adornee），会随距离缩放",
-        Callback = function(v) cfg.box3d = v end
+    A.preset = gE:AddDropdown("espPreset", {
+        Text = "显示风格", Values = ESP_PRESET_NAMES, Default = cfg.espPreset,
+        Tooltip = "高亮=全身透墙发光；方框=屏幕贴合包围盒。选带方框的组合即两者同时开。切换约 0.2 秒生效",
+        Callback = function(v)
+            cfg.espPreset = v
+            -- 本体类型变了要重建，交给 sync 处理；这里立刻把开关类改动推下去
+            for _, rec in pairs(ESPB.tracked) do
+                if rec.z then pcall(espB_apply, rec, rec.z) end
+            end
+        end
     })
     A.skeleton = gE:AddToggle("espSkeleton", {
         Text = "骨骼线", Default = cfg.skeleton,
