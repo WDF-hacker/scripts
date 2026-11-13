@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 29
-_G.HUSH_UI_VERSION = 29
+local VERSION = 30
+_G.HUSH_UI_VERSION = 30
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -784,7 +784,22 @@ local function espB_label(z)
     if z.isBoss then parts[#parts + 1] = "BOSS" end
     if cfg.espKind ~= false then parts[#parts + 1] = z.kind end
     if cfg.espName ~= false then parts[#parts + 1] = "#" .. tostring(z.id) end
-    return #parts > 0 and table.concat(parts, " ") or tostring(z.kind)
+    -- 全关时必须返回空串：库的 Billboard 会用 Name 直接渲染，
+    -- 回落到 kind 会导致「开关全关但仍有文字」
+    return table.concat(parts, " ")
+end
+
+-- 库的 GlobalConfig.Distance 会在 Name 后面自动追加 [距离]，
+-- 所以必须跟「显示距离」开关联动，否则名字关了距离还留着
+local function espB_syncGlobals()
+    if not ESPB.lib then return end
+    local showDist = cfg.espDist ~= false
+    local showBillboard = (cfg.espKind ~= false) or (cfg.espName ~= false) or showDist
+    pcall(function()
+        local g = ESPB.lib.GlobalConfig
+        g.Distance = showDist
+        g.Billboards = showBillboard
+    end)
 end
 
 local COL_TARGET = Color3.fromRGB(255, 55, 55)
@@ -853,6 +868,8 @@ function ESPB.sync(alive)
     local now = os.clock()
     if (now - ESPB.lastSync) < ESPB.interval then return end
     ESPB.lastSync = now
+
+    espB_syncGlobals()
 
     local wantType = normESPType(curPreset().type)
     local sig = cfg.espPreset
@@ -1394,17 +1411,17 @@ if Library then
     A.kind = gE:AddToggle("espKind", {
         Text = "显示类型", Default = cfg.espKind,
         Tooltip = "walker / runner / brute 等",
-        Callback = function(v) cfg.espKind = v end
+        Callback = function(v) cfg.espKind = v; espB_syncGlobals() end
     })
     A.name = gE:AddToggle("espName", {
         Text = "显示编号", Default = cfg.espName,
         Tooltip = "僵尸在服务器上的 id",
-        Callback = function(v) cfg.espName = v end
+        Callback = function(v) cfg.espName = v; espB_syncGlobals() end
     })
     A.espDist = gE:AddToggle("espDist", {
         Text = "显示距离", Default = cfg.espDist,
         Tooltip = "与你的距离",
-        Callback = function(v) cfg.espDist = v end
+        Callback = function(v) cfg.espDist = v; espB_syncGlobals() end
     })
     A.tracer = gE:AddToggle("tracer", {
         Text = "显示连线", Default = cfg.tracer,
@@ -1416,6 +1433,7 @@ if Library then
         Tooltip = "高亮=全身透墙发光；方框=屏幕贴合包围盒。选带方框的组合即两者同时开。切换约 0.2 秒生效",
         Callback = function(v)
             cfg.espPreset = v
+            espB_syncGlobals()
             -- 本体类型变了要重建，交给 sync 处理；这里立刻把开关类改动推下去
             for _, rec in pairs(ESPB.tracked) do
                 if rec.z then pcall(espB_apply, rec, rec.z) end
