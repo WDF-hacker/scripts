@@ -50,6 +50,7 @@ local state = {
     attempts = {},
     lastResult = {},
     inflight = {},
+    retryAt = {},       -- [name] = 下次允许重试的时间
     lastOpenTry = 0,
 }
 
@@ -141,6 +142,17 @@ local function fmtCountdown(sec)
     return string.format("%02d:%02d", m, s)
 end
 
+-- Left 文本两种形态：
+--   "You can still buy N. Resets in ..."        -> 还能买 N 件
+--   "You reached your limit of N per hour..."   -> 已经买满，返回 0
+local function parseLeftCount(txt)
+    if type(txt) ~= "string" then return nil end
+    local n = string.match(txt, "still buy (%d+)")
+    if n then return tonumber(n) end
+    if string.find(string.lower(txt), "reached your limit", 1, true) then return 0 end
+    return nil
+end
+
 local function snapshot()
     local cards = {}
     for _, c in ipairs(listCards()) do
@@ -190,23 +202,34 @@ local function buyOne(item, cards)
 
     if not rec.enabled then return "未开售" end
 
-    local leftBefore = (card:FindFirstChild("Left") and card:FindFirstChild("Left").Text) or ""
+    local leftLbl = card:FindFirstChild("Left")
+    local before = parseLeftCount(leftLbl and leftLbl.Text)
 
     click(buy)                 -- 第 1 次：arm
     task.wait(CFG.armWait)
     click(buy)                 -- 第 2 次：确认下单
 
-    for _ = 1, 25 do
-        task.wait(0.1)
-        local why = buy:GetAttribute("Why")
-        if why and why ~= "NOT_YET" then return "why:" .. tostring(why) end
-        local st2 = btnState(buy)
-        if st2 and st2.enabled == false then
-            local leftNow = (card:FindFirstChild("Left") and card:FindFirstChild("Left").Text) or ""
-            if leftNow ~= leftBefore then return "已下单" end
-            return "已提交"
+    -- 成功判定只看「限购余量下降」。
+    -- Why 属性变成 SOLD_OUT / HELD / CASH 都是失败，不能当成功。
+    for _ = 1, 30 do
+        task.wait(0.08)
+        local nowN = parseLeftCount(leftLbl and leftLbl.Text)
+        if before ~= nil and nowN ~= nil and nowN < before then
+            return "已下单"
         end
+        if before == nil and nowN == 0 then
+            return "已下单"
+        end
+        local why = buy:GetAttribute("Why")
+        if why == "CASH" then return "资金不足" end
+        if why == "SOLD_OUT" then return "已售罄" end
+        if why == "COOLDOWN" then return "冷却中" end
+        local st2 = btnState(buy)
+        if st2 and st2.enabled == false and why == "HELD" then return "保留中" end
     end
+    -- 收尾再确认一次，避免刚好在最后一刻成功
+    local nowN = parseLeftCount(leftLbl and leftLbl.Text)
+    if before ~= nil and nowN ~= nil and nowN < before then return "已下单" end
     return "超时"
 end
 
@@ -365,7 +388,8 @@ local function buildUI()
         end)
 
         PANEL.buttons.reset = mkBtn("重置", 168, 66, Color3.fromRGB(60, 64, 74), function()
-            state.done = {}; state.attempts = {}; state.lastResult = {}; state.inflight = {}
+            state.done = {}; state.attempts = {}; state.lastResult = {}
+            state.inflight = {}; state.retryAt = {}
             log("重置")
         end)
 
@@ -389,6 +413,7 @@ end
 --============ 主循环 ============
 local function step()
     local cards = snapshot()
+    PANEL.cards = cards
 
     if #cards == 0 then
         if CFG.autoOpen then tryOpenRestock() end
@@ -452,7 +477,8 @@ local function step()
     -- 严格按数组顺序执行：前一个没结束不会影响后面的优先级判定
     for _, item in ipairs(CFG.targets) do
         local name = item.name
-        if not state.done[name] and not isBlacklisted(name) and not state.inflight[name] then
+        local ready = (state.retryAt[name] == nil) or (os.clock() >= state.retryAt[name])
+        if not state.done[name] and not isBlacklisted(name) and not state.inflight[name] and ready then
             local rec
             for _, c in ipairs(cards) do
                 if c.name == name then rec = c break end
@@ -465,11 +491,24 @@ local function step()
                 if res ~= "未开售" and res ~= "无卡片" then
                     state.attempts[name] = (state.attempts[name] or 0) + 1
                     log(string.format("BUY %s -> %s", name, tostring(res)))
-                    if res == "已下单" or res == "已提交" or res:sub(1, 4) == "why:" then
+
+                    if res == "已下单" then
                         state.done[name] = true
                         state.lastResult[name] = "✓ 已下单"
                     else
-                        state.lastResult[name] = "重试 " .. res
+                        -- 只有「限购余量下降」才算成功，其余一律退避重试
+                        local wait = 2
+                        if res == "已售罄" then wait = 10
+                        elseif res == "保留中" then wait = 6
+                        elseif res == "冷却中" then wait = 4
+                        elseif res == "资金不足" then wait = 30
+                        end
+                        state.retryAt[name] = os.clock() + wait
+                        state.lastResult[name] = res
+                        if (state.attempts[name] or 0) >= 12 then
+                            state.retryAt[name] = os.clock() + 3600
+                            state.lastResult[name] = "放弃 " .. res
+                        end
                     end
                     task.wait(CFG.sendGap)
                 end
@@ -488,7 +527,10 @@ _G.HUSH_RESTOCK = {
     panel = PANEL,
     start = function() state.running = true end,
     stop = function() state.running = false end,
-    reset = function() state.done = {}; state.attempts = {}; state.lastResult = {}; state.inflight = {} end,
+    reset = function()
+        state.done = {}; state.attempts = {}; state.lastResult = {}
+        state.inflight = {}; state.retryAt = {}
+    end,
     snapshot = snapshot,
     buyOne = buyOne,
 }
@@ -496,10 +538,20 @@ _G.HUSH_RESTOCK = {
 log(string.format("# SESSION %s user=%s", os.date("!%Y-%m-%dT%H:%M:%S"), lp.Name))
 print("[HUSH-RESTOCK] v3 loaded  面板可拖动  「测试购买」立即尝试首个已开售目标")
 
+-- 临近开售时把轮询压到 50ms，尽量贴近开售瞬间；平时 150ms 省性能
+local function pollDelay()
+    if not state.running then return 0.25 end
+    for _, c in ipairs(PANEL.cards or {}) do
+        if c.enabled then return 0.08 end
+        if c.cd and c.cd <= 3 then return 0.05 end
+    end
+    return 0.12
+end
+
 task.spawn(function()
     while true do
         local ok, err = pcall(step)
         if not ok then log("STEP_ERR " .. tostring(err)) end
-        task.wait(state.running and 0.12 or 0.25)
+        task.wait(pollDelay())
     end
 end)
