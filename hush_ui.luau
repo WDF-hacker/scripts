@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 27
-_G.HUSH_UI_VERSION = 27
+local VERSION = 28
+_G.HUSH_UI_VERSION = 28
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -158,6 +158,7 @@ local kindCache = {}
 local bossKindCache = {}     -- kind 字符串 -> 是否 boss，避免每帧 tostring+lower+find
 local kindLowerCache = {}    -- kind 字符串 -> 小写，供 BOSS_HEAD_Y / BOSS_HEAD_MODEL 查表
 local aimTargetId, aimTargetAt, aimTargetRootY = nil, 0, 0
+local currentTargetId = nil      -- 当前锁定目标 id，供 ESP 染红与切换惩罚共用
 
 --============ 配置持久化 ============
 local HttpService = game:GetService("HttpService")
@@ -571,7 +572,7 @@ local function listAlive()
     end
     return out
 end
-_G.HUSH_UI = { cfg = cfg, listAlive = listAlive, calib = bossCalib }
+_G.HUSH_UI = { cfg = cfg, listAlive = listAlive, calib = bossCalib, targetId = function() return currentTargetId end }
 
 local function aimPointOf(z)
     if cfg.part == "neck" then return z.neck end
@@ -710,7 +711,9 @@ local MSESP_CACHE = "hush_msesp_source.luau"
 
 local ESPB = {
     lib = nil,
-    tracked = {},      -- [model] = { esp, boss }
+    tracked = {},      -- [model] = { esp, boss, type, z }
+    byId = {},         -- [zombieId] = rec，供染红快速定位
+    markedId = nil,
     lastSync = 0,
     interval = 0.2,
     failed = false,
@@ -750,17 +753,47 @@ function ESPB.load()
     return true
 end
 
+local VALID_ESP_TYPE = {
+    highlight = "Highlight",
+    selectionbox = "SelectionBox",
+    adornment = "Adornment",
+    text = "Text",
+    sphereadornment = "SphereAdornment",
+    cylinderadornment = "CylinderAdornment",
+}
+
+local function normESPType(v)
+    return VALID_ESP_TYPE[string.lower(tostring(v or "Highlight"))] or "Highlight"
+end
+
+local function espB_label(z)
+    local parts = {}
+    if z.isBoss then parts[#parts + 1] = "BOSS" end
+    if cfg.espKind ~= false then parts[#parts + 1] = z.kind end
+    if cfg.espName ~= false then parts[#parts + 1] = "#" .. tostring(z.id) end
+    return #parts > 0 and table.concat(parts, " ") or tostring(z.kind)
+end
+
+local COL_TARGET = Color3.fromRGB(255, 55, 55)
+local COL_BOSS = Color3.fromRGB(255, 165, 60)
+
+local function espB_color(z)
+    -- 被静默瞄准锁定 / 刚开过火的目标染红
+    if z.id ~= nil then
+        if z.id == currentTargetId then return COL_TARGET end
+        if aimTargetId ~= nil and z.id == aimTargetId and (os.clock() - aimTargetAt) < 1.2 then
+            return COL_TARGET
+        end
+    end
+    return z.isBoss and COL_BOSS or cfg.espColor
+end
+
 local function espB_settings(z)
-    local nameParts = {}
-    if z.isBoss then nameParts[#nameParts + 1] = "BOSS" end
-    if cfg.espKind ~= false then nameParts[#nameParts + 1] = z.kind end
-    if cfg.espName ~= false then nameParts[#nameParts + 1] = "#" .. tostring(z.id) end
-    local label = #nameParts > 0 and table.concat(nameParts, " ") or tostring(z.kind)
-    local color = z.isBoss and Color3.fromRGB(255, 165, 60) or cfg.espColor
+    local color = espB_color(z)
     return {
         Model = z.model,
-        Name = label,
-        ESPType = cfg.espType or "Highlight",
+        Name = espB_label(z),
+        ESPType = normESPType(cfg.espType),
         Color = color,
         MaxDistance = cfg.espMaxDist or 300,
         TextSize = cfg.textSize or 13,
@@ -778,13 +811,45 @@ local function espB_settings(z)
     }
 end
 
+-- 组件开关、颜色、名字、距离、字号都走 CurrentSettings 实时写；
+-- 只有 ESPType 是库内只读，必须销毁重建。
+local function espB_apply(rec, z)
+    local color = espB_color(z)
+    local th = cfg.thickness or 1
+    local cs = rec.esp.CurrentSettings
+    cs.Name = espB_label(z)
+    cs.Color = color
+    cs.FillColor = color
+    cs.OutlineColor = color
+    cs.MaxDistance = cfg.espMaxDist or 300
+    cs.TextSize = cfg.textSize or 13
+    if cs.Box2D then
+        cs.Box2D.Enabled = cfg.box2d ~= false
+        cs.Box2D.Color = color
+        cs.Box2D.Thickness = th
+    end
+    if cs.Box3D then
+        cs.Box3D.Enabled = cfg.box3d == true
+        cs.Box3D.Color = color
+        cs.Box3D.Thickness = th
+    end
+    if cs.Tracer then
+        cs.Tracer.Enabled = cfg.tracer == true
+        cs.Tracer.Color = color
+    end
+    if cs.Skeleton then
+        cs.Skeleton.Enabled = cfg.skeleton == true
+        cs.Skeleton.Color = color
+    end
+end
+
 function ESPB.sync(alive)
     if not ESPB.lib then return end
     local now = os.clock()
     if (now - ESPB.lastSync) < ESPB.interval then return end
     ESPB.lastSync = now
 
-    local wantType = cfg.espType or "Highlight"
+    local wantType = normESPType(cfg.espType)
     local seen = {}
     for i = 1, #alive do
         local z = alive[i]
@@ -792,34 +857,26 @@ function ESPB.sync(alive)
         if m and m.Parent then
             seen[m] = true
             local rec = ESPB.tracked[m]
-            -- ESPType 在库内只读，类型换了只能重建
+
             if rec and rec.type ~= wantType then
                 pcall(function() rec.esp:Destroy() end)
                 ESPB.tracked[m] = nil
                 rec = nil
             end
+
             if not rec then
                 local ok, esp = pcall(function() return ESPB.lib:Add(espB_settings(z)) end)
                 if ok and esp then
-                    ESPB.tracked[m] = { esp = esp, boss = z.isBoss, type = wantType }
+                    ESPB.tracked[m] = { esp = esp, boss = z.isBoss, type = wantType, z = z }
                     ESPB.lastErr = nil
                 else
                     ESPB.lastErr = tostring(esp)
                 end
             else
-                local dirty = (rec.boss ~= z.isBoss)
                 rec.boss = z.isBoss
-                pcall(function()
-                    local cs = rec.esp.CurrentSettings
-                    cs.MaxDistance = cfg.espMaxDist or 300
-                    cs.TextSize = cfg.textSize or 13
-                    if dirty then
-                        local c = z.isBoss and Color3.fromRGB(255, 165, 60) or cfg.espColor
-                        cs.Color = c; cs.FillColor = c; cs.OutlineColor = c
-                        if cs.Box2D then cs.Box2D.Color = c end
-                        if cs.Tracer then cs.Tracer.Color = c end
-                    end
-                end)
+                rec.z = z
+                local ok, err = pcall(espB_apply, rec, z)
+                if not ok then ESPB.lastErr = tostring(err) end
             end
         end
     end
@@ -830,6 +887,26 @@ function ESPB.sync(alive)
             ESPB.tracked[m] = nil
         end
     end
+
+    -- id -> 记录，供染红快速定位
+    ESPB.byId = {}
+    for _, rec in pairs(ESPB.tracked) do
+        if rec.z and rec.z.id ~= nil then ESPB.byId[rec.z.id] = rec end
+    end
+end
+
+-- 目标变化时立刻只刷这两条的颜色，不等 sync 周期
+function ESPB.markTarget(id)
+    if id == ESPB.markedId then return end
+    local prev = ESPB.markedId
+    ESPB.markedId = id
+    local function refresh(i)
+        if i == nil then return end
+        local rec = ESPB.byId and ESPB.byId[i]
+        if rec and rec.z then pcall(espB_apply, rec, rec.z) end
+    end
+    refresh(prev)
+    refresh(id)
 end
 
 function ESPB.clear()
@@ -895,7 +972,7 @@ local function drawCorner(s, x, y, w, h, c)
 end
 
 --============ 静默瞄准 ============
-local currentTargetId = nil
+-- currentTargetId 已在 ESP 段之前声明
 local raidKey = ""
 local corrections = 0
 local restoreFire = nil
@@ -917,7 +994,7 @@ if Net then
     restoreFire = function() Net.fire = oldFire end
     Net.fire = function(name, payload)
         if cfg.silent and name == "combat.fire" and type(payload) == "table" and payload.o and payload.d then
-            pcall(function()
+            local okAim, errAim = pcall(function()
                 if cfg.pauseWatched and lp:GetAttribute("Watched") == true then logLine("SKIP watched"); return end
                 local mpNow = mousePos()
                 local pick = nil
@@ -988,6 +1065,10 @@ if Net then
                     tostring(z.kind), tostring(z.id), pick.px, pick.dist, ang,
                     tonumber(payload.sp) or -1, tostring(lp:GetAttribute("Watched")), corrections))
             end)
+            if not okAim then
+                _G.HUSH_AIM_ERR = tostring(errAim)
+                logLine("AIM_ERR " .. tostring(errAim))
+            end
         end
         return oldFire(name, payload)
     end
@@ -1006,6 +1087,7 @@ renderConn = RunService.RenderStepped:Connect(function()
         local mpNow = mousePos()
         preTarget = pickTarget(hrpNow.Position + Vector3.new(0, 1.1, 0), frameList, mpNow)
         preTargetAt = os.clock()
+        if espLibActive then ESPB.markTarget(currentTargetId) end
         lastTargetName = preTarget and (preTarget.z.kind .. " #" .. tostring(preTarget.z.id)) or "-"
     end
 
@@ -1300,8 +1382,8 @@ if Library then
         Callback = function(v) cfg.esp = v end
     })
     A.style = gE:AddDropdown("espStyle", {
-        Text = "方框样式", Values = { "corner", "box" }, Default = cfg.style,
-        Tooltip = "corner=四角框（更简洁），box=完整方框",
+        Text = "方框样式（内置回落）", Values = { "corner", "box" }, Default = cfg.style,
+        Tooltip = "仅在关闭 MSESP 渲染、退回内置 Drawing 绘制时生效",
         Callback = function(v) cfg.style = v end
     })
     A.kind = gE:AddToggle("espKind", {
@@ -1325,8 +1407,8 @@ if Library then
         Callback = function(v) cfg.tracer = v end
     })
     A.espType = gE:AddDropdown("espLibType", {
-        Text = "ESP 类型", Values = { "Highlight", "SelectionBox", "Box3D", "Box2D" }, Default = cfg.espType,
-        Tooltip = "Highlight=全身高亮透墙；SelectionBox=边框；Box3D=三维盒；Box2D=仅屏幕方框。改动即时生效",
+        Text = "ESP 类型", Values = { "Highlight", "SelectionBox", "Adornment" }, Default = cfg.espType,
+        Tooltip = "Highlight=全身高亮透墙；SelectionBox=线框；Adornment=简易挂件。切换会重建对象，约 0.2 秒生效",
         Callback = function(v) cfg.espType = v end
     })
     A.box2d = gE:AddToggle("espBox2D", {
