@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 25
-_G.HUSH_UI_VERSION = 25
+local VERSION = 27
+_G.HUSH_UI_VERSION = 27
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -153,7 +153,10 @@ _G.HUSH_BOSS_HEAD_MODEL = BOSS_HEAD_MODEL
 
 local bossCalib = {}
 local headCache = setmetatable({}, { __mode = "k" })
+local faceCache = setmetatable({}, { __mode = "k" })
 local kindCache = {}
+local bossKindCache = {}     -- kind 字符串 -> 是否 boss，避免每帧 tostring+lower+find
+local kindLowerCache = {}    -- kind 字符串 -> 小写，供 BOSS_HEAD_Y / BOSS_HEAD_MODEL 查表
 local aimTargetId, aimTargetAt, aimTargetRootY = nil, 0, 0
 
 --============ 配置持久化 ============
@@ -307,24 +310,38 @@ task.spawn(function()
 end)
 
 --============ 僵尸注册表 ============
+-- 数据源优先级：
+--   1) HushClient.Controllers.ZombieRender 的注册表数组（真实来源，稳定）
+--   2) 老的 upvalue 扫描（回落，形状变了就会失效）
+-- 记录字段由游戏侧维护：.id .kind .dead .state .x .z .rig{model,root,scale,parts}
+local ZR_NODES = { "PlayerScripts", "HushClient", "Controllers", "ZombieRender" }
+
+local registry, registryAt = nil, 0
+local regLost = false
+local regMode = "none"        -- "module" | "scan" | "none"
+local regFailAt, regBackoff = 0, 1
+local REG_BACKOFF_MAX = 10
+local REG_TTL = 30            -- 只用来周期性确认控制器还在，不做全量重扫
+
+-- 回落扫描用的打分：字段小改也要能认出来
 local function scoreReg(t)
     if type(t) ~= "table" then return 0 end
     local n = 0
     for k, v in pairs(t) do
-        if type(k) == "number" and type(v) == "table" and v.dead ~= nil and v.x ~= nil then n = n + 1 end
+        if type(k) == "number" and type(v) == "table" then
+            if v.rig ~= nil or (v.dead ~= nil and v.kind ~= nil) then n = n + 1 end
+        end
     end
     return n
 end
 
-local registry, registryAt = nil, 0
-local function findRegistry()
-    if registry and os.clock() - registryAt < 3 then return registry end
+local function scanRegistry()
     local ev
     pcall(function() ev = RS.HushNet["zombie.event"] end)
     if not ev then return nil end
     local best, bestScore = nil, 0
     local okc, conns = pcall(getconnections, ev.OnClientEvent)
-    if not okc or type(conns) ~= "table" then return registry end
+    if not okc or type(conns) ~= "table" then return nil end
     for _, c in ipairs(conns) do
         local ok, uvs = pcall(function() return debug.getupvalues(c.Function) end)
         if ok and type(uvs) == "table" then
@@ -343,8 +360,82 @@ local function findRegistry()
             end
         end
     end
-    if best then registry, registryAt = best, os.clock() end
-    return registry
+    if best and bestScore > 0 then return best end
+    return nil
+end
+
+local function resolveZR()
+    local node = lp
+    for i = 1, #ZR_NODES do
+        if not node then return nil end
+        node = node:FindFirstChild(ZR_NODES[i])
+    end
+    return node
+end
+
+-- 控制器闭包的第 1 个 upvalue 就是注册表数组本身。
+-- 空数组也是合法状态（附近没僵尸），不能当成失配。
+local function attachZR()
+    local scr = resolveZR()
+    if not scr then return false end
+    local ok, mod = pcall(require, scr)
+    if not ok or type(mod) ~= "table" or type(mod.targets) ~= "function" then return false end
+    local ok2, uvs = pcall(function() return debug.getupvalues(mod.targets) end)
+    if not ok2 or type(uvs) ~= "table" then return false end
+    local arr = uvs[1]
+    if type(arr) ~= "table" then return false end
+    registry, registryAt = arr, os.clock()
+    regMode = "module"
+    regLost = false
+    regBackoff = 1
+    return true
+end
+
+local findRegistry
+function findRegistry(force)
+    local now = os.clock()
+
+    if registry and not force then
+        if now - registryAt > REG_TTL then
+            registryAt = now
+            if not resolveZR() then      -- 控制器没了才丢弃引用
+                registry = nil
+                regMode = "none"
+            end
+        end
+        if registry then return registry end
+    end
+
+    if force then registry = nil end
+    if not force and now < regFailAt then return nil end
+
+    if attachZR() then return registry end
+
+    local found = scanRegistry()
+    if found then
+        registry, registryAt = found, now
+        regMode = "scan"
+        regLost = false
+        regBackoff = 1
+        return registry
+    end
+
+    regLost = true
+    regMode = "none"
+    regFailAt = now + regBackoff
+    regBackoff = math.min(regBackoff * 2, REG_BACKOFF_MAX)
+    return nil
+end
+
+local function regCount()
+    if type(registry) ~= "table" then return 0 end
+    local n = 0
+    for _ in pairs(registry) do n = n + 1 end
+    return n
+end
+
+_G.HUSH_REG_STATUS = function()
+    return { lost = regLost, mode = regMode, count = regCount(), backoff = regBackoff, has = registry ~= nil }
 end
 
 local function listAlive()
@@ -358,8 +449,17 @@ local function listAlive()
             local root = type(rig) == "table" and rig.root
             if model and root and root.Parent and root.Position.Y > -100 then
                 local scale = (type(rig) == "table" and tonumber(rig.scale)) or 1
-                local isBoss = string.find(string.lower(tostring(rec.kind)), "boss") ~= nil
-                local headPos = root.Position + Vector3.new(0, 1.55 * scale, 0)
+                local kindStr = tostring(rec.kind)
+                local kindLower = kindLowerCache[kindStr]
+                if kindLower == nil then
+                    kindLower = string.lower(kindStr)
+                    kindLowerCache[kindStr] = kindLower
+                end
+                local isBoss = bossKindCache[kindStr]
+                if isBoss == nil then
+                    isBoss = string.find(kindLower, "boss") ~= nil
+                    bossKindCache[kindStr] = isBoss
+                end                local headPos = root.Position + Vector3.new(0, 1.55 * scale, 0)
                 local hp = nil
                 local parts = type(rig) == "table" and rig.parts
                 -- 只有 boss 才用游戏给的 parts[rec.head]（boss_conductor 指向 LowerTorso）
@@ -377,13 +477,17 @@ local function listAlive()
                     if mh and mh ~= false and mh:IsA("BasePart") and math.abs(mh.Position.Y - root.Position.Y) < 8 then hp = mh end
                 end
                 if not hp then
-                    local face = model:FindFirstChild("FaceCenterAttachment", true)
-                    if face then headPos = face.WorldPosition end
+                    local face = faceCache[model]
+                    if face == nil then
+                        face = model:FindFirstChild("FaceCenterAttachment", true) or false
+                        faceCache[model] = face
+                    end
+                    if face and face ~= false then headPos = face.WorldPosition end
                 else
                     headPos = hp.Position
                 end
                 local defHeadY = nil
-                local kk = tostring(rec.kind)
+                local kk = kindStr
                 local cached = kindCache[kk]
                 if cached == nil then
                     cached = false
@@ -399,7 +503,7 @@ local function listAlive()
                 end
                 if isBoss then
                     local used = false
-                    if BOSS_HEAD_MODEL[string.lower(tostring(rec.kind))] then
+                    if BOSS_HEAD_MODEL[kindLower] then
                         local mh = headCache[model]
                         if mh == nil then
                             mh = model:FindFirstChild("Head", true) or false
@@ -433,7 +537,7 @@ local function listAlive()
                         end
                     end
                     if not used then
-                        local ky = BOSS_HEAD_Y[string.lower(tostring(rec.kind))]
+                        local ky = BOSS_HEAD_Y[kindLower]
                         if ky and cfg.bossAim ~= false then
                             headPos = Vector3.new(headPos.X, ky + (cfg.bossBias or 0), headPos.Z)
                             used = true
@@ -451,7 +555,7 @@ local function listAlive()
                 local neck = headPos - Vector3.new(0, 0.35 * scale, 0)
                 out[#out + 1] = {
                     id = rec.id,
-                    kind = tostring(rec.kind),
+                    kind = kindStr,
                     model = model,
                     root = root,
                     head = headPos,
@@ -480,13 +584,19 @@ local params = RaycastParams.new()
 params.FilterType = Enum.RaycastFilterType.Exclude
 params.IgnoreWater = true
 
-local function los(from, to)
-    local f = {}
-    if lp.Character then f[1] = lp.Character end
-    params.FilterDescendantsInstances = f
+-- 过滤表只在角色变化时重建一次；目标模型不排除，
+-- 改成「射线命中目标模型本身 = 通视」，避免每次 raycast 重建过滤器
+local losChar = nil
+local function los(from, to, targetModel)
+    local char = lp.Character
+    if char ~= losChar then
+        losChar = char
+        params.FilterDescendantsInstances = char and { char } or {}
+    end
     local delta = to - from
     local hit = workspace:Raycast(from, delta, params)
     if not hit then return true end
+    if targetModel and hit.Instance and hit.Instance:IsDescendantOf(targetModel) then return true end
     return hit.Distance >= delta.Magnitude - 0.5
 end
 
@@ -495,8 +605,14 @@ local function mousePos()
     return Vector2.new(p.X, p.Y)
 end
 
+-- CurrentCamera 缓存：这是跨边界的属性读，每帧每目标读一次不划算
+local camRef = workspace.CurrentCamera
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    camRef = workspace.CurrentCamera
+end)
+
 local function project(pos)
-    local cam = workspace.CurrentCamera
+    local cam = camRef
     if not cam then return nil end
     local sp, on = cam:WorldToViewportPoint(pos)
     if not on or sp.Z <= 0 then return nil end
@@ -504,25 +620,32 @@ local function project(pos)
 end
 
 local function pickTarget(o, list, mp)
-    local cam = workspace.CurrentCamera
     local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-    if not cam or not hrp then return nil end
+    if not camRef or not hrp then return nil end
     mp = mp or mousePos()
     list = list or listAlive()
+
+    local maxD2 = cfg.maxDist * cfg.maxDist
+    local pen = 1 - (cfg.switchPenalty or 0)
+    local hrpPos = hrp.Position
     local best, bestD = nil, math.huge
+
     for _, z in ipairs(list) do
-        local dist = (z.pos - hrp.Position).Magnitude
-        if dist <= cfg.maxDist then
-            local sp = project(aimPointOf(z))
+        local dx, dy, dz = z.pos.X - hrpPos.X, z.pos.Y - hrpPos.Y, z.pos.Z - hrpPos.Z
+        local d2 = dx * dx + dy * dy + dz * dz
+        if d2 <= maxD2 then
+            local ap = aimPointOf(z)          -- 只算一次，别再调第二遍
+            local sp = project(ap)
             if sp then
                 local dpx = (sp - mp).Magnitude
                 local eff = dpx
                 if currentTargetId ~= nil and z.id == currentTargetId then
-                    eff = dpx * (1 - (cfg.switchPenalty or 0))
+                    eff = dpx * pen
                 end
                 if dpx <= cfg.fov and eff < bestD then
-                    if (not cfg.los) or los(o, aimPointOf(z)) then
-                        best, bestD = { z = z, px = dpx, dist = dist }, dpx
+                    if (not cfg.los) or los(o, ap, z.model) then
+                        best = { z = z, px = dpx, dist = math.sqrt(d2) }
+                        bestD = eff               -- 存 eff，与比较口径一致
                     end
                 end
             end
@@ -1267,6 +1390,19 @@ if Library then
     A.lblTarget = gS:AddLabel("目标: -")
     A.lblWatched = gS:AddLabel("Watched: -")
     A.lblMode = gS:AddLabel("部位: head")
+    A.lblReg = gS:AddLabel("注册表: -")
+    gS:AddButton({
+        Text = "重新扫描僵尸注册表",
+        Tooltip = "注册表失配（追踪数为 0 但场上明明有僵尸）时手动重扫一次",
+        Func = function()
+            findRegistry(true)
+            local st = _G.HUSH_REG_STATUS and _G.HUSH_REG_STATUS() or {}
+            if Library and Library.Notify then
+                Library:Notify(st.has and string.format("注册表已接入（%s / %d 条）",
+                    tostring(st.mode), st.count or 0) or "仍未找到注册表，稍后再试", 4)
+            end
+        end
+    })
     A.warnToggle = gS:AddToggle("warnWatched", {
         Text = "Watched 警告弹窗", Default = cfg.warnWatched,
         Tooltip = "检测到本局被抽样录像时，在左上角弹出红色警告",
@@ -1304,6 +1440,12 @@ if Library then
             end
             pcall(function()
                 A.lblTrack:SetText("追踪: " .. tostring(#listAlive()) .. " 只活僵尸")
+                local st = _G.HUSH_REG_STATUS and _G.HUSH_REG_STATUS() or nil
+                if st then
+                    local modeTxt = st.mode == "module" and "控制器" or (st.mode == "scan" and "扫描(回落)" or "未接入")
+                    A.lblReg:SetText(string.format("注册表: %s / %s / %d 条", modeTxt,
+                        st.has and "正常" or "失联", st.count or 0))
+                end
                 A.lblTarget:SetText("目标: " .. lastTargetName)
                 A.lblWatched:SetText("Watched: " .. tostring(lp:GetAttribute("Watched")))
                 A.lblMode:SetText(string.format("部位: %s  FOV: %dpx  距离: %d", cfg.part, cfg.fov, cfg.maxDist))
