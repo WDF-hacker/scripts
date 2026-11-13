@@ -203,33 +203,41 @@ local function buyOne(item, cards)
     if not rec.enabled then return "未开售" end
 
     local leftLbl = card:FindFirstChild("Left")
+    local statusLbl = card:FindFirstChild("Status")
     local before = parseLeftCount(leftLbl and leftLbl.Text)
 
     click(buy)                 -- 第 1 次：arm
     task.wait(CFG.armWait)
     click(buy)                 -- 第 2 次：确认下单
 
-    -- 成功判定只看「限购余量下降」。
-    -- Why 属性变成 SOLD_OUT / HELD / CASH 都是失败，不能当成功。
-    for _ = 1, 30 do
-        task.wait(0.08)
+    -- 结算方式有两种，成功判据也不同：
+    --   直接掉落：限购余量下降
+    --   抽签（"The draw closes in 4 s" -> "Getting your share..."）：
+    --     Status 变成 "Bought: N x ..."，可能延迟 5 秒以上才出结果
+    -- Why=OK 只是客户端发出去，不能当成功；SOLD_OUT / HELD / CAP / CASH 都是失败。
+    local deadline = os.clock() + 12
+    while os.clock() < deadline do
+        task.wait(0.25)
+
+        local stTxt = tostring(statusLbl and statusLbl.Text or "")
+        if string.find(stTxt, "Bought:", 1, true)
+            or string.find(string.lower(stTxt), "reached your limit", 1, true) then
+            return "已下单"
+        end
+
         local nowN = parseLeftCount(leftLbl and leftLbl.Text)
-        if before ~= nil and nowN ~= nil and nowN < before then
-            return "已下单"
-        end
-        if before == nil and nowN == 0 then
-            return "已下单"
-        end
-        local why = buy:GetAttribute("Why")
+        if before ~= nil and nowN ~= nil and nowN < before then return "已下单" end
+
+        local why = tostring(buy:GetAttribute("Why") or "")
         if why == "CASH" then return "资金不足" end
         if why == "SOLD_OUT" then return "已售罄" end
-        if why == "COOLDOWN" then return "冷却中" end
-        local st2 = btnState(buy)
-        if st2 and st2.enabled == false and why == "HELD" then return "保留中" end
+        if why == "CAP" then return "已达上限" end
+        if why == "COOLDOWN" or why == "GAP" then
+            -- 正常节流，继续等结果，不算失败
+        elseif why == "HELD" then
+            return "保留中"
+        end
     end
-    -- 收尾再确认一次，避免刚好在最后一刻成功
-    local nowN = parseLeftCount(leftLbl and leftLbl.Text)
-    if before ~= nil and nowN ~= nil and nowN < before then return "已下单" end
     return "超时"
 end
 
@@ -502,6 +510,7 @@ local function step()
                         elseif res == "保留中" then wait = 6
                         elseif res == "冷却中" then wait = 4
                         elseif res == "资金不足" then wait = 30
+                        elseif res == "已达上限" then wait = 60
                         end
                         state.retryAt[name] = os.clock() + wait
                         state.lastResult[name] = res
