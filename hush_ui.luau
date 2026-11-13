@@ -6,8 +6,8 @@
     快捷键：RightShift 开关面板
 ]]
 local PREFIX = "[HUSH-UI]"
-local VERSION = 24
-_G.HUSH_UI_VERSION = 24
+local VERSION = 25
+_G.HUSH_UI_VERSION = 25
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -118,7 +118,14 @@ local cfg = {
     espMaxDist = 300,
     thickness = 1,
     textSize = 13,
-    espColor = Color3.fromRGB(120, 255, 140)
+    espColor = Color3.fromRGB(120, 255, 140),
+
+    -- MSESP（mstudio45's ESP Library）渲染后端
+    espLib = true,
+    espType = "Highlight",
+    box2d = true,
+    box3d = false,
+    skeleton = false
 }
 _G.HUSH_UI_CFG = cfg
 
@@ -540,30 +547,203 @@ fovCircle.Visible = false
 
 --============ ESP ============
 local POOL = 48
-local pool = {}
-for i = 1, POOL do
-    local s = { lines = {}, text = Drawing.new("Text") }
-    s.text.Size = cfg.textSize
-    s.text.Center = true
-    s.text.Outline = true
-    s.text.Visible = false
-    for j = 1, 8 do
-        local ln = Drawing.new("Line")
-        ln.Thickness = cfg.thickness
-        ln.Visible = false
-        s.lines[j] = ln
+local pool = nil
+
+-- 旧版 Drawing ESP 的池子改成按需创建：MSESP 生效时一个 Drawing 都不建
+local function ensurePool()
+    if pool then return pool end
+    pool = {}
+    for i = 1, POOL do
+        local s = { lines = {}, text = Drawing.new("Text") }
+        s.text.Size = cfg.textSize
+        s.text.Center = true
+        s.text.Outline = true
+        s.text.Visible = false
+        for j = 1, 8 do
+            local ln = Drawing.new("Line")
+            ln.Thickness = cfg.thickness
+            ln.Visible = false
+            s.lines[j] = ln
+        end
+        s.square = Drawing.new("Square")
+        s.square.Filled = false
+        s.square.Thickness = cfg.thickness
+        s.square.Visible = false
+        s.tracer = Drawing.new("Line")
+        s.tracer.Thickness = 1
+        s.tracer.Visible = false
+        protect(s.text); protect(s.square); protect(s.tracer)
+        for j = 1, 8 do protect(s.lines[j]) end
+        pool[i] = s
     end
-    s.square = Drawing.new("Square")
-    s.square.Filled = false
-    s.square.Thickness = cfg.thickness
-    s.square.Visible = false
-    s.tracer = Drawing.new("Line")
-    s.tracer.Thickness = 1
-    s.tracer.Visible = false
-    protect(s.text); protect(s.square); protect(s.tracer)
-    for j = 1, 8 do protect(s.lines[j]) end
-    pool[i] = s
+    return pool
 end
+
+--============ MSESP 桥接 ============
+-- 把僵尸 ESP 交给 mstudio45's ESP Library 渲染：库自带 RenderStepped 循环，
+-- 我们只做低频成员对账，主循环不再产生任何绘制调用。
+local MSESP_URL = "https://raw.githubusercontent.com/mstudio45/MSESP/refs/heads/main/source.luau"
+local MSESP_CACHE = "hush_msesp_source.luau"
+
+local ESPB = {
+    lib = nil,
+    tracked = {},      -- [model] = { esp, boss }
+    lastSync = 0,
+    interval = 0.2,
+    failed = false,
+}
+
+function ESPB.load()
+    if ESPB.lib then return true end
+    if ESPB.failed then return false end
+    if _G.mstudio45_ESP then
+        ESPB.lib = _G.mstudio45_ESP
+        return true
+    end
+    local src
+    if isfile and isfile(MSESP_CACHE) then
+        local ok, s = pcall(readfile, MSESP_CACHE)
+        if ok and type(s) == "string" and #s > 20000 then src = s end
+    end
+    if not src then
+        local ok, s = pcall(function() return game:HttpGet(MSESP_URL) end)
+        if ok and type(s) == "string" and #s > 20000 then
+            src = s
+            pcall(writefile, MSESP_CACHE, s)
+        end
+    end
+    if not src then ESPB.failed = true; return false end
+    local fn = loadstring(src)
+    if not fn then ESPB.failed = true; return false end
+    local ok, res = pcall(fn)
+    if not ok or type(res) ~= "table" then ESPB.failed = true; return false end
+    ESPB.lib = res
+    pcall(function()
+        local g = res.GlobalConfig
+        g.Billboards = true; g.Distance = true; g.Highlighters = true
+        g.Tracers = true; g.Boxes2D = true; g.Boxes3D = true
+        g.Rainbow = false; g.IgnoreCharacter = false
+    end)
+    return true
+end
+
+local function espB_settings(z)
+    local nameParts = {}
+    if z.isBoss then nameParts[#nameParts + 1] = "BOSS" end
+    if cfg.espKind ~= false then nameParts[#nameParts + 1] = z.kind end
+    if cfg.espName ~= false then nameParts[#nameParts + 1] = "#" .. tostring(z.id) end
+    local label = #nameParts > 0 and table.concat(nameParts, " ") or tostring(z.kind)
+    local color = z.isBoss and Color3.fromRGB(255, 165, 60) or cfg.espColor
+    return {
+        Model = z.model,
+        Name = label,
+        ESPType = cfg.espType or "Highlight",
+        Color = color,
+        MaxDistance = cfg.espMaxDist or 300,
+        TextSize = cfg.textSize or 13,
+        StudsOffset = Vector3.new(0, 0.6, 0),
+        FillColor = color,
+        OutlineColor = color,
+        FillTransparency = 0.6,
+        OutlineTransparency = 0,
+        Transparency = 0.35,
+        Thickness = cfg.thickness or 1,
+        Box2D = { Enabled = cfg.box2d ~= false, Color = color, Thickness = cfg.thickness or 1, Transparency = 0 },
+        Box3D = { Enabled = cfg.box3d == true, Color = color, Thickness = cfg.thickness or 1, Transparency = 0 },
+        Tracer = { Enabled = cfg.tracer == true, Color = color, Thickness = 1, Transparency = 0, From = "Bottom" },
+        Skeleton = { Enabled = cfg.skeleton == true, Color = color, Thickness = 1, Transparency = 0 },
+    }
+end
+
+function ESPB.sync(alive)
+    if not ESPB.lib then return end
+    local now = os.clock()
+    if (now - ESPB.lastSync) < ESPB.interval then return end
+    ESPB.lastSync = now
+
+    local wantType = cfg.espType or "Highlight"
+    local seen = {}
+    for i = 1, #alive do
+        local z = alive[i]
+        local m = z.model
+        if m and m.Parent then
+            seen[m] = true
+            local rec = ESPB.tracked[m]
+            -- ESPType 在库内只读，类型换了只能重建
+            if rec and rec.type ~= wantType then
+                pcall(function() rec.esp:Destroy() end)
+                ESPB.tracked[m] = nil
+                rec = nil
+            end
+            if not rec then
+                local ok, esp = pcall(function() return ESPB.lib:Add(espB_settings(z)) end)
+                if ok and esp then
+                    ESPB.tracked[m] = { esp = esp, boss = z.isBoss, type = wantType }
+                    ESPB.lastErr = nil
+                else
+                    ESPB.lastErr = tostring(esp)
+                end
+            else
+                local dirty = (rec.boss ~= z.isBoss)
+                rec.boss = z.isBoss
+                pcall(function()
+                    local cs = rec.esp.CurrentSettings
+                    cs.MaxDistance = cfg.espMaxDist or 300
+                    cs.TextSize = cfg.textSize or 13
+                    if dirty then
+                        local c = z.isBoss and Color3.fromRGB(255, 165, 60) or cfg.espColor
+                        cs.Color = c; cs.FillColor = c; cs.OutlineColor = c
+                        if cs.Box2D then cs.Box2D.Color = c end
+                        if cs.Tracer then cs.Tracer.Color = c end
+                    end
+                end)
+            end
+        end
+    end
+
+    for m, rec in pairs(ESPB.tracked) do
+        if not seen[m] or not m.Parent then
+            pcall(function() rec.esp:Destroy() end)
+            ESPB.tracked[m] = nil
+        end
+    end
+end
+
+function ESPB.clear()
+    for m, rec in pairs(ESPB.tracked) do
+        pcall(function() rec.esp:Destroy() end)
+        ESPB.tracked[m] = nil
+    end
+    if ESPB.lib then pcall(function() ESPB.lib:Clear() end) end
+end
+
+function ESPB.destroy()
+    ESPB.clear()
+    if ESPB.lib then pcall(function() ESPB.lib:Destroy() end) end
+    ESPB.lib = nil
+    pcall(function() getgenv().mstudio45_ESP = nil end)
+end
+
+function ESPB.setColor(c)
+    if not ESPB.lib then return end
+    for _, rec in pairs(ESPB.tracked) do
+        pcall(function()
+            local cs = rec.esp.CurrentSettings
+            if cs.Box2D then cs.Box2D.Color = c end
+            if cs.Box3D then cs.Box3D.Color = c end
+            if cs.Tracer then cs.Tracer.Color = c end
+            if not rec.boss then cs.Color = c; cs.FillColor = c; cs.OutlineColor = c end
+        end)
+    end
+end
+
+local espLibActive = false
+if cfg.espLib ~= false then
+    espLibActive = ESPB.load()
+end
+_G.HUSH_ESP_BRIDGE = ESPB
+_G.HUSH_ESP_ACTIVE = espLibActive
+
 
 local function hideSlot(s)
     s.text.Visible = false
@@ -718,9 +898,21 @@ renderConn = RunService.RenderStepped:Connect(function()
 
     -- ESP
     if not cfg.esp then
-        for _, s in ipairs(pool) do hideSlot(s) end
+        if espLibActive then
+            if next(ESPB.tracked) ~= nil then ESPB.clear() end
+        elseif pool then
+            for _, s in ipairs(pool) do hideSlot(s) end
+        end
         return
     end
+
+    -- MSESP 后端：库自己渲染，这里只做对账，不产生绘制调用
+    if espLibActive then
+        ESPB.sync(frameList)
+        return
+    end
+
+    ensurePool()
     pcall(function()
         local cam = workspace.CurrentCamera
         local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
@@ -791,13 +983,16 @@ local function cleanup()
     pcall(function() if renderConn then renderConn:Disconnect() end end)
     pcall(function() if restoreFire then restoreFire() end end)
     pcall(function() fovCircle:Remove() end)
-    for _, s in ipairs(pool) do
-        pcall(function() s.text:Remove() end)
-        pcall(function() s.square:Remove() end)
-        pcall(function() s.tracer:Remove() end)
-        for j = 1, 8 do pcall(function() s.lines[j]:Remove() end) end
+    pcall(function() ESPB.destroy() end)
+    if pool then
+        for _, s in ipairs(pool) do
+            pcall(function() s.text:Remove() end)
+            pcall(function() s.square:Remove() end)
+            pcall(function() s.tracer:Remove() end)
+            for j = 1, 8 do pcall(function() s.lines[j]:Remove() end) end
+        end
     end
-    pool = {}
+    pool = nil
     pcall(function()
         if _G.HUSH_UI and _G.HUSH_UI.uiGui then _G.HUSH_UI.uiGui:Destroy() end
     end)
@@ -815,7 +1010,7 @@ local function fullPurge()
         if Net and _G.__HUSH_ORIG_FIRE then Net.fire = _G.__HUSH_ORIG_FIRE end
     end)
     _G.__HUSH_ORIG_FIRE = nil
-    for _, k in ipairs({ "HUSH_UI", "HUSH_UI_CFG", "HUSH_UI_CLEANUP", "HUSH_UI_VERSION", "HUSH_Z", "HUSH_ESP", "HUSH_SILENT_TEST", "HUSH_CURSOR" }) do
+    for _, k in ipairs({ "HUSH_UI", "HUSH_UI_CFG", "HUSH_UI_CLEANUP", "HUSH_UI_VERSION", "HUSH_Z", "HUSH_ESP", "HUSH_SILENT_TEST", "HUSH_CURSOR", "HUSH_ESP_BRIDGE", "HUSH_ESP_ACTIVE", "mstudio45_ESP" }) do
         _G[k] = nil
     end
 end
@@ -1006,6 +1201,31 @@ if Library then
         Tooltip = "从屏幕底部中心到目标的线",
         Callback = function(v) cfg.tracer = v end
     })
+    A.espType = gE:AddDropdown("espLibType", {
+        Text = "ESP 类型", Values = { "Highlight", "SelectionBox", "Box3D", "Box2D" }, Default = cfg.espType,
+        Tooltip = "Highlight=全身高亮透墙；SelectionBox=边框；Box3D=三维盒；Box2D=仅屏幕方框。改动即时生效",
+        Callback = function(v) cfg.espType = v end
+    })
+    A.box2d = gE:AddToggle("espBox2D", {
+        Text = "屏幕方框", Default = cfg.box2d,
+        Tooltip = "MSESP 的 2D 包围框（Frame + UIStroke），严格贴合模型包围盒",
+        Callback = function(v) cfg.box2d = v end
+    })
+    A.box3d = gE:AddToggle("espBox3D", {
+        Text = "三维方框", Default = cfg.box3d,
+        Tooltip = "MSESP 的 3D 盒（adornee），会随距离缩放",
+        Callback = function(v) cfg.box3d = v end
+    })
+    A.skeleton = gE:AddToggle("espSkeleton", {
+        Text = "骨骼线", Default = cfg.skeleton,
+        Tooltip = "按 R15 关节连线，开销最大，僵尸多时建议关",
+        Callback = function(v) cfg.skeleton = v end
+    })
+    A.espLibOn = gE:AddToggle("espLibOn", {
+        Text = "使用 MSESP 渲染", Default = cfg.espLib,
+        Tooltip = "关掉则退回内置 Drawing 绘制（会明显掉帧）。切换后需重载脚本才完全生效",
+        Callback = function(v) cfg.espLib = v end
+    })
     A.espMax = gE:AddSlider("espMaxDist", {
         Text = "最大绘制距离", Default = cfg.espMaxDist, Min = 30, Max = 600, Rounding = 0, Suffix = " studs",
         Tooltip = "超过就不画",
@@ -1016,9 +1236,11 @@ if Library then
         Tooltip = "方框/四角框的线条粗细",
         Callback = function(v)
             cfg.thickness = v
-            for _, s in ipairs(pool) do
-                s.square.Thickness = v
-                for j = 1, 8 do s.lines[j].Thickness = v end
+            if pool then
+                for _, s in ipairs(pool) do
+                    s.square.Thickness = v
+                    for j = 1, 8 do s.lines[j].Thickness = v end
+                end
             end
         end
     })
@@ -1034,7 +1256,10 @@ if Library then
     })
     A.espColorToggle:AddColorPicker("espColorPick", {
         Default = cfg.espColor, Title = "ESP 颜色",
-        Callback = function(c) cfg.espColor = c end
+        Callback = function(c)
+            cfg.espColor = c
+            ESPB.setColor(c)
+        end
     })
 
     local gS = Tabs.Status:AddLeftGroupbox("运行状态", "activity")
