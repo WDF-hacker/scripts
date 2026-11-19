@@ -150,6 +150,10 @@ local CFG = {
         x = 0,      -- 相对屏幕底部中线的偏移
         y = -45,
     },
+    traps = {
+        on = true,
+        maxDist = 400,
+    },
 }
 _G.HXCFG = CFG
 
@@ -1396,6 +1400,114 @@ local function updateAmmoHud()
 	cv.Visible = true
 end
 
+--[[
+    诡雷 / 陷阱高亮
+
+    实测 RoundObjects 里放的就是地面上的可交互物：
+        claymore_mine   ← 诡雷（踩上去炸的那种）
+        tesla_new       ← 特斯拉线圈（靠近就电）
+    它们在放进地图时是普通 Part，名字固定，直接按名字扫即可。
+
+    每 2 秒重扫一次：诡雷是玩家中途布置/引爆的，静态列表会过期。
+]]
+local TRAP_NAMES = {
+    claymore_mine = { label = "MINE", color = Color3.fromRGB(255, 60, 60) },
+    tesla_new = { label = "TESLA", color = Color3.fromRGB(255, 150, 40) },
+}
+
+local trapPool = {}
+local trapCache = {}
+local trapScanAt = 0
+
+local function scanTraps()
+    local list = {}
+    local root = workspace:FindFirstChild("RoundObjects")
+    if root then
+        for _, d in ipairs(root:GetChildren()) do
+            local info = TRAP_NAMES[d.Name]
+            if info and d:IsA("BasePart") then
+                list[#list + 1] = { part = d, label = info.label, color = info.color }
+            end
+        end
+    end
+    trapCache = list
+end
+
+local function trapSlot(i)
+    local s = trapPool[i]
+    if s then return s end
+    local o = {}
+    pcall(function()
+        o.box = Drawing.new("Square")
+        o.box.Thickness = 1.5
+        o.box.Filled = false
+        o.box.Transparency = 1
+        o.box.Visible = false
+
+        o.txt = Drawing.new("Text")
+        o.txt.Size = 13
+        o.txt.Center = true
+        o.txt.Outline = true
+        o.txt.OutlineColor = Color3.fromRGB(0, 0, 0)
+        o.txt.Visible = false
+    end)
+    protect(o.box)
+    protect(o.txt)
+    trapPool[i] = o
+    return o
+end
+
+local function drawTraps()
+    if not CFG.traps.on then
+        for i = 1, #trapPool do
+            pcall(function() trapPool[i].box.Visible = false end)
+            pcall(function() trapPool[i].txt.Visible = false end)
+        end
+        return
+    end
+
+    local now = os.clock()
+    if now - trapScanAt > 2 then
+        trapScanAt = now
+        scanTraps()
+    end
+
+    local cam = workspace.CurrentCamera
+    local camPos = cam.CFrame.Position
+    local n = 0
+
+    for i = 1, #trapCache do
+        local t = trapCache[i]
+        if t.part.Parent then
+            local dist = (t.part.Position - camPos).Magnitude
+            if dist <= CFG.traps.maxDist then
+                local sp, vis = project(t.part.Position + Vector3.new(0, 0.4, 0))
+                if sp and vis then
+                    n = n + 1
+                    local s = trapSlot(n)
+                    local half = math.clamp(1400 / math.max(dist, 4), 8, 46)
+                    pcall(function()
+                        s.box.Position = Vector2.new(sp.X - half, sp.Y - half)
+                        s.box.Size = Vector2.new(half * 2, half * 2)
+                        s.box.Color = t.color
+                        s.box.Visible = true
+
+                        s.txt.Text = string.format("%s %dm", t.label, math.floor(dist / 3.2))
+                        s.txt.Color = t.color
+                        s.txt.Position = Vector2.new(sp.X, sp.Y + half + 2)
+                        s.txt.Visible = true
+                    end)
+                end
+            end
+        end
+    end
+
+    for i = n + 1, #trapPool do
+        pcall(function() trapPool[i].box.Visible = false end)
+        pcall(function() trapPool[i].txt.Visible = false end)
+    end
+end
+
 local function render()
     if _G.__HX_TOKEN ~= TOKEN then return end
     local now = os.clock()
@@ -1423,6 +1535,7 @@ local function render()
     applyNav()
     applyPhase()
     updateAmmoHud()
+    drawTraps()
     if CFG.vis.tracers then drawTracers() end
 
     if CFG.aim.showFov and CFG.aim.on then
@@ -1719,6 +1832,15 @@ if Library then
         Text = "Ammo HUD", Default = CFG.ammo.on,
         Tooltip = "Mirrors the game's ammo readout as magazine / reserve above the crosshair",
         Callback = function(v) CFG.ammo.on = v end,
+    })
+    gP:AddToggle("trapOn", {
+        Text = "Trap ESP", Default = CFG.traps.on,
+        Tooltip = "Highlights claymore mines and tesla coils in RoundObjects with a box, label and distance",
+        Callback = function(v) CFG.traps.on = v end,
+    })
+    gP:AddSlider("trapDist", {
+        Text = "Trap range", Default = CFG.traps.maxDist, Min = 50, Max = 800, Rounding = 0, Suffix = " studs",
+        Callback = function(v) CFG.traps.maxDist = v end,
     })
     gP:AddSlider("ammoX", {
         Text = "Ammo X", Default = CFG.ammo.x, Min = -600, Max = 600, Rounding = 0, Suffix = " px",
