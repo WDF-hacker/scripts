@@ -89,10 +89,10 @@ local CFG = {
         mode = "hold",        -- hold / toggle / always
         key = Enum.KeyCode.Q,
         part = "Auto",        -- Auto: 人类打头；SCP 用 scpPart 指定的部位
-        scpPart = "Stomach",  -- SCP 的可视模型很小/很低，默认打腹部
+        scpPart = "Head",     -- 其它 SCP 一律打头（999 单独走下面的特殊分支）
         useVisual = false,    -- 同上，关闭
-        scpOffsetY = -1.5,    -- SCP 骨架比模型高，往下压一点才能打到实体
-        scp999OffsetY = -0.25, -- SCP-999 单独一档：命中盒是标准人形骨架，视觉是贴地果冻
+        scpOffsetY = -0.35,   -- 命中盒中心比视觉头顶高，往下压这么多
+        scp999OffsetY = 0.20, -- SCP-999：以腿部命中盒为基准再往上抬一点，贴住果冻
         fov = 12,             -- 角度制默认：近距离也不会被"像素圈"挡掉
         fovUnit = "deg",     -- deg / px
         smooth = 10,
@@ -660,14 +660,23 @@ local function partOf(t, cfg)
     --[[
         SCP-999 单独一档
 
-        实测它的命中盒是完全标准的人形骨架（Head +1.56 / Chest +0.50 /
-        Stomach -0.21 / 腿 -1.78，相对 root），但视觉模型是一坨贴地的果冻。
-        按头打必然从它头顶飞过去，所以固定瞄 Stomach（离地最近的大盒子），
-        再叠加一个独立偏移，UI 里单独可调。
+        实测它的命中盒是完整人形骨架（Head +1.56 / Chest +0.50 / Stomach -0.21 /
+        腿 -1.78，相对 root），但视觉模型是贴在地面的一坨果冻。
+        瞄 Stomach 仍然在它头顶上方（实测差 1.5 studs 以上），必须用腿的命中盒
+        当基准 —— 腿盒子中心已经接近地面，正好落在果冻身体里。
     ]]
     if cfg.part == "Auto" and string.find(tostring(t.role or ""), "999", 1, true) then
-        local low = hb:FindFirstChild("Stomach") or hb:FindFirstChild("Chest") or t.head
-        return low.Position + Vector3.new(0, cfg.scp999OffsetY or 0, 0)
+        local ll = hb:FindFirstChild("LeftLeg")
+        local rl = hb:FindFirstChild("RightLeg")
+        local base
+        if ll and rl then
+            base = (ll.Position + rl.Position) * 0.5
+        elseif ll or rl then
+            base = (ll or rl).Position
+        else
+            base = (hb:FindFirstChild("Stomach") or t.head).Position
+        end
+        return base + Vector3.new(0, cfg.scp999OffsetY or 0, 0)
     end
 
     local mode = cfg.part
@@ -1781,8 +1790,8 @@ if Library then
         Callback = function(v) CFG.aim.scpOffsetY = v end,
     })
     gA:AddSlider("aim999Off", {
-        Text = "SCP-999 offset", Default = CFG.aim.scp999OffsetY, Min = -2, Max = 2, Rounding = 2, Suffix = " studs",
-        Tooltip = "999 aims at its Stomach hitbox by default; use this to nudge onto the blob",
+        Text = "SCP-999 offset", Default = CFG.aim.scp999OffsetY, Min = -1.5, Max = 2, Rounding = 2, Suffix = " studs",
+        Tooltip = "999 aims at its leg hitboxes (ground level) by default; raise this if it sits too low",
         Callback = function(v) CFG.aim.scp999OffsetY = v end,
     })
     gA:AddSlider("aimOffY", {
