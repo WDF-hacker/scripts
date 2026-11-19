@@ -92,6 +92,7 @@ local CFG = {
         scpPart = "Stomach",  -- SCP 的可视模型很小/很低，默认打腹部
         useVisual = false,    -- 同上，关闭
         scpOffsetY = -1.5,    -- SCP 骨架比模型高，往下压一点才能打到实体
+        scp999OffsetY = -0.25, -- SCP-999 单独一档：命中盒是标准人形骨架，视觉是贴地果冻
         fov = 12,             -- 角度制默认：近距离也不会被"像素圈"挡掉
         fovUnit = "deg",     -- deg / px
         smooth = 10,
@@ -595,6 +596,7 @@ local function collect()
                             e.plr = plr
                             e.name = plr.Name
                             e.team = team
+                            e.role = tostring(plr:GetAttribute("Role") or "")
                             e.ally = ally
                             e.head = head
                             e.root = root2
@@ -654,6 +656,20 @@ local function partOf(t, cfg)
         return t.head.Position + t.vOff
     end
     local hb = t.head.Parent
+
+    --[[
+        SCP-999 单独一档
+
+        实测它的命中盒是完全标准的人形骨架（Head +1.56 / Chest +0.50 /
+        Stomach -0.21 / 腿 -1.78，相对 root），但视觉模型是一坨贴地的果冻。
+        按头打必然从它头顶飞过去，所以固定瞄 Stomach（离地最近的大盒子），
+        再叠加一个独立偏移，UI 里单独可调。
+    ]]
+    if cfg.part == "Auto" and string.find(tostring(t.role or ""), "999", 1, true) then
+        local low = hb:FindFirstChild("Stomach") or hb:FindFirstChild("Chest") or t.head
+        return low.Position + Vector3.new(0, cfg.scp999OffsetY or 0, 0)
+    end
+
     local mode = cfg.part
     if mode == "Random" then
         -- 按爆头率掷一次：命中就用 Head，否则 Chest
@@ -1763,6 +1779,11 @@ if Library then
         Text = "SCP aim offset", Default = CFG.aim.scpOffsetY, Min = -4, Max = 1, Rounding = 2, Suffix = " studs",
         Tooltip = "SCP hitbox rig is taller than the model; negative pulls the aim down onto the visible body",
         Callback = function(v) CFG.aim.scpOffsetY = v end,
+    })
+    gA:AddSlider("aim999Off", {
+        Text = "SCP-999 offset", Default = CFG.aim.scp999OffsetY, Min = -2, Max = 2, Rounding = 2, Suffix = " studs",
+        Tooltip = "999 aims at its Stomach hitbox by default; use this to nudge onto the blob",
+        Callback = function(v) CFG.aim.scp999OffsetY = v end,
     })
     gA:AddSlider("aimOffY", {
         Text = "Head offset", Default = CFG.aim.headOffset, Min = -1, Max = 1, Rounding = 2, Suffix = " studs",
