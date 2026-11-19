@@ -1451,8 +1451,8 @@ local function trapSlot(i)
         o.txt.OutlineColor = Color3.fromRGB(0, 0, 0)
         o.txt.Visible = false
     end)
-    protect(o.box)
-    protect(o.txt)
+    pcall(function() o.box.Streamproof = true end)
+    pcall(function() o.txt.Streamproof = true end)
     trapPool[i] = o
     return o
 end
@@ -1646,7 +1646,11 @@ local function render()
     end
 end
 
-local renderConn = RunService.RenderStepped:Connect(render)
+-- 包一层 pcall：render 里任何一处报错都不该让整条渲染循环断掉
+-- （上一版就是因为一个未定义函数直接抛错，连接被引擎断开，全部功能消失）
+local renderConn = RunService.RenderStepped:Connect(function()
+    pcall(render)
+end)
 local collectConn = task.spawn(function()
     while _G.__HX_TOKEN == TOKEN do
         local ok, err = pcall(collect)
