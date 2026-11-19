@@ -1412,12 +1412,19 @@ end
 ]]
 local TRAP_NAMES = {
     claymore_mine = { label = "MINE", color = Color3.fromRGB(255, 60, 60) },
-    tesla_new = { label = "TESLA", color = Color3.fromRGB(255, 150, 40) },
 }
 
 local trapPool = {}
 local trapCache = {}
 local trapScanAt = 0
+
+-- 上一代遗留的陷阱框必须清掉，否则重载一次就多留一层残影
+if _G.__HX_TRAP_DRAW then
+    for i = 1, #_G.__HX_TRAP_DRAW do
+        pcall(function() _G.__HX_TRAP_DRAW[i]:Remove() end)
+    end
+end
+_G.__HX_TRAP_DRAW = {}
 
 local function scanTraps()
     local list = {}
@@ -1453,6 +1460,10 @@ local function trapSlot(i)
     end)
     pcall(function() o.box.Streamproof = true end)
     pcall(function() o.txt.Streamproof = true end)
+    if _G.__HX_TRAP_DRAW then
+        _G.__HX_TRAP_DRAW[#_G.__HX_TRAP_DRAW + 1] = o.box
+        _G.__HX_TRAP_DRAW[#_G.__HX_TRAP_DRAW + 1] = o.txt
+    end
     trapPool[i] = o
     return o
 end
@@ -1938,6 +1949,12 @@ _G.HX_UNLOAD = function()
     if _G.__HX_AMMO_DRAW then
         pcall(function() _G.__HX_AMMO_DRAW:Remove() end)
         _G.__HX_AMMO_DRAW = nil
+    end
+    if _G.__HX_TRAP_DRAW then
+        for i = 1, #_G.__HX_TRAP_DRAW do
+            pcall(function() _G.__HX_TRAP_DRAW[i]:Remove() end)
+        end
+        _G.__HX_TRAP_DRAW = nil
     end
     _G.HX_UNLOAD = nil
     print("[HX] unloaded")
