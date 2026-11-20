@@ -1644,13 +1644,42 @@ local function crouchReset()
     crouchDown = false
 end
 
--- 真正生效的补偿：游戏相机在更早的优先级写完，我们在这个之后把 Y 顶回去
+--[[
+    相机高度补偿（自适应版）
+
+    固定 0.45 顶不住，因为每个角色蹲下时相机实际下沉多少并不固定，
+    而且相机本身可能有平滑/插值，逐帧还会抖。
+
+    这里改成动态测量：站立的那一半周期里记录"相机相对角色根部的高度"，
+    蹲下的那一半周期把这个相对高度强行补回去。这样不管实际下沉多少、
+    相机有没有插值，看到的高度都是站立的那个。
+]]
+local standRelY = nil
+
 __crouchCameraFix = function()
-    if not (CFG.crouch.on and CFG.crouch.keepCam and crouchDown) then return end
+    if not (CFG.crouch.on and CFG.crouch.keepCam) then
+        standRelY = nil
+        return
+    end
     local cam = workspace.CurrentCamera
-    if not cam then return end
-    local lift = tonumber(CFG.crouch.camY) or 0.45
-    cam.CFrame = cam.CFrame * CFrame.new(0, lift, 0)
+    local ch = lp.Character
+    local root = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not (cam and root) then return end
+
+    local rel = cam.CFrame.Position.Y - root.Position.Y
+
+    -- 基准 = 见过的最高相对高度（站立姿态），只缓慢回落，避免基准漂移
+    if not standRelY or rel > standRelY then
+        standRelY = rel
+    else
+        standRelY = standRelY + (rel - standRelY) * 0.002
+    end
+
+    -- 低于基准就补回去，蹲下多少补多少，不依赖开关状态，也没有档位跳变
+    local lift = standRelY - rel
+    if lift > 0.008 then
+        cam.CFrame = cam.CFrame * CFrame.new(0, lift, 0)
+    end
 end
 
 local function applyCrouch()
