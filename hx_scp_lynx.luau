@@ -158,11 +158,9 @@ local CFG = {
     move = {
         speedMul = 1.0,     -- 1.0 = 原速；写入 runSpeed / walkSpeed 属性
     },
-    crouch = {
-        on = false,
-        hz = 8,             -- 每秒蹲起次数
-        keepCam = true,     -- 蹲下时补偿视角高度
-        camY = 0.45,        -- 补偿量（studs）
+    hp = {
+        on = false,         -- 只影响本地显示，服务器血量照样扣
+        value = 150,
     },
 }
 _G.HXCFG = CFG
@@ -1030,16 +1028,9 @@ local function __aimTick(dt)
     end
 end
 
--- 先占位，真正的实现在下方的蹲起模块里赋值（同一个 upvalue）
-local __crouchCameraFix = function() end
-
 RunService:BindToRenderStep("HX_AIM", Enum.RenderPriority.Camera.Value + 1, function(dt)
     local okT, eT = pcall(__aimTick, dt)
     if not okT then _G.HX_AIM_ERR = tostring(eT) end
-    -- 蹲起时把相机顶回站立高度：游戏的相机写在更早的优先级，
-    -- 这里在 Camera+1 直接改 CFrame，才是真正生效的那一次写入
-    local okC, eC = pcall(__crouchCameraFix)
-    if not okC then _G.HX_CAM_ERR = tostring(eC) end
 end)
 
 -- =====================  渲染  =====================
@@ -1616,90 +1607,38 @@ local function applyMove()
 end
 
 --[[
-    蹲起 spam
+    血量锁（测试用）
 
-    游戏里蹲下是 Controller 每帧读 Keybinds.down("key_crouch") 得到的，
-    而 Keybinds 直接暴露了 press / release，所以可以不用发系统按键，
-    直接推进它自己的按键状态。
-
-    视角补偿：Controller.setViewOffset(CFrame) 写的是一个作用在相机上的偏移
-    （内部就是 CFrame_identity = p161）。蹲下时相机跟着角色下沉，
-    这里在蹲下期间塞一个 +Y 的偏移把它顶回去，起身时归零。
+    血的真相：Humanoid 在客户端能随便写，但那只是本地显示。
+    服务器算伤害、判死亡，全程不看客户端这个数字。
+    这里保留一个开关，方便你自己验证——开着它挨打，看血量是被顶回满值，
+    还是直接被服务器推下来的真实值覆盖。
 ]]
-local KB = nil
-local CTRL = nil
-do
-    local ok = pcall(function()
-        KB = require(lp.PlayerScripts.Client.Core.Keybinds)
-        CTRL = require(lp.PlayerScripts.Client.Core.Controller)
-    end)
-    if not ok then KB, CTRL = nil, nil end
-end
+local hpNext = 0
+local hpLogged = 0
 
-local crouchDown = false
-local crouchNext = 0
-
-local function crouchReset()
-    if KB and KB.release then pcall(function() KB.release("key_crouch") end) end
-    crouchDown = false
-end
-
---[[
-    相机高度补偿（自适应版）
-
-    固定 0.45 顶不住，因为每个角色蹲下时相机实际下沉多少并不固定，
-    而且相机本身可能有平滑/插值，逐帧还会抖。
-
-    这里改成动态测量：站立的那一半周期里记录"相机相对角色根部的高度"，
-    蹲下的那一半周期把这个相对高度强行补回去。这样不管实际下沉多少、
-    相机有没有插值，看到的高度都是站立的那个。
-]]
-local standRelY = nil
-
-__crouchCameraFix = function()
-    if not (CFG.crouch.on and CFG.crouch.keepCam) then
-        standRelY = nil
-        return
-    end
-    local cam = workspace.CurrentCamera
-    local ch = lp.Character
-    local root = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not (cam and root) then return end
-
-    local rel = cam.CFrame.Position.Y - root.Position.Y
-
-    -- 基准 = 见过的最高相对高度（站立姿态），只缓慢回落，避免基准漂移
-    if not standRelY or rel > standRelY then
-        standRelY = rel
-    else
-        standRelY = standRelY + (rel - standRelY) * 0.002
-    end
-
-    -- 低于基准就补回去，蹲下多少补多少，不依赖开关状态，也没有档位跳变
-    local lift = standRelY - rel
-    if lift > 0.008 then
-        cam.CFrame = cam.CFrame * CFrame.new(0, lift, 0)
-    end
-end
-
-local function applyCrouch()
-    if not (KB and KB.press and KB.release) then return end
-
-    if not CFG.crouch.on then
-        if crouchDown then crouchReset() end
-        return
-    end
-
+local function applyHealth()
+    if not CFG.hp.on then return end
     local now = os.clock()
-    if now < crouchNext then return end
-    local hz = math.max(1, tonumber(CFG.crouch.hz) or 8)
-    crouchNext = now + 0.5 / hz
+    if now < hpNext then return end
+    hpNext = now + 0.1
 
-    crouchDown = not crouchDown
-    if crouchDown then
-        pcall(function() KB.press("key_crouch") end)
-    else
-        pcall(function() KB.release("key_crouch") end)
+    local ch = lp.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    local want = tonumber(CFG.hp.value) or 150
+    if hum.MaxHealth ~= want then
+        pcall(function() hum.MaxHealth = want end)
+    end
+    if hum.Health < want then
+        pcall(function() hum.Health = want end)
+    end
+
+    -- 每 2 秒打一行，用来看服务器有没有把真实血量推下来
+    if now - hpLogged > 2 then
+        hpLogged = now
+        _G.HX_HP_DEBUG = string.format("hp=%.0f max=%.0f", hum.Health, hum.MaxHealth)
     end
 end
 
@@ -1729,7 +1668,7 @@ local function render()
     applyNoRecoil()
     applyNav()
     applyMove()
-    applyCrouch()
+    applyHealth()
     applyPhase()
     updateAmmoHud()
     drawTraps()
@@ -2049,27 +1988,14 @@ if Library then
         Tooltip = "Writes runSpeed / walkSpeed attributes; Controller re-syncs on AttributeChanged, so it applies instantly",
         Callback = function(v) CFG.move.speedMul = v end,
     })
-    gP:AddToggle("crouchOn", {
-        Text = "Crouch spam", Default = CFG.crouch.on,
-        Tooltip = "Rapidly taps the game's crouch key through Keybinds; toggles the duck state so the hitbox keeps moving",
-        Callback = function(v)
-            CFG.crouch.on = v
-            if not v then crouchReset() end
-        end,
+    gP:AddToggle("hpOn", {
+        Text = "Health lock (test)", Default = CFG.hp.on,
+        Tooltip = "Writes Humanoid.MaxHealth/Health locally so you can see whether the server overwrites it",
+        Callback = function(v) CFG.hp.on = v end,
     })
-    gP:AddSlider("crouchHz", {
-        Text = "Crouch Hz", Default = CFG.crouch.hz, Min = 2, Max = 20, Rounding = 0,
-        Tooltip = "Crouch/stand cycles per second; 8 is already faster than any human tap",
-        Callback = function(v) CFG.crouch.hz = v end,
-    })
-    gP:AddToggle("crouchCam", {
-        Text = "Keep view height", Default = CFG.crouch.keepCam,
-        Tooltip = "Pushes the camera back up while ducked via Controller.setViewOffset, so the screen does not bob",
-        Callback = function(v) CFG.crouch.keepCam = v end,
-    })
-    gP:AddSlider("crouchCamY", {
-        Text = "View lift", Default = CFG.crouch.camY, Min = 0, Max = 1.5, Rounding = 2, Suffix = " studs",
-        Callback = function(v) CFG.crouch.camY = v end,
+    gP:AddSlider("hpVal", {
+        Text = "Health value", Default = CFG.hp.value, Min = 100, Max = 1000, Rounding = 0,
+        Callback = function(v) CFG.hp.value = v end,
     })
     gP:AddSlider("trapDist", {
         Text = "Trap range", Default = CFG.traps.maxDist, Min = 50, Max = 800, Rounding = 0, Suffix = " studs",
