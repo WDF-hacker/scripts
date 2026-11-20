@@ -158,6 +158,12 @@ local CFG = {
     move = {
         speedMul = 1.0,     -- 1.0 = 原速；写入 runSpeed / walkSpeed 属性
     },
+    crouch = {
+        on = false,
+        hz = 8,             -- 每秒蹲起次数
+        keepCam = true,     -- 蹲下时补偿视角高度
+        camY = 0.45,        -- 补偿量（studs）
+    },
 }
 _G.HXCFG = CFG
 
@@ -1602,6 +1608,64 @@ local function applyMove()
     end
 end
 
+--[[
+    蹲起 spam
+
+    游戏里蹲下是 Controller 每帧读 Keybinds.down("key_crouch") 得到的，
+    而 Keybinds 直接暴露了 press / release，所以可以不用发系统按键，
+    直接推进它自己的按键状态。
+
+    视角补偿：Controller.setViewOffset(CFrame) 写的是一个作用在相机上的偏移
+    （内部就是 CFrame_identity = p161）。蹲下时相机跟着角色下沉，
+    这里在蹲下期间塞一个 +Y 的偏移把它顶回去，起身时归零。
+]]
+local KB = nil
+local CTRL = nil
+do
+    local ok = pcall(function()
+        KB = require(lp.PlayerScripts.Client.Core.Keybinds)
+        CTRL = require(lp.PlayerScripts.Client.Core.Controller)
+    end)
+    if not ok then KB, CTRL = nil, nil end
+end
+
+local crouchDown = false
+local crouchNext = 0
+
+local function crouchReset()
+    if KB and KB.release then pcall(function() KB.release("key_crouch") end) end
+    if CTRL and CTRL.setViewOffset then
+        pcall(function() CTRL.setViewOffset(CFrame.new()) end)
+    end
+    crouchDown = false
+end
+
+local function applyCrouch()
+    if not (KB and KB.press and KB.release) then return end
+
+    if not CFG.crouch.on then
+        if crouchDown then crouchReset() end
+        return
+    end
+
+    local now = os.clock()
+    if now < crouchNext then return end
+    local hz = math.max(1, tonumber(CFG.crouch.hz) or 8)
+    crouchNext = now + 0.5 / hz
+
+    crouchDown = not crouchDown
+    if crouchDown then
+        pcall(function() KB.press("key_crouch") end)
+    else
+        pcall(function() KB.release("key_crouch") end)
+    end
+
+    if CFG.crouch.keepCam and CTRL and CTRL.setViewOffset then
+        local lift = crouchDown and (tonumber(CFG.crouch.camY) or 0.45) or 0
+        pcall(function() CTRL.setViewOffset(CFrame.new(0, lift, 0)) end)
+    end
+end
+
 local function render()
     if _G.__HX_TOKEN ~= TOKEN then return end
     local now = os.clock()
@@ -1628,6 +1692,7 @@ local function render()
     applyNoRecoil()
     applyNav()
     applyMove()
+    applyCrouch()
     applyPhase()
     updateAmmoHud()
     drawTraps()
@@ -1946,6 +2011,28 @@ if Library then
         Text = "Speed multiplier", Default = CFG.move.speedMul, Min = 1, Max = 3, Rounding = 1, Suffix = "x",
         Tooltip = "Writes runSpeed / walkSpeed attributes; Controller re-syncs on AttributeChanged, so it applies instantly",
         Callback = function(v) CFG.move.speedMul = v end,
+    })
+    gP:AddToggle("crouchOn", {
+        Text = "Crouch spam", Default = CFG.crouch.on,
+        Tooltip = "Rapidly taps the game's crouch key through Keybinds; toggles the duck state so the hitbox keeps moving",
+        Callback = function(v)
+            CFG.crouch.on = v
+            if not v then crouchReset() end
+        end,
+    })
+    gP:AddSlider("crouchHz", {
+        Text = "Crouch Hz", Default = CFG.crouch.hz, Min = 2, Max = 20, Rounding = 0,
+        Tooltip = "Crouch/stand cycles per second; 8 is already faster than any human tap",
+        Callback = function(v) CFG.crouch.hz = v end,
+    })
+    gP:AddToggle("crouchCam", {
+        Text = "Keep view height", Default = CFG.crouch.keepCam,
+        Tooltip = "Pushes the camera back up while ducked via Controller.setViewOffset, so the screen does not bob",
+        Callback = function(v) CFG.crouch.keepCam = v end,
+    })
+    gP:AddSlider("crouchCamY", {
+        Text = "View lift", Default = CFG.crouch.camY, Min = 0, Max = 1.5, Rounding = 2, Suffix = " studs",
+        Callback = function(v) CFG.crouch.camY = v end,
     })
     gP:AddSlider("trapDist", {
         Text = "Trap range", Default = CFG.traps.maxDist, Min = 50, Max = 800, Rounding = 0, Suffix = " studs",
