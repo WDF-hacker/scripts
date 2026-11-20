@@ -158,6 +158,10 @@ local CFG = {
     move = {
         speedMul = 1.0,     -- 1.0 = 原速；写入 runSpeed / walkSpeed 属性
     },
+    fire = {
+        on = false,
+        delay = 0.05,       -- 秒/发；0.05 ≈ 20 发/秒
+    },
 }
 _G.HXCFG = CFG
 
@@ -1333,6 +1337,48 @@ local function getGunData()
 	return gunDataCache
 end
 
+--[[
+    射速
+
+    Guns 模块里开火节奏是客户端自己卡的：
+
+        v170 = u160.fireDelay;
+        u11 = os_clock_ret + v170;     -- 下一次允许开火的时间
+
+    所以把 GunData.guns[id].fireDelay 改小，客户端就会发得更快。
+    服务器会不会拒绝连发超出它的预期，只能实测——先给个保守档位。
+]]
+local fireOrig = {}
+
+local function applyFireRate()
+    local GD = getGunData()
+    if not GD or not GD.guns then return end
+
+    local item = tostring(lp:GetAttribute("ActiveItem") or "")
+
+    if not CFG.fire.on then
+        for id, orig in pairs(fireOrig) do
+            local w = GD.guns[id]
+            if w and type(orig) == "number" then
+                pcall(function() w.fireDelay = orig end)
+            end
+        end
+        table.clear(fireOrig)
+        return
+    end
+
+    local w = GD.guns[item]
+    if not w or type(w.fireDelay) ~= "number" then return end
+
+    if fireOrig[item] == nil then fireOrig[item] = w.fireDelay end
+    local want = tonumber(CFG.fire.delay) or 0.05
+    if want < 0.02 then want = 0.02 end
+    if w.fireDelay ~= want then
+        local ok = pcall(function() w.fireDelay = want end)
+        if not ok then _G.HX_FIRE_ERR = tostring(item) end
+    end
+end
+
 local function findAmmoLabel()
 	local gui = lp:FindFirstChild("PlayerGui")
 	if not gui then return nil end
@@ -1653,6 +1699,7 @@ local function render()
     applyNoRecoil()
     applyNav()
     applyMove()
+    applyFireRate()
     applyPhase()
     updateAmmoHud()
     drawTraps()
@@ -1971,6 +2018,15 @@ if Library then
         Text = "Speed multiplier", Default = CFG.move.speedMul, Min = 1, Max = 2, Rounding = 1, Suffix = "x",
         Tooltip = "Scales runSpeed / walkSpeed from a captured baseline; capped at 2x so it cannot compound",
         Callback = function(v) CFG.move.speedMul = v end,
+    })
+    gP:AddToggle("fireOn", {
+        Text = "Fast fire", Default = CFG.fire.on,
+        Tooltip = "Lowers GunData fireDelay for the held weapon so the client sends shots faster; server may or may not accept",
+        Callback = function(v) CFG.fire.on = v end,
+    })
+    gP:AddSlider("fireDelay", {
+        Text = "Fire delay", Default = CFG.fire.delay, Min = 0.02, Max = 0.10, Rounding = 3, Suffix = " s",
+        Callback = function(v) CFG.fire.delay = v end,
     })
     gP:AddSlider("trapDist", {
         Text = "Trap range", Default = CFG.traps.maxDist, Min = 50, Max = 800, Rounding = 0, Suffix = " studs",
