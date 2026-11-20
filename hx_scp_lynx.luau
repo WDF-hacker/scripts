@@ -1030,9 +1030,16 @@ local function __aimTick(dt)
     end
 end
 
+-- 先占位，真正的实现在下方的蹲起模块里赋值（同一个 upvalue）
+local __crouchCameraFix = function() end
+
 RunService:BindToRenderStep("HX_AIM", Enum.RenderPriority.Camera.Value + 1, function(dt)
     local okT, eT = pcall(__aimTick, dt)
     if not okT then _G.HX_AIM_ERR = tostring(eT) end
+    -- 蹲起时把相机顶回站立高度：游戏的相机写在更早的优先级，
+    -- 这里在 Camera+1 直接改 CFrame，才是真正生效的那一次写入
+    local okC, eC = pcall(__crouchCameraFix)
+    if not okC then _G.HX_CAM_ERR = tostring(eC) end
 end)
 
 -- =====================  渲染  =====================
@@ -1634,10 +1641,16 @@ local crouchNext = 0
 
 local function crouchReset()
     if KB and KB.release then pcall(function() KB.release("key_crouch") end) end
-    if CTRL and CTRL.setViewOffset then
-        pcall(function() CTRL.setViewOffset(CFrame.new()) end)
-    end
     crouchDown = false
+end
+
+-- 真正生效的补偿：游戏相机在更早的优先级写完，我们在这个之后把 Y 顶回去
+__crouchCameraFix = function()
+    if not (CFG.crouch.on and CFG.crouch.keepCam and crouchDown) then return end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local lift = tonumber(CFG.crouch.camY) or 0.45
+    cam.CFrame = cam.CFrame * CFrame.new(0, lift, 0)
 end
 
 local function applyCrouch()
@@ -1658,11 +1671,6 @@ local function applyCrouch()
         pcall(function() KB.press("key_crouch") end)
     else
         pcall(function() KB.release("key_crouch") end)
-    end
-
-    if CFG.crouch.keepCam and CTRL and CTRL.setViewOffset then
-        local lift = crouchDown and (tonumber(CFG.crouch.camY) or 0.45) or 0
-        pcall(function() CTRL.setViewOffset(CFrame.new(0, lift, 0)) end)
     end
 end
 
