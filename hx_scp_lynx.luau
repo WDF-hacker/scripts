@@ -1564,45 +1564,64 @@ end
 ]]
 pcall(function() lp:SetAttribute("PassDoors", false) end)
 
+-- 出厂值：只在属性明显被污染时用来兜底（游戏本身会按角色/等级下发不同数值）
+local MOVE_DEFAULTS = { run = 214.83, walk = 100, slow = 70, jump = 200 }
+
 local moveBase = nil
 local moveNext = 0
+
+-- 判定一个值是否可信：超出合理区间说明是之前反复相乘留下的脏数据
+local function saneBase()
+    local run = lp:GetAttribute("runSpeed")
+    local walk = lp:GetAttribute("walkSpeed")
+    if type(run) ~= "number" or type(walk) ~= "number" then return nil end
+    if run < 80 or run > 400 then return nil end
+    if walk < 40 or walk > 400 then return nil end
+    return { run = run, walk = walk }
+end
+
+local function captureBase()
+    local b = saneBase()
+    if not b then
+        -- 已经脏了：先写回出厂值，再拿它当基准
+        b = { run = MOVE_DEFAULTS.run, walk = MOVE_DEFAULTS.walk }
+        pcall(function()
+            lp:SetAttribute("runSpeed", b.run)
+            lp:SetAttribute("walkSpeed", b.walk)
+            lp:SetAttribute("slowWalkSpeed", MOVE_DEFAULTS.slow)
+            lp:SetAttribute("jumpPower", MOVE_DEFAULTS.jump)
+        end)
+        print("[HX] move attrs were corrupted, reset to defaults")
+    end
+    moveBase = b
+    _G.HX_MOVE_BASE = b
+end
+
+captureBase()
+lp.CharacterAdded:Connect(function()
+    task.wait(0.4)
+    moveBase = nil
+    captureBase()
+end)
 
 local function applyMove()
     local now = os.clock()
     if now < moveNext then return end
     moveNext = now + 0.2
 
-    local mul = tonumber(CFG.move.speedMul) or 1
+    local mul = math.clamp(tonumber(CFG.move.speedMul) or 1, 1, 2)
+    if not moveBase then captureBase() end
+    if not moveBase then return end
 
-    -- 首次启用时记住原始值，关掉时好还原
-    if mul ~= 1 and not moveBase then
-        moveBase = {
-            run = lp:GetAttribute("runSpeed"),
-            walk = lp:GetAttribute("walkSpeed"),
-        }
+    -- 目标值永远由「基准 × 倍率」算出来，不会层层相乘
+    local runTarget = math.floor(moveBase.run * mul + 0.5)
+    local walkTarget = math.floor(moveBase.walk * mul + 0.5)
+
+    if lp:GetAttribute("runSpeed") ~= runTarget then
+        pcall(function() lp:SetAttribute("runSpeed", runTarget) end)
     end
-
-    if mul ~= 1 and moveBase then
-        if type(moveBase.run) == "number" then
-            local target = math.floor(moveBase.run * mul + 0.5)
-            if lp:GetAttribute("runSpeed") ~= target then
-                pcall(function() lp:SetAttribute("runSpeed", target) end)
-            end
-        end
-        if type(moveBase.walk) == "number" then
-            local target = math.floor(moveBase.walk * mul + 0.5)
-            if lp:GetAttribute("walkSpeed") ~= target then
-                pcall(function() lp:SetAttribute("walkSpeed", target) end)
-            end
-        end
-    elseif mul == 1 and moveBase then
-        if type(moveBase.run) == "number" and lp:GetAttribute("runSpeed") ~= moveBase.run then
-            pcall(function() lp:SetAttribute("runSpeed", moveBase.run) end)
-        end
-        if type(moveBase.walk) == "number" and lp:GetAttribute("walkSpeed") ~= moveBase.walk then
-            pcall(function() lp:SetAttribute("walkSpeed", moveBase.walk) end)
-        end
-        moveBase = nil
+    if lp:GetAttribute("walkSpeed") ~= walkTarget then
+        pcall(function() lp:SetAttribute("walkSpeed", walkTarget) end)
     end
 end
 
@@ -1984,8 +2003,8 @@ if Library then
         Callback = function(v) CFG.traps.on = v end,
     })
     gP:AddSlider("moveMul", {
-        Text = "Speed multiplier", Default = CFG.move.speedMul, Min = 1, Max = 3, Rounding = 1, Suffix = "x",
-        Tooltip = "Writes runSpeed / walkSpeed attributes; Controller re-syncs on AttributeChanged, so it applies instantly",
+        Text = "Speed multiplier", Default = CFG.move.speedMul, Min = 1, Max = 2, Rounding = 1, Suffix = "x",
+        Tooltip = "Scales runSpeed / walkSpeed from a captured baseline; capped at 2x so it cannot compound",
         Callback = function(v) CFG.move.speedMul = v end,
     })
     gP:AddToggle("hpOn", {
