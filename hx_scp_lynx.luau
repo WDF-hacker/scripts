@@ -157,7 +157,6 @@ local CFG = {
     },
     move = {
         speedMul = 1.0,     -- 1.0 = 原速；写入 runSpeed / walkSpeed 属性
-        passDoors = false,  -- 写 PassDoors，让 MovementTrace 忽略门
     },
 }
 _G.HXCFG = CFG
@@ -1556,12 +1555,11 @@ end
     而 syncParams 会把 runSpeed / walkSpeed 等属性重新读进移动配置。
     所以直接写属性就能改速度，不需要重生、不需要 hook。
 
-    PassDoors 更直接：
-        MovementTrace.setPassDoors(LocalPlayer:GetAttribute("PassDoors") == true)
-    本地置 true，移动射线就跳过门。
-
-    两者都只写在本地玩家实例上，不会同步到服务器。
+    注意：PassDoors 那套已经删了 —— 实测本地置 true 能穿门，但服务器有位置校验，
+    穿过去会被拉回，而且关掉开关后属性不回滚会一直生效。这里在加载时强制清一次。
 ]]
+pcall(function() lp:SetAttribute("PassDoors", false) end)
+
 local moveBase = nil
 local moveNext = 0
 
@@ -1571,14 +1569,12 @@ local function applyMove()
     moveNext = now + 0.2
 
     local mul = tonumber(CFG.move.speedMul) or 1
-    local wantDoors = CFG.move.passDoors
 
     -- 首次启用时记住原始值，关掉时好还原
-    if (mul ~= 1 or wantDoors) and not moveBase then
+    if mul ~= 1 and not moveBase then
         moveBase = {
             run = lp:GetAttribute("runSpeed"),
             walk = lp:GetAttribute("walkSpeed"),
-            doors = lp:GetAttribute("PassDoors"),
         }
     end
 
@@ -1595,27 +1591,13 @@ local function applyMove()
                 pcall(function() lp:SetAttribute("walkSpeed", target) end)
             end
         end
-    elseif mul == 1 and moveBase and type(moveBase.run) == "number" then
-        if lp:GetAttribute("runSpeed") ~= moveBase.run then
+    elseif mul == 1 and moveBase then
+        if type(moveBase.run) == "number" and lp:GetAttribute("runSpeed") ~= moveBase.run then
             pcall(function() lp:SetAttribute("runSpeed", moveBase.run) end)
         end
-        if lp:GetAttribute("walkSpeed") ~= moveBase.walk then
+        if type(moveBase.walk) == "number" and lp:GetAttribute("walkSpeed") ~= moveBase.walk then
             pcall(function() lp:SetAttribute("walkSpeed", moveBase.walk) end)
         end
-    end
-
-    if wantDoors then
-        if lp:GetAttribute("PassDoors") ~= true then
-            pcall(function() lp:SetAttribute("PassDoors", true) end)
-        end
-    elseif moveBase and moveBase.doors ~= nil then
-        if lp:GetAttribute("PassDoors") ~= moveBase.doors then
-            pcall(function() lp:SetAttribute("PassDoors", moveBase.doors) end)
-        end
-    end
-
-    -- 全部关掉后释放基准值，让下次重新采样
-    if mul == 1 and not wantDoors and moveBase and type(moveBase.run) ~= "number" then
         moveBase = nil
     end
 end
@@ -1964,11 +1946,6 @@ if Library then
         Text = "Speed multiplier", Default = CFG.move.speedMul, Min = 1, Max = 3, Rounding = 1, Suffix = "x",
         Tooltip = "Writes runSpeed / walkSpeed attributes; Controller re-syncs on AttributeChanged, so it applies instantly",
         Callback = function(v) CFG.move.speedMul = v end,
-    })
-    gP:AddToggle("moveDoors", {
-        Text = "Pass doors", Default = CFG.move.passDoors,
-        Tooltip = "Sets the PassDoors attribute locally so MovementTrace ignores locked doors",
-        Callback = function(v) CFG.move.passDoors = v end,
     })
     gP:AddSlider("trapDist", {
         Text = "Trap range", Default = CFG.traps.maxDist, Min = 50, Max = 800, Rounding = 0, Suffix = " studs",
