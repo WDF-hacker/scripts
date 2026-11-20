@@ -158,10 +158,6 @@ local CFG = {
     move = {
         speedMul = 1.0,     -- 1.0 = 原速；写入 runSpeed / walkSpeed 属性
     },
-    hp = {
-        on = false,         -- 只影响本地显示，服务器血量照样扣
-        value = 150,
-    },
 }
 _G.HXCFG = CFG
 
@@ -1626,41 +1622,6 @@ local function applyMove()
 end
 
 --[[
-    血量锁（测试用）
-
-    血的真相：Humanoid 在客户端能随便写，但那只是本地显示。
-    服务器算伤害、判死亡，全程不看客户端这个数字。
-    这里保留一个开关，方便你自己验证——开着它挨打，看血量是被顶回满值，
-    还是直接被服务器推下来的真实值覆盖。
-]]
-local hpNext = 0
-local hpLogged = 0
-
-local function applyHealth()
-    if not CFG.hp.on then return end
-    local now = os.clock()
-    if now < hpNext then return end
-    hpNext = now + 0.1
-
-    local ch = lp.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-
-    local want = tonumber(CFG.hp.value) or 150
-    if hum.MaxHealth ~= want then
-        pcall(function() hum.MaxHealth = want end)
-    end
-    if hum.Health < want then
-        pcall(function() hum.Health = want end)
-    end
-
-    -- 每 2 秒打一行，用来看服务器有没有把真实血量推下来
-    if now - hpLogged > 2 then
-        hpLogged = now
-        _G.HX_HP_DEBUG = string.format("hp=%.0f max=%.0f", hum.Health, hum.MaxHealth)
-    end
-end
-
 local function render()
     if _G.__HX_TOKEN ~= TOKEN then return end
     local now = os.clock()
@@ -1687,7 +1648,6 @@ local function render()
     applyNoRecoil()
     applyNav()
     applyMove()
-    applyHealth()
     applyPhase()
     updateAmmoHud()
     drawTraps()
@@ -2006,15 +1966,6 @@ if Library then
         Text = "Speed multiplier", Default = CFG.move.speedMul, Min = 1, Max = 2, Rounding = 1, Suffix = "x",
         Tooltip = "Scales runSpeed / walkSpeed from a captured baseline; capped at 2x so it cannot compound",
         Callback = function(v) CFG.move.speedMul = v end,
-    })
-    gP:AddToggle("hpOn", {
-        Text = "Health lock (test)", Default = CFG.hp.on,
-        Tooltip = "Writes Humanoid.MaxHealth/Health locally so you can see whether the server overwrites it",
-        Callback = function(v) CFG.hp.on = v end,
-    })
-    gP:AddSlider("hpVal", {
-        Text = "Health value", Default = CFG.hp.value, Min = 100, Max = 1000, Rounding = 0,
-        Callback = function(v) CFG.hp.value = v end,
     })
     gP:AddSlider("trapDist", {
         Text = "Trap range", Default = CFG.traps.maxDist, Min = 50, Max = 800, Rounding = 0, Suffix = " studs",
