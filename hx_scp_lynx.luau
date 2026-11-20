@@ -1622,6 +1622,11 @@ local function applyMove()
 end
 
 --[[
+    渲染循环
+
+    每帧：更新特效、应用各模块补丁、画 ESP / 陷阱 / 弹药 HUD。
+    refreshHz 控制最小间隔，避免高频重绘。
+]]
 local function render()
     if _G.__HX_TOKEN ~= TOKEN then return end
     local now = os.clock()
