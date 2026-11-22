@@ -65,6 +65,7 @@ end
 -- 配置
 ------------------------------------------------------------------
 local CONFIG_FILE = "hush_ammo_config.txt"
+local BOUGHT_FILE = "hush_ammo_bought.txt"   -- 已买数量，重连/重载后不丢
 local LIB_FILE = "obsidian_Library.lua"
 
 local CFG = {
@@ -98,7 +99,9 @@ local S = {
     dead = false,
     bought = 0,            -- 本次累计发数（所有弹种求和）
     spent = 0,
-    boughtBy = {},         -- [商品名] = 本次已买发数
+    boughtBy = {},         -- [商品名] = 已买发数（持久化）
+    spentBy = {},          -- [商品名] = 已花金额（持久化）
+    boughtDirty = false,   -- 有待落盘的已买记录
     products = {},         -- [calId] = { {name, short, key, count, price, stock, perRound, soldOut} }
     nameToCal = {},        -- [商品名] = calId，配置里保留，弹种下架后也能定位口径
     currentCal = nil,      -- 当前正在处理的口径
@@ -115,6 +118,9 @@ local S = {
     restockAt = nil,
     nextRescanAt = 0,
     needRescan = false,
+    lastNavAt = 0,         -- 上次尝试自动进入购买页的时间
+    lastDismissAt = 0,     -- 上次扫描弹窗的时间
+    ammoTried = false,     -- AMMO 分类整个 session 只点一次
     savePending = false,
     lastSaveAt = 0,
     loadedFromFile = false,
@@ -202,20 +208,60 @@ local function click(btn)
     return true
 end
 
-local function clickByText(root, wantText)
-    local want = string.upper(wantText)
+-- 游戏 UI 的文案全部带字距动画（"S K I P" / "T R A D E R S"），
+-- 直接比对永远不相等，必须先去掉所有非字母数字字符
+local function normText(s)
+    return (tostring(s or ""):upper():gsub("[^%w]", ""))
+end
+
+local function findClickable(want, root)
+    local w = normText(want)
+    if not root then return nil end
     for _, d in ipairs(root:GetDescendants()) do
-        if d:IsA("TextButton") then
-            if string.upper(textOf(d)) == want then return click(d), d end
+        if d:IsA("GuiButton") then
+            if normText(textOf(d)) == w then return d end
             for _, c in ipairs(d:GetDescendants()) do
-                if c:IsA("TextLabel") and string.upper(textOf(c)) == want then
-                    return click(d), d
-                end
+                if c:IsA("TextLabel") and normText(textOf(c)) == w then return d end
             end
+        elseif d:IsA("TextLabel") and normText(textOf(d)) == w then
+            -- 有些入口本身就是 TextLabel（例如开场动画的 Skip）
+            local anc = d.Parent
+            for _ = 1, 3 do
+                if not anc then break end
+                if anc:IsA("GuiButton") then return anc end
+                anc = anc.Parent
+            end
+            return d
         end
     end
-    return false, nil
+    return nil
 end
+
+local function clickByText(root, wantText)
+    local t = findClickable(wantText, root)
+    if not t then return false, nil end
+    if t:IsA("GuiButton") then
+        return click(t), t
+    end
+    return false, t      -- 纯 TextLabel，交给调用方处理
+end
+
+-- 商品名推断口径：AMMO 分类点不动时的兜底（ALL 列表里也能归类）
+local CAL_PATTERNS = {
+    { "^12ga", "12ga" }, { "^%.308", "308" },
+    { "^9x19", "9mm" }, { "^9mm", "9mm" },
+    { "^%.45", "45" }, { "^%.357", "357" },
+    { "^5%.56", "556" }, { "^7%.62", "762" }, { "^bolt", "bolt" },
+}
+
+local function inferCal(name)
+    local l = string.lower(tostring(name or ""))
+    for _, e in ipairs(CAL_PATTERNS) do
+        if string.find(l, e[1]) then return e[2] end
+    end
+    return nil
+end
+
 
 ------------------------------------------------------------------
 -- 口径归属
@@ -302,6 +348,76 @@ local function queueSave()
 end
 
 ------------------------------------------------------------------
+-- 已买数量持久化
+-- 这一份是「跨重连」的账本：不看它的话，每次重进游戏都会把 1000 发重新买一遍
+------------------------------------------------------------------
+local function recomputeTotals()
+    local b, s = 0, 0
+    for _, v in pairs(S.boughtBy) do b = b + (tonumber(v) or 0) end
+    for _, v in pairs(S.spentBy) do s = s + (tonumber(v) or 0) end
+    S.bought = b
+    S.spent = s
+end
+
+-- 格式：口径<TAB>商品名<TAB>已买发数<TAB>已花金额
+local function saveBought()
+    local lines = { "# HUSH 已购买记录  " .. os.date("%Y-%m-%d %H:%M") }
+    local rows = {}
+    for name, n in pairs(S.boughtBy) do
+        n = tonumber(n) or 0
+        if n > 0 then
+            rows[#rows + 1] = {
+                cal = nameCal(name) or "?",
+                name = name,
+                n = math.floor(n),
+                spent = math.floor(tonumber(S.spentBy[name]) or 0),
+            }
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.cal ~= b.cal then return a.cal < b.cal end
+        return a.name < b.name
+    end)
+    for _, r in ipairs(rows) do
+        lines[#lines + 1] = string.format("%s\t%s\t%d\t%d", r.cal, r.name, r.n, r.spent)
+    end
+    local ok = pcall(writefile, BOUGHT_FILE, table.concat(lines, "\n"))
+    if ok then S.boughtDirty = false end
+    return ok
+end
+
+local function loadBought()
+    if not (isfile and isfile(BOUGHT_FILE)) then return 0 end
+    local ok, data = pcall(readfile, BOUGHT_FILE)
+    if not ok or type(data) ~= "string" then return 0 end
+    local n = 0
+    -- 兼容只有三列（没有金额）的旧记录
+    for line in data:gmatch("[^\r\n]+") do
+        if line:sub(1, 1) ~= "#" then
+            local cal, name, cnt, spent = line:match("^([^\t]+)\t(.-)\t(%d+)\t(%d+)$")
+            if not cal then
+                name, cnt, spent = line:match("^([^\t]+)\t(%d+)\t(%d+)$")
+                if not name then
+                    name, cnt = line:match("^([^\t]+)\t(%d+)$")
+                end
+            end
+            if name and name ~= "" and cnt then
+                S.boughtBy[name] = (S.boughtBy[name] or 0) + tonumber(cnt)
+                if spent then
+                    S.spentBy[name] = (S.spentBy[name] or 0) + tonumber(spent)
+                end
+                if cal and cal ~= "?" and not S.nameToCal[name] then
+                    S.nameToCal[name] = cal
+                end
+                n = n + 1
+            end
+        end
+    end
+    recomputeTotals()
+    return n
+end
+
+------------------------------------------------------------------
 -- 定位菜单
 ------------------------------------------------------------------
 local function menuRoot()
@@ -326,39 +442,151 @@ local function isLobby()
 end
 
 ------------------------------------------------------------------
+-- 自动进入 Gunner 购买页
+-- 关键：只有 Page_traders 的内容已经存在时才切页。
+-- 内容还没生成就硬点 tab，会把页面变成永久空壳（实测踩过，只能重进恢复）
+------------------------------------------------------------------
+------------------------------------------------------------------
+-- 切到 AMMO 分类：口径芯片 Calibres 只有选中 AMMO 后才会被创建
+------------------------------------------------------------------
+local function ensureAmmoTab(body)
+    if not body then return false end
+    local fb = body:FindFirstChild("FilterBox")
+    if not fb then return false end
+    if fb:FindFirstChild("Calibres") then return true end
+
+    -- 这个按钮点不动（Activated / 模拟鼠标都试过，On 一直是 false），
+    -- 而且反复点会让筛选栏反复重建，所以整个 session 只试一次
+    if S.ammoTried then return false end
+    S.ammoTried = true
+
+    local filters = fb:FindFirstChild("Filters")
+    if not filters then return false end
+    local btn = filters:FindFirstChild("F_ammo") or findClickable("AMMO", filters)
+    if btn and btn:IsA("GuiButton") then
+        click(btn)
+        local deadline = os.clock() + 2
+        while os.clock() < deadline do
+            if fb:FindFirstChild("Calibres") then return true end
+            task.wait(0.1)
+        end
+    end
+    return fb:FindFirstChild("Calibres") ~= nil
+end
+
+-- 当前商店是不是弹药（GUNNER）。DOC 的店卖医疗品，两者共用同一个 Body 结构，
+-- 所以不能靠 tradersBody() 判断是否已就位
+local function shopLooksAmmo(body)
+    if not body then return false end
+    local checked = 0
+    for _, o in ipairs(body.Offers:GetChildren()) do
+        if o:IsA("TextButton") then
+            checked = checked + 1
+            for _, d in ipairs(o:GetDescendants()) do
+                if d:IsA("TextLabel") and string.lower(d.Name) == "name" then
+                    local tx = d.Text or ""
+                    -- 卡片里可能有多个 name 标签，空的不能当结论
+                    if tx ~= "" and inferCal(tx) then return true end
+                end
+            end
+            if checked >= 8 then break end
+        end
+    end
+    return false
+end
+
+local function ensureBuyPage()
+    local root = menuRoot()
+    local pages = root and root:FindFirstChild("Pages")
+    local pt = pages and pages:FindFirstChild("Page_traders")
+
+    if not root then return false, "菜单未打开" end
+    if not pt or #pt:GetDescendants() == 0 then
+        return false, "交易页未加载，请手动点一次 TRADERS"
+    end
+
+    -- 1) 切到交易页（内容已存在才点，安全）
+    if not pt.Visible then
+        local top = root:FindFirstChild("TopBar")
+        local tab = findClickable("TRADERS", top)
+        if tab and tab:IsA("GuiButton") then
+            click(tab)
+            task.wait(0.45)
+        end
+    end
+
+    -- 2) 默认选中的是 DOC，每次进来都点一次 gunner（幂等，实测安全）
+    local tr = pt:FindFirstChild("Traders")
+    local content = tr and tr:FindFirstChild("Content")
+    local left = content and content:FindFirstChild("Left")
+    if left then
+        local gunner = left:FindFirstChild("gunner") or findClickable("GUNNER", left)
+        if gunner and gunner:IsA("GuiButton") then
+            click(gunner)
+            task.wait(0.7)
+        end
+    end
+
+    local body = tradersBody()
+    if body then
+        ensureAmmoTab(body)
+        return true, "已进入 Gunner"
+    end
+    return false, "未找到交易面板"
+end
+
+------------------------------------------------------------------
 -- 自动关弹窗：SKIP / LATER
 ------------------------------------------------------------------
+-- 开场动画（ReplicatedFirst.JoinIntro）的 Skip 是个纯 TextLabel，
+-- 没有按钮可 firesignal，只能模拟鼠标点击它的中心
+local function mouseClickAt(guiObj)
+    if type(mousemoveabs) ~= "function" or type(mouse1click) ~= "function" then return false end
+    local pos = guiObj.AbsolutePosition
+    local size = guiObj.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then return false end
+    local x = math.floor(pos.X + size.X / 2)
+    local y = math.floor(pos.Y + size.Y / 2)
+    pcall(mousemoveabs, x, y)
+    task.wait(0.05)
+    pcall(mouse1click)
+    return true
+end
+
 local function autoDismiss()
     local pg = lp:FindFirstChild("PlayerGui")
     if not pg then return end
 
-    for _, guiName in ipairs({ "HushMenuFade", "HushTouch", "HushTransit" }) do
-        local g = pg:FindFirstChild(guiName)
-        if g and g.Enabled then
-            local ok = clickByText(g, "SKIP")
-            if ok then log("已点 SKIP") end
+    -- 一秒一次就够，别每 tick 全量扫 GUI
+    local now = os.clock()
+    if now - (S.lastDismissAt or 0) < 1 then return end
+    S.lastDismissAt = now
+
+    -- 1) 过场 / 开场动画的 SKIP
+    for _, g in ipairs(pg:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled and g.Name ~= "HushMenu" then
+            local skip = findClickable("SKIP", g)
+            if skip then
+                if skip:IsA("GuiButton") then
+                    click(skip)
+                    log("已点 SKIP（" .. g.Name .. "）")
+                elseif mouseClickAt(skip) then
+                    log("已模拟点击 SKIP（" .. g.Name .. "）")
+                end
+                return
+            end
         end
     end
 
-    -- 只点 LATER，绝不点 VIEW SALE
+    -- 2) 礼包 / 广告弹窗：只关掉，绝不点购买类按钮
     local modal = pg:FindFirstChild("HushModal")
     if modal then
-        for _, d in ipairs(modal:GetDescendants()) do
-            if d:IsA("TextButton") then
-                local hit = string.upper(textOf(d)) == "LATER"
-                if not hit then
-                    for _, c in ipairs(d:GetDescendants()) do
-                        if c:IsA("TextLabel") and string.upper(textOf(c)) == "LATER" then
-                            hit = true
-                            break
-                        end
-                    end
-                end
-                if hit then
-                    click(d)
-                    log("已关闭 SALE 弹窗（LATER）")
-                    return
-                end
+        for _, want in ipairs({ "LATER", "NOTHANKS", "CLOSE", "DISMISS" }) do
+            local b = findClickable(want, modal)
+            if b and b:IsA("GuiButton") then
+                click(b)
+                log("已关闭弹窗（" .. want .. "）")
+                return
             end
         end
     end
@@ -402,9 +630,53 @@ end)
 ------------------------------------------------------------------
 -- 扫描商品
 ------------------------------------------------------------------
+local function parseOffer(o, calId)
+    local labels = {}
+    for _, d in ipairs(o:GetDescendants()) do
+        if d:IsA("TextLabel") then
+            local t = textOf(d)
+            if t ~= "" then labels[string.lower(d.Name)] = t end
+        end
+    end
+    local full = labels["name"] or ""
+    local short = labels["short"] or ""
+    local count = num(labels["count"]) or 0
+    local price = num(labels["price"]) or 0
+
+    -- Label 三种形态："3 / 3 LEFT" / "SOLD OUT" / 空
+    local lbl = labels["label"] or ""
+    local upper = string.upper(lbl)
+    local soldOut = string.find(upper, "SOLD", 1, true) ~= nil
+        or string.find(lbl, "售罄", 1, true) ~= nil
+    local stock = 0
+    if not soldOut then
+        local a, b = lbl:match("(%d+)%s*/%s*(%d+)")
+        if a then
+            stock = tonumber(a)
+            if stock == 0 then soldOut = true end
+        elseif b then
+            stock = tonumber(b)
+        end
+    end
+
+    if full == "" or count <= 0 then return nil end
+    return {
+        key = o.Name,
+        name = full,
+        short = short,
+        count = count,
+        price = price,
+        stock = stock,
+        soldOut = soldOut,
+        perRound = price / count,
+        calId = calId,
+    }
+end
+
 local function scanCaliber(cal)
     local body = tradersBody()
     if not body then return nil end
+    ensureAmmoTab(body)          -- 没选 AMMO 时口径芯片还不存在
     local calBox = body.FilterBox:FindFirstChild("Calibres")
     local chip = calBox and calBox:FindFirstChild(cal.chip)
     if not chip then return nil end
@@ -413,68 +685,38 @@ local function scanCaliber(cal)
     S.currentCal = cal.id
     task.wait(CFG.chipWait)
 
-    local offers = body.Offers
     local out = {}
-    for _, o in ipairs(offers:GetChildren()) do
+    for _, o in ipairs(body.Offers:GetChildren()) do
         if o:IsA("TextButton") and o.Name ~= "kit_starter" then
-            local labels = {}
-            for _, d in ipairs(o:GetDescendants()) do
-                if d:IsA("TextLabel") then
-                    local t = textOf(d)
-                    if t ~= "" then labels[string.lower(d.Name)] = t end
-                end
-            end
-            local full = labels["name"] or ""
-            local short = labels["short"] or ""
-            local count = num(labels["count"]) or 0
-            local price = num(labels["price"]) or 0
-
-            -- Label 三种形态："3 / 3 LEFT" / "SOLD OUT" / 空
-            local lbl = labels["label"] or ""
-            local upper = string.upper(lbl)
-            local soldOut = string.find(upper, "SOLD", 1, true) ~= nil
-                or string.find(lbl, "售罄", 1, true) ~= nil
-            local stock = 0
-            if not soldOut then
-                local a, b = lbl:match("(%d+)%s*/%s*(%d+)")
-                if a then
-                    stock = tonumber(a)
-                    if stock == 0 then soldOut = true end
-                elseif b then
-                    stock = tonumber(b)
-                end
-            end
-
-            if full ~= "" and count > 0 then
-                out[#out + 1] = {
-                    key = o.Name,
-                    name = full,
-                    short = short,
-                    count = count,
-                    price = price,
-                    stock = stock,
-                    soldOut = soldOut,
-                    perRound = price / count,
-                    calId = cal.id,
-                }
-            end
+            local rec = parseOffer(o, cal.id)
+            if rec then out[#out + 1] = rec end
         end
     end
     return out
 end
 
--- 该商品当前是否真的在扫描结果里（名字变了/下架了就不算）
-local function productExists(name)
-    local cal = nameCal(name)
-    if not cal then return false end
-    for _, p in ipairs(S.products[cal] or {}) do
-        if p.name == name then return true end
+-- 不切口径，直接扫当前列表（ALL），按商品名归类
+local function scanAllList()
+    local body = tradersBody()
+    if not body then return {} end
+    local grouped = {}
+    for _, o in ipairs(body.Offers:GetChildren()) do
+        if o:IsA("TextButton") and o.Name ~= "kit_starter" then
+            local rec = parseOffer(o, nil)
+            if rec then
+                local cal = inferCal(rec.name)
+                if cal then
+                    rec.calId = cal
+                    grouped[cal] = grouped[cal] or {}
+                    table.insert(grouped[cal], rec)
+                end
+            end
+        end
     end
-    return false
+    return grouped
 end
 
--- 某口径下是否还有「有目标且未达标」的弹种
--- 只在产品当前确实存在时才算待办：否则游戏改个名字就会把整个口径永久卡成「买空」
+
 local function caliberHasPending(calId)
     for name, target in pairs(CFG.targets) do
         if (tonumber(target) or 0) > 0 and remainOf(name) > 0 then
@@ -500,14 +742,48 @@ local function scanAll(onlyTargeted)
     end
 
     local total, sold = 0, 0
-    for _, cal in ipairs(targets) do
-        local ok, res = pcall(scanCaliber, cal)
-        local list = (ok and res) or {}
-        S.products[cal.id] = list
-        for _, p in ipairs(list) do
-            total = total + 1
-            if p.soldOut then sold = sold + 1 end
-            S.nameToCal[p.name] = cal.id
+    local calMapChanged = false
+
+    local body = tradersBody()
+    local hasCalibres = body and body.FilterBox and body.FilterBox:FindFirstChild("Calibres")
+    local scanned = false
+
+    if hasCalibres then
+        for _, cal in ipairs(targets) do
+            local ok, res = pcall(scanCaliber, cal)
+            local list = (ok and res) or {}
+            S.products[cal.id] = list
+            for _, p in ipairs(list) do
+                total = total + 1
+                if p.soldOut then sold = sold + 1 end
+                if not S.nameToCal[p.name] then calMapChanged = true end
+                S.nameToCal[p.name] = cal.id
+            end
+        end
+        scanned = total > 0
+    end
+
+    -- 兜底：AMMO 分类点不动时，从当前列表按名字归类
+    if not scanned then
+        local grouped = scanAllList()
+        for calId, list in pairs(grouped) do
+            S.products[calId] = list
+            for _, p in ipairs(list) do
+                total = total + 1
+                if p.soldOut then sold = sold + 1 end
+                if not S.nameToCal[p.name] then calMapChanged = true end
+                S.nameToCal[p.name] = calId
+            end
+        end
+    end
+
+    -- 之前配置里标成 "?" 的口径这次能认出来了，回写一次
+    if calMapChanged then
+        for _, v in pairs(CFG.targets) do
+            if (tonumber(v) or 0) > 0 then
+                pcall(saveConfig)
+                break
+            end
         end
     end
 
@@ -522,7 +798,8 @@ local function scanAll(onlyTargeted)
     if P.onScan then pcall(P.onScan) end
 
     if total == 0 then
-        log("扫描为空：请打开 Blackmarket → Traders → Gunner")
+        S.needRescan = true          -- 没扫到东西，下一轮重新导航再试
+        log("扫描为空，重试中…")
     else
         log(string.format("扫描 %d 个口径：%d 个挂牌，%d 个售罄", #targets, total, sold))
     end
@@ -697,14 +974,15 @@ local function buyInCaliber(cal)
     local body = tradersBody()
     if not body then return "wait", "无交易面板" end
 
-    -- 切到该口径（已经是就不重复切）
-    if S.currentCal ~= cal.id then
-        local calBox = body.FilterBox:FindFirstChild("Calibres")
-        local chip = calBox and calBox:FindFirstChild(cal.chip)
-        if not chip then return "dry", "无口径芯片" end
-        click(chip)
-        S.currentCal = cal.id
-        task.wait(CFG.chipWait)
+    -- 有口径芯片才切；没有说明当前是 ALL 列表，卡片已经在列表里了
+    local calBox = body.FilterBox:FindFirstChild("Calibres")
+    if calBox and S.currentCal ~= cal.id then
+        local chip = calBox:FindFirstChild(cal.chip)
+        if chip then
+            click(chip)
+            S.currentCal = cal.id
+            task.wait(CFG.chipWait)
+        end
     end
 
     local list = S.products[cal.id] or {}
@@ -725,9 +1003,10 @@ local function buyInCaliber(cal)
                         local ok, got, why = buyFromOffer(cal, offer, packsNeeded, true)
                         if ok then
                             S.waitingRestock = false
-                            S.bought = S.bought + got
                             S.boughtBy[p.name] = (S.boughtBy[p.name] or 0) + got
-                            S.spent = S.spent + offer.perRound * got
+                            S.spentBy[p.name] = (S.spentBy[p.name] or 0) + offer.perRound * got
+                            S.boughtDirty = true
+                            recomputeTotals()
                             offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
                             if offer.stock == 0 then offer.soldOut = true end
                             log(string.format("[%s] 买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
@@ -891,14 +1170,18 @@ local function buildUI()
         end
     })
     gCtl:AddButton({
-        Text = "清零本次计数",
+        Text = "清零已买记录（含文件）",
+        Tooltip = "把已买数量归零并写入 " .. BOUGHT_FILE .. "，之后会重新按目标购买",
         Func = function()
-            S.bought = 0
-            S.spent = 0
             S.boughtBy = {}
+            S.spentBy = {}
             S.lastBuyAt = {}
             S.dryCal = {}
-            log("计数已清零")
+            S.softFail = {}
+            S.boughtDirty = true
+            recomputeTotals()
+            saveBought()
+            log("已买记录已清零（文件同步）")
         end
     })
 
@@ -1152,6 +1435,12 @@ local function step()
 
     if S.needRescan or (not S.ready) then
         if not S.scanning then
+            -- 先确保站在 Gunner 购买页；不在就自动切过去
+            local navOK, navWhy = ensureBuyPage()
+            if not navOK and not tradersBody() then
+                S.lastMsg = navWhy
+                return
+            end
             S.lastMsg = "扫描商品中…"
             task.spawn(function() scanAll(S.ready) end)   -- 首次全量，之后只扫有目标的
         end
@@ -1264,16 +1553,25 @@ if cfgOK then
     print("[AMMO] 已从 " .. CONFIG_FILE .. " 载入 " .. cfgN .. " 条目标")
 end
 
+-- 已买账本：必须在建 UI 之前载入，否则第一屏显示的是 0，也容易被误判成没买过
+local bN = loadBought()
+if bN and bN > 0 then
+    print(string.format("[AMMO] 已从 %s 载入 %d 条已买记录，累计 %d 发", BOUGHT_FILE, bN, S.bought))
+end
+
 local uiOK = buildUI()
 if not uiOK then
     log("UI 未就绪，后台购买仍可用（_G.HUSH_AMMO）")
 end
 
--- 配置改动后 1.5 秒落盘，避免拖滑块时狂写文件
+-- 配置改动后 1.5 秒落盘，避免拖滑块时狂写文件；已买记录则尽快写，防意外断线
 task.spawn(function()
     while not S.dead do
         if S.savePending and (os.clock() - S.lastSaveAt) > 1.5 then
             saveConfig()
+        end
+        if S.boughtDirty then
+            saveBought()
         end
         task.wait(0.5)
     end
@@ -1314,7 +1612,10 @@ _G.HUSH_AMMO = {
     restockRemain = restockRemain,
     saveConfig = saveConfig,
     loadConfig = loadConfig,
+    saveBought = saveBought,
+    loadBought = loadBought,
     buyInCaliber = buyInCaliber,
+    ensureBuyPage = ensureBuyPage,
     start = function()
         S.running = true
         S.dryCal = {}
@@ -1344,6 +1645,7 @@ _G.HUSH_AMMO = {
         pcall(function()
             if hasAnyTarget() or S.loadedFromFile then saveConfig() end
         end)
+        pcall(saveBought)
         pcall(function()
             if P.library and P.library.ScreenGui then P.library.ScreenGui:Destroy() end
         end)
