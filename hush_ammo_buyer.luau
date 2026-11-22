@@ -888,23 +888,37 @@ end
 local function scanCaliber(cal)
     local body = tradersBody()
     if not body then return nil end
+    local offers = body:FindFirstChild("Offers")
+    if not offers then return nil end
     ensureAmmoTab(body)          -- 没选 AMMO 时口径芯片还不存在
-    local calBox = body.FilterBox:FindFirstChild("Calibres")
+    local calBox = body:FindFirstChild("FilterBox") and body.FilterBox:FindFirstChild("Calibres")
     local chip = calBox and calBox:FindFirstChild(cal.chip)
     if not chip then return nil end
 
     click(chip)
     S.currentCal = cal.id
-    task.wait(CFG.chipWait)
 
+    -- 切口径后列表是异步重建的：轮询到「出现该口径商品」再读，
+    -- 否则会读到上一口径的旧列表，导致整轮扫描为空
     local out = {}
-    for _, o in ipairs(body.Offers:GetChildren()) do
-        if o:IsA("TextButton") and o.Name ~= "kit_starter" then
-            local rec = parseOffer(o, cal.id)
-            if rec then
-                recordCard(rec, rec.soldOut and "sold_out" or ((rec.stock or 0) > 0 and "in_stock" or "empty"))
-                out[#out + 1] = rec
+    local deadline = os.clock() + 1.8
+    while os.clock() < deadline do
+        task.wait(0.1)
+        local of = body:FindFirstChild("Offers")
+        if of then
+            out = {}
+            local matched = 0
+            for _, o in ipairs(of:GetChildren()) do
+                if o:IsA("TextButton") and o.Name ~= "kit_starter" then
+                    local rec = parseOffer(o, cal.id)
+                    if rec then
+                        recordCard(rec, rec.soldOut and "sold_out" or ((rec.stock or 0) > 0 and "in_stock" or "empty"))
+                        out[#out + 1] = rec
+                        if inferCal(rec.name) == cal.id then matched = matched + 1 end
+                    end
+                end
             end
+            if matched > 0 then break end
         end
     end
     return out
@@ -914,8 +928,10 @@ end
 local function scanAllList()
     local body = tradersBody()
     if not body then return {} end
+    local offers = body:FindFirstChild("Offers")
+    if not offers then return {} end
     local grouped = {}
-    for _, o in ipairs(body.Offers:GetChildren()) do
+    for _, o in ipairs(offers:GetChildren()) do
         if o:IsA("TextButton") and o.Name ~= "kit_starter" then
             local rec = parseOffer(o, nil)
             if rec then
@@ -964,7 +980,12 @@ local function scanAll(onlyTargeted)
     if S.pageTab and S.pageFrame then
         local okR, whyR = buildTradersPage()
         if not okR then log("扫描前重建页面失败：" .. tostring(whyR)) end
-        task.wait(0.25)
+        local waitEnd = os.clock() + 2.0
+        while os.clock() < waitEnd do
+            local b = tradersBody()
+            if b and b:FindFirstChild("Offers") then break end
+            task.wait(0.1)
+        end
     end
     S.scanEpoch = (S.scanEpoch or 0) + 1
 
@@ -1102,7 +1123,7 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     if not body then return false, 0, "找不到交易面板" end
 
     if not skipChip then
-        local calBox = body.FilterBox:FindFirstChild("Calibres")
+        local calBox = body:FindFirstChild("FilterBox") and body.FilterBox:FindFirstChild("Calibres")
         local chip = calBox and calBox:FindFirstChild(cal.chip)
         if chip then
             click(chip)
@@ -1112,7 +1133,8 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     end
 
     local function card()
-        return body.Offers:FindFirstChild(offer.key)
+        local offers = body:FindFirstChild("Offers")
+        return offers and offers:FindFirstChild(offer.key) or nil
     end
 
     -- 切口径后列表是异步重建的，固定 wait 不够：轮询等目标卡片出现
@@ -1125,7 +1147,11 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     if not card() then return false, 0, "卡片未出现:" .. tostring(offer.key) end
     click(card())
 
-    local detail = body.Detail.Panel.Content
+    local panel = body.Detail and body.Detail:FindFirstChild("Panel")
+    local detail = panel and panel:FindFirstChild("Content")
+    if not detail then return false, 0, "detail panel missing" end
+    local foot = detail:FindFirstChild("Foot")
+    if not foot then return false, 0, "detail foot missing" end
 
     -- 先确认详情面板确实切到了这件商品（标题带字距动画，要去掉空白再比），
     -- 再判断有没有数量控件；顺序反了会把「面板还没切过来」误判成「限购满」
@@ -1157,15 +1183,15 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
         return false, 0, "详情未同步:[" .. title .. "]"        -- 不判售罄，下轮再试
     end
 
-    local qtyFrame = detail.Foot:FindFirstChild("Qty")
+    local qtyFrame = foot:FindFirstChild("Qty")
     -- 买过之后该 listing 可能达到限购上限：游戏会直接把 Qty 控件移除，
     -- 只剩 Price / BuyButton。这不是异常，标成不可买然后跳过。
     if not qtyFrame then
         task.wait(0.12)
-        qtyFrame = detail.Foot:FindFirstChild("Qty")
+        qtyFrame = foot:FindFirstChild("Qty")
     end
     if not qtyFrame then
-        local btn = detail.Foot:FindFirstChild("BuyButton")
+        local btn = foot:FindFirstChild("BuyButton")
         local lbl = textOf(btn and btn.Inner and btn.Inner:FindFirstChild("Text"))
         offer.stock = 0
         offer.soldOut = true
@@ -1200,7 +1226,7 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     end
     if cur ~= packs then return false, 0, "数量设定失败" end
 
-    local buyBtn = detail.Foot:FindFirstChild("BuyButton")
+    local buyBtn = foot:FindFirstChild("BuyButton")
     if not buyBtn then return false, 0, "无购买按钮" end
     local label = textOf(buyBtn.Inner and buyBtn.Inner:FindFirstChild("Text"))
     -- 按钮文案同样带字距空格（"S O L D  O U T"），先去空白再判
@@ -1239,7 +1265,7 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
             confirmed = true
             break
         end
-        local bb = detail.Foot:FindFirstChild("BuyButton")
+        local bb = foot:FindFirstChild("BuyButton")
         local lab = textOf(bb and bb.Inner and bb.Inner:FindFirstChild("Text"))
         local flat2 = string.lower(lab):gsub("[^%w]", "")
         if flat2:find("sold") or flat2:find("locked") or flat2:find("full") then
@@ -1263,7 +1289,7 @@ local function buyInCaliber(cal)
     local body = tradersBody()
     if not body then return "wait", "无交易面板" end
 
-    local calBox = body.FilterBox:FindFirstChild("Calibres")
+    local calBox = body:FindFirstChild("FilterBox") and body.FilterBox:FindFirstChild("Calibres")
     if calBox and S.currentCal ~= cal.id then
         local chip = calBox:FindFirstChild(cal.chip)
         if chip then
