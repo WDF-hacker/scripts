@@ -109,6 +109,7 @@ local S = {
     softFail = {},         -- [calId] = 连续未成交轮数
     lastBuyAt = {},        -- [offerKey] = os.clock()
     scanning = false,
+    scanStartAt = 0,
     ready = false,
     lastMsg = "空闲",
     lastBuyErr = "",       -- 最近一次买失败的原因，便于诊断
@@ -717,6 +718,17 @@ local function scanAllList()
 end
 
 
+-- 当前扫描结果里是否存在该商品名（用于判断"目标是否还在售"）
+local function productExists(name)
+    local want = tostring(name or "")
+    for _, list in pairs(S.products or {}) do
+        for _, p in ipairs(list) do
+            if p.name == want then return true end
+        end
+    end
+    return false
+end
+
 local function caliberHasPending(calId)
     for name, target in pairs(CFG.targets) do
         if (tonumber(target) or 0) > 0 and remainOf(name) > 0 then
@@ -730,6 +742,7 @@ end
 local function scanAll(onlyTargeted)
     if S.scanning then return end
     S.scanning = true
+    S.scanStartAt = os.clock()
 
     local targets = {}
     if onlyTargeted then
@@ -792,6 +805,7 @@ local function scanAll(onlyTargeted)
     S.softFail = {}
     S.currentCal = nil
     S.scanning = false
+    S.scanStartAt = 0
     S.ready = true
     S.needRescan = false
     S.nextRescanAt = os.clock() + CFG.fallbackRescan
@@ -1431,6 +1445,14 @@ local function step()
     if not isLobby() then
         S.lastMsg = "等待进入大厅"
         return
+    end
+
+    -- 看门狗：扫描卡死（异常/等待）超过 15 秒就强制复位
+    if S.scanning and S.scanStartAt and os.clock() - S.scanStartAt > 15 then
+        S.scanning = false
+        S.scanStartAt = 0
+        S.needRescan = true
+        log("扫描超时，已重置")
     end
 
     if S.needRescan or (not S.ready) then
