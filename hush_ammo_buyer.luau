@@ -1,5 +1,5 @@
 --[[
-    HUSH 弹药自动购买 v3  (Potassium / autoexec)
+    HUSH 弹药自动购买 v4  (Potassium / autoexec)
     ─────────────────────────────────────────────
     用途
       · 放在 autoexec，进大厅后自动就绪
@@ -7,11 +7,14 @@
       · 每个弹种单独设目标发数；勾选后自动在 Gunner 处买满
       · 配置自动存盘，重进游戏自动恢复
 
-    v3 变更
-      · 售空自动识别：卡片 Label 为 "SOLD OUT" 即标记，UI 显示「售罄」，不再重试
-      · 配置持久化：hush_ammo_config.txt（writefile 已验证可用），启动自动加载
-      · Obsidian 库本地缓存到 obsidian_Library.lua，重载不再每次下载 483KB
-      · 修控件 ID：产品名含中文时 [^%w] 会全部替换成下划线导致 ID 撞车，改用 djb2 哈希
+    v4 变更（购买流程按口径分组重构）
+      · 以「口径」为单位：切到某口径就把它下面所有勾选且有货的弹种买空，才进下一个口径
+      · 买空的口径记入 dryCal，本轮不再切进去，避免反复切页空转（原来是每个 tick 把 8 个口径轮一遍）
+      · 只扫「有勾选目标」的口径；未勾选的口径完全不碰，UI 不再频繁闪烁
+      · 以补货倒计时为主：全部买空后一直等，只在倒计时剩 ≤2 秒时才重扫
+      · 售空识别：卡片 Label 为 "SOLD OUT" 即标记，UI 显示「售罄」，不再重试
+      · 配置升级为三列（口径 + 商品名 + 目标），即使该弹种当前不在售也能定位到口径
+      · 有目标但当前不在售的弹种保持可见并标「未在售」，不会从 UI 上消失
       · 重载时自动停掉旧实例，避免两个循环同时下单
 
     实测依据（place 91445552037955 / Menu，Potassium v2.7.0）
@@ -71,6 +74,8 @@ local CFG = {
     selectWait = 0.4,      -- 选中商品后等详情刷新
     tickGap = 0.35,
     restockPoll = 1.0,     -- 补货倒计时读取间隔
+    rescanLead = 2,        -- 补货倒计时剩这么多秒时重扫
+    fallbackRescan = 30,   -- 读不到倒计时时的兜底重扫间隔
     autoStart = false,     -- 加载后是否自动开始
 }
 
@@ -95,10 +100,15 @@ local S = {
     spent = 0,
     boughtBy = {},         -- [商品名] = 本次已买发数
     products = {},         -- [calId] = { {name, short, key, count, price, stock, perRound, soldOut} }
+    nameToCal = {},        -- [商品名] = calId，配置里保留，弹种下架后也能定位口径
+    currentCal = nil,      -- 当前正在处理的口径
+    dryCal = {},           -- [calId] = true 本轮已确认买空
+    softFail = {},         -- [calId] = 连续未成交轮数
     lastBuyAt = {},        -- [offerKey] = os.clock()
     scanning = false,
     ready = false,
     lastMsg = "空闲",
+    lastBuyErr = "",       -- 最近一次买失败的原因，便于诊断
     waitingRestock = false,
     restockText = "",
     restockSec = nil,
@@ -121,6 +131,7 @@ local P = {
     lblBought = nil,
     lblSpent = nil,
     lblConfig = nil,
+    lblCal = nil,
     sumLabels = {},        -- [calId] = label
     toggleRun = nil,
     onScan = nil,
@@ -207,18 +218,51 @@ local function clickByText(root, wantText)
 end
 
 ------------------------------------------------------------------
+-- 口径归属
+------------------------------------------------------------------
+local function calLabel(calId)
+    for _, c in ipairs(CALIBERS) do
+        if c.id == calId then return c.label end
+    end
+    return tostring(calId)
+end
+
+-- 商品属于哪个口径：UI 行 → 扫描记录 → nil
+local function nameCal(name)
+    local row = P.rows[name]
+    if row and row.calId then return row.calId end
+    return S.nameToCal[name]
+end
+
+-- 某弹种还差多少发（caliberHasPending 会用到，必须放在它之前）
+local function remainOf(name)
+    local target = tonumber(CFG.targets[name]) or 0
+    if target <= 0 then return 0 end
+    return target - (S.boughtBy[name] or 0)
+end
+
+------------------------------------------------------------------
 -- 配置持久化
 ------------------------------------------------------------------
--- 格式：每行 "商品名<TAB>目标发数"，# 开头为注释
+-- 三列格式：口径<TAB>商品名<TAB>目标发数；旧的两列格式仍可读
 local function saveConfig()
     local lines = { "# HUSH 弹药采购配置  " .. os.date("%Y-%m-%d %H:%M") }
-    local keys = {}
+    local rowsOut = {}
     for name, n in pairs(CFG.targets) do
-        if (tonumber(n) or 0) > 0 then keys[#keys + 1] = name end
+        if (tonumber(n) or 0) > 0 then
+            rowsOut[#rowsOut + 1] = {
+                cal = nameCal(name) or "?",
+                name = name,
+                n = math.floor(tonumber(n) or 0),
+            }
+        end
     end
-    table.sort(keys)
-    for _, name in ipairs(keys) do
-        lines[#lines + 1] = name .. "\t" .. tostring(math.floor(tonumber(CFG.targets[name]) or 0))
+    table.sort(rowsOut, function(a, b)
+        if a.cal ~= b.cal then return a.cal < b.cal end
+        return a.name < b.name
+    end)
+    for _, r in ipairs(rowsOut) do
+        lines[#lines + 1] = string.format("%s\t%s\t%d", r.cal, r.name, r.n)
     end
     local ok, err = pcall(writefile, CONFIG_FILE, table.concat(lines, "\n"))
     if ok then
@@ -235,11 +279,16 @@ local function loadConfig()
     local ok, data = pcall(readfile, CONFIG_FILE)
     if not ok or type(data) ~= "string" then return false, 0 end
     local n = 0
+    -- 注意：Luau 的 pattern 不支持 %t（Lua 5.2 才有），必须用 \t 字面量
     for line in data:gmatch("[^\r\n]+") do
         if line:sub(1, 1) ~= "#" then
-            local name, val = line:match("^(.-)\t(%d+)$")
+            local cal, name, val = line:match("^([^\t]+)\t(.-)\t(%d+)$")
+            if not cal then
+                name, val = line:match("^([^\t]+)\t(%d+)$")
+            end
             if name and name ~= "" and val then
                 CFG.targets[name] = tonumber(val)
+                if cal and cal ~= "?" then S.nameToCal[name] = cal end
                 n = n + 1
             end
         end
@@ -361,6 +410,7 @@ local function scanCaliber(cal)
     if not chip then return nil end
 
     click(chip)
+    S.currentCal = cal.id
     task.wait(CFG.chipWait)
 
     local offers = body.Offers
@@ -405,6 +455,7 @@ local function scanCaliber(cal)
                     stock = stock,
                     soldOut = soldOut,
                     perRound = price / count,
+                    calId = cal.id,
                 }
             end
         end
@@ -412,29 +463,68 @@ local function scanCaliber(cal)
     return out
 end
 
-local function scanAll()
+-- 该商品当前是否真的在扫描结果里（名字变了/下架了就不算）
+local function productExists(name)
+    local cal = nameCal(name)
+    if not cal then return false end
+    for _, p in ipairs(S.products[cal] or {}) do
+        if p.name == name then return true end
+    end
+    return false
+end
+
+-- 某口径下是否还有「有目标且未达标」的弹种
+-- 只在产品当前确实存在时才算待办：否则游戏改个名字就会把整个口径永久卡成「买空」
+local function caliberHasPending(calId)
+    for name, target in pairs(CFG.targets) do
+        if (tonumber(target) or 0) > 0 and remainOf(name) > 0 then
+            if nameCal(name) == calId and productExists(name) then return true end
+        end
+    end
+    return false
+end
+
+-- onlyTargeted = true 时只扫「有目标的口径」，其他口径完全不碰
+local function scanAll(onlyTargeted)
     if S.scanning then return end
     S.scanning = true
-    S.products = {}
+
+    local targets = {}
+    if onlyTargeted then
+        for _, cal in ipairs(CALIBERS) do
+            if caliberHasPending(cal.id) then targets[#targets + 1] = cal end
+        end
+        if #targets == 0 then targets = CALIBERS end
+    else
+        targets = CALIBERS
+    end
+
     local total, sold = 0, 0
-    for _, cal in ipairs(CALIBERS) do
+    for _, cal in ipairs(targets) do
         local ok, res = pcall(scanCaliber, cal)
         local list = (ok and res) or {}
         S.products[cal.id] = list
         for _, p in ipairs(list) do
             total = total + 1
             if p.soldOut then sold = sold + 1 end
+            S.nameToCal[p.name] = cal.id
         end
     end
+
+    -- 重扫后重新判断哪些口径还有货
+    S.dryCal = {}
+    S.softFail = {}
+    S.currentCal = nil
     S.scanning = false
     S.ready = true
     S.needRescan = false
-    S.nextRescanAt = os.clock() + 25
+    S.nextRescanAt = os.clock() + CFG.fallbackRescan
     if P.onScan then pcall(P.onScan) end
+
     if total == 0 then
         log("扫描为空：请打开 Blackmarket → Traders → Gunner")
     else
-        log(string.format("扫描完成：%d 个挂牌，其中 %d 个售罄", total, sold))
+        log(string.format("扫描 %d 个口径：%d 个挂牌，%d 个售罄", #targets, total, sold))
     end
 end
 
@@ -451,17 +541,24 @@ local function pickBestOffers(calId, productName)
     return hits
 end
 
-local function remainOf(name)
-    local target = tonumber(CFG.targets[name]) or 0
-    if target <= 0 then return 0 end
-    return target - (S.boughtBy[name] or 0)
-end
-
 local function anyPending()
     for name, target in pairs(CFG.targets) do
-        if (tonumber(target) or 0) > 0 and remainOf(name) > 0 then return true end
+        if (tonumber(target) or 0) > 0 and remainOf(name) > 0 and productExists(name) then
+            return true
+        end
     end
     return false
+end
+
+-- 有目标但商品已不在售的条数（名字变了 / 下架 / 换季）
+local function staleCount()
+    local n = 0
+    for name, target in pairs(CFG.targets) do
+        if (tonumber(target) or 0) > 0 and remainOf(name) > 0 and not productExists(name) then
+            n = n + 1
+        end
+    end
+    return n
 end
 
 local function hasAnyTarget()
@@ -472,32 +569,90 @@ local function hasAnyTarget()
 end
 
 -- 返回: ok, 已买发数, 说明
-local function buyFromOffer(cal, offer, packsWanted)
+-- 原则：只有「详情面板确实切到这件商品、且确实没货」才判售罄；
+-- 其它失败一律只冷却、不写死缓存，否则一次抖动会让该商品永久被跳过
+local function buyFromOffer(cal, offer, packsWanted, skipChip)
     local body = tradersBody()
     if not body then return false, 0, "找不到交易面板" end
 
-    local calBox = body.FilterBox:FindFirstChild("Calibres")
-    local chip = calBox and calBox:FindFirstChild(cal.chip)
-    if chip then
-        click(chip)
-        task.wait(CFG.chipWait)
+    if not skipChip then
+        local calBox = body.FilterBox:FindFirstChild("Calibres")
+        local chip = calBox and calBox:FindFirstChild(cal.chip)
+        if chip then
+            click(chip)
+            S.currentCal = cal.id
+            task.wait(CFG.chipWait)
+        end
     end
 
-    local card = body.Offers:FindFirstChild(offer.key)
-    if not card then return false, 0, "卡片不存在" end
-    click(card)
+    local function card()
+        return body.Offers:FindFirstChild(offer.key)
+    end
+
+    -- 切口径后列表是异步重建的，固定 wait 不够：轮询等目标卡片出现
+    if not card() then
+        local deadline = os.clock() + 2
+        while os.clock() < deadline and not card() do
+            task.wait(0.08)
+        end
+    end
+    if not card() then return false, 0, "卡片未出现:" .. tostring(offer.key) end
+    click(card())
     task.wait(CFG.selectWait)
 
     local detail = body.Detail.Panel.Content
+
+    -- 先确认详情面板确实切到了这件商品（标题带字距动画，要去掉空白再比），
+    -- 再判断有没有数量控件；顺序反了会把「面板还没切过来」误判成「限购满」
+    local function norm(x)
+        return (tostring(x or ""):lower():gsub("[^%w%.]", ""))
+    end
+    local function detailTitle()
+        local top = detail:FindFirstChild("Top")
+        local t = top and top:FindFirstChild("Title")
+        return textOf(t)
+    end
+    local wantTitle = norm(offer.name)
+    local title = detailTitle()
+    if title ~= "" and norm(title) ~= wantTitle then
+        for _ = 1, 6 do
+            task.wait(0.15)
+            title = detailTitle()
+            if norm(title) == wantTitle then break end
+            if card() then click(card()) end
+        end
+    end
+    if title ~= "" and norm(title) ~= wantTitle then
+        return false, 0, "详情未同步:[" .. title .. "]"        -- 不判售罄，下轮再试
+    end
+
     local qtyFrame = detail.Foot:FindFirstChild("Qty")
-    if not qtyFrame then return false, 0, "无数量控件" end
+    -- 买过之后该 listing 可能达到限购上限：游戏会直接把 Qty 控件移除，
+    -- 只剩 Price / BuyButton。这不是异常，标成不可买然后跳过。
+    if not qtyFrame then
+        task.wait(0.3)
+        qtyFrame = detail.Foot:FindFirstChild("Qty")
+    end
+    if not qtyFrame then
+        local btn = detail.Foot:FindFirstChild("BuyButton")
+        local lbl = textOf(btn and btn.Inner and btn.Inner:FindFirstChild("Text"))
+        offer.stock = 0
+        offer.soldOut = true
+        return false, 0, "不可购买(限购/售罄):" .. tostring(lbl)
+    end
 
     local maxPacks = tonumber(get(qtyFrame, "QtyMax")) or 1
     local packs = math.min(packsWanted, maxPacks, 50)
     if packs < 1 then
-        offer.stock = 0
-        offer.soldOut = true
-        return false, 0, "已售罄"
+        -- 再确认一次，避免详情刚切过来时读到旧值
+        task.wait(0.25)
+        maxPacks = tonumber(get(qtyFrame, "QtyMax")) or 0
+        packs = math.min(packsWanted, maxPacks, 50)
+        if packs < 1 then
+            offer.stock = 0
+            offer.soldOut = true
+            return false, 0, "已售罄"
+        end
     end
 
     -- 点 QtyMax 再减到目标值，比连点加号稳
@@ -517,16 +672,88 @@ local function buyFromOffer(cal, offer, packsWanted)
     local buyBtn = detail.Foot:FindFirstChild("BuyButton")
     if not buyBtn then return false, 0, "无购买按钮" end
     local label = textOf(buyBtn.Inner and buyBtn.Inner:FindFirstChild("Text"))
-    local low = string.lower(label)
-    if low:find("locked") or low:find("sold") or low:find("full") or label:find("售罄", 1, true) then
+    -- 按钮文案同样带字距空格（"S O L D  O U T"），先去空白再判
+    local flat = string.lower(label):gsub("[^%w]", "")
+    if flat:find("locked") or flat:find("full") then
+        return false, 0, "按钮不可用:" .. label   -- 可能是限购，不是售罄
+    end
+    if flat:find("sold") or label:find("售罄", 1, true) then
+        -- 标题已在上面校验过，这里可以确认是这件商品售罄
         offer.stock = 0
         offer.soldOut = true
-        return false, 0, "按钮不可用:" .. label
+        return false, 0, "已售罄"
     end
 
     click(buyBtn)
     S.lastBuyAt[offer.key] = os.clock()
     return true, packs * offer.count, "已下单"
+end
+
+------------------------------------------------------------------
+-- 单个口径内买完
+-- 返回 "bought"（成交一笔） | "wait"（有货但冷却中） | "dry"（无货可买）
+------------------------------------------------------------------
+local function buyInCaliber(cal)
+    local body = tradersBody()
+    if not body then return "wait", "无交易面板" end
+
+    -- 切到该口径（已经是就不重复切）
+    if S.currentCal ~= cal.id then
+        local calBox = body.FilterBox:FindFirstChild("Calibres")
+        local chip = calBox and calBox:FindFirstChild(cal.chip)
+        if not chip then return "dry", "无口径芯片" end
+        click(chip)
+        S.currentCal = cal.id
+        task.wait(CFG.chipWait)
+    end
+
+    local list = S.products[cal.id] or {}
+    local seen = {}
+    local cooling = false
+    local tried = 0
+
+    for _, p in ipairs(list) do
+        if not seen[p.name] then
+            seen[p.name] = true
+            local remain = remainOf(p.name)
+            if remain > 0 then
+                local offer = pickBestOffers(cal.id, p.name)[1]
+                if offer then
+                    local cd = S.lastBuyAt[offer.key]
+                    if not cd or (os.clock() - cd) >= CFG.buyGap then
+                        local packsNeeded = math.ceil(remain / math.max(1, offer.count))
+                        local ok, got, why = buyFromOffer(cal, offer, packsNeeded, true)
+                        if ok then
+                            S.waitingRestock = false
+                            S.bought = S.bought + got
+                            S.boughtBy[p.name] = (S.boughtBy[p.name] or 0) + got
+                            S.spent = S.spent + offer.perRound * got
+                            offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
+                            if offer.stock == 0 then offer.soldOut = true end
+                            log(string.format("[%s] 买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
+                                cal.label, offer.name, math.max(1, math.floor(got / offer.count)), got,
+                                money(offer.perRound),
+                                S.boughtBy[p.name], tonumber(CFG.targets[p.name]) or 0))
+                            return "bought"
+                        else
+                            -- 失败也进冷却：不然同一 tick 会反复点同一张卡，
+                            -- 而且会被误判成「整个口径没货」
+                            S.lastBuyAt[offer.key] = os.clock()
+                            S.lastBuyErr = tostring(why)
+                            S.lastMsg = string.format("[%s] 跳过 %s：%s", cal.label, offer.name, tostring(why))
+                            tried = tried + 1
+                        end
+                    else
+                        cooling = true
+                    end
+                end
+            end
+        end
+    end
+
+    if tried > 0 then return "fail", "本轮未成交" end
+    if cooling then return "cool", "冷却中" end
+    return "dry"
 end
 
 ------------------------------------------------------------------
@@ -579,7 +806,7 @@ local function setLbl(lbl, key, text)
     pcall(function() lbl:SetText(text) end)
 end
 
--- 某产品当前是否有货 / 是否全售罄
+-- 某产品当前是否有货 / 是否全售罄 / 是否根本没扫到
 local function stockState(calId, productName)
     local has, sold, any = false, false, false
     for _, q in ipairs(S.products[calId] or {}) do
@@ -589,8 +816,8 @@ local function stockState(calId, productName)
             if q.soldOut then sold = true end
         end
     end
-    if not any then return false, true end        -- 扫描里没有 = 不在售
-    return has, (not has) and sold
+    if not any then return false, false, true end     -- 不在售
+    return has, (not has) and sold, false
 end
 
 local function buildUI()
@@ -603,7 +830,7 @@ local function buildUI()
 
     local Window = Library:CreateWindow({
         Title = "HUSH 弹药采购",
-        Footer = "v3",
+        Footer = "v4",
         ToggleKeybind = Enum.KeyCode.RightControl,
         Resizable = true,
         ShowCustomCursor = false,
@@ -632,6 +859,7 @@ local function buildUI()
     --============ 控制 ============
     local gCtl = tabRun:AddLeftGroupbox("控制", "activity")
     P.lblState = gCtl:AddLabel("状态：空闲")
+    P.lblCal = gCtl:AddLabel("当前口径：—")
     P.lblRestock = gCtl:AddLabel("补货：—")
     P.lblBought = gCtl:AddLabel("已买：0 发")
     P.lblSpent = gCtl:AddLabel("花费：$0")
@@ -639,11 +867,14 @@ local function buildUI()
     P.toggleRun = gCtl:AddToggle("ammoRun", {
         Text = "启用自动购买",
         Default = false,
-        Tooltip = "按各弹种设定的目标发数购买；每包可能超出目标",
+        Tooltip = "按口径顺序：把当前口径下勾选且有货的弹种买空，再进下一个口径",
         Callback = function(v)
             S.running = v
             if v then
                 S.nextRescanAt = 0
+                S.dryCal = {}
+                S.currentCal = nil
+                S.needRescan = true
                 log("已启用")
             else
                 log("已暂停")
@@ -652,7 +883,7 @@ local function buildUI()
     })
 
     gCtl:AddButton({
-        Text = "立即重扫商品",
+        Text = "立即重扫（仅勾选的口径）",
         Func = function()
             S.nextRescanAt = 0
             S.needRescan = true
@@ -666,6 +897,7 @@ local function buildUI()
             S.spent = 0
             S.boughtBy = {}
             S.lastBuyAt = {}
+            S.dryCal = {}
             log("计数已清零")
         end
     })
@@ -692,6 +924,8 @@ local function buildUI()
                     pcall(function() row.input:SetValue(tostring(v)) end)
                     pcall(function() row.toggle:SetValue(v > 0) end)
                 end
+                S.dryCal = {}
+                S.needRescan = true
                 log(string.format("已载入 %d 条配置", n))
             else
                 log("配置文件不存在或为空")
@@ -717,7 +951,8 @@ local function buildUI()
             local lines = {}
             for name, n in pairs(CFG.targets) do
                 if (tonumber(n) or 0) > 0 then
-                    lines[#lines + 1] = name .. "\t" .. tostring(math.floor(tonumber(n)))
+                    lines[#lines + 1] = string.format("%s\t%s\t%d",
+                        nameCal(name) or "?", name, math.floor(tonumber(n)))
                 end
             end
             table.sort(lines)
@@ -766,6 +1001,8 @@ local function buildUI()
                                     CFG.targets[p.name] = 0
                                     pcall(function() row.input:SetValue("0") end)
                                 end
+                                S.nameToCal[p.name] = cal.id
+                                S.dryCal = {}
                                 queueSave()
                             end
                         })
@@ -780,6 +1017,8 @@ local function buildUI()
                                 local n = math.max(0, math.floor(tonumber(v) or 0))
                                 CFG.targets[p.name] = n
                                 pcall(function() row.toggle:SetValue(n > 0) end)
+                                S.nameToCal[p.name] = cal.id
+                                S.dryCal = {}
                                 queueSave()
                             end
                         })
@@ -787,14 +1026,22 @@ local function buildUI()
                     end
                 end
             end
-            -- 本次没扫到的产品先隐藏，保留已填目标
+
+            -- 本次没扫到的：有目标的保持可见并标「未在售」，没目标的隐藏
             for name, row in pairs(P.rows) do
                 if row.calId == cal.id and not seen[name] then
-                    pcall(function() row.toggle:SetVisible(false) end)
-                    pcall(function() row.input:SetVisible(false) end)
+                    if (tonumber(CFG.targets[name]) or 0) > 0 then
+                        pcall(function() row.toggle:SetVisible(true) end)
+                        pcall(function() row.input:SetVisible(true) end)
+                        pcall(function() row.toggle:SetText(name .. "  · 未在售") end)
+                    else
+                        pcall(function() row.toggle:SetVisible(false) end)
+                        pcall(function() row.input:SetVisible(false) end)
+                    end
                 end
             end
         end
+
         -- 刷一次文本（价格 / 售罄标记）
         for _, cal in ipairs(CALIBERS) do
             local done = {}
@@ -844,6 +1091,7 @@ local function refreshUI()
     end
 
     setLbl(P.lblState, "state", "状态：" .. stateText)
+    setLbl(P.lblCal, "cal", "当前口径：" .. (S.currentCal and calLabel(S.currentCal) or "—"))
     setLbl(P.lblRestock, "restock", "补货：" .. rText)
     setLbl(P.lblBought, "bought", string.format("已买：%d 发", S.bought))
     setLbl(P.lblSpent, "spent", "花费：" .. money(S.spent))
@@ -869,13 +1117,24 @@ local function refreshUI()
                 if allSold then soldN = soldN + 1 end
             end
         end
+        -- 配置里有、但当前扫描不到的目标（游戏改名 / 下架）
+        local staleN = 0
+        for nm, tv in pairs(CFG.targets) do
+            if (tonumber(tv) or 0) > 0 and nameCal(nm) == cal.id and not productExists(nm) then
+                staleN = staleN + 1
+            end
+        end
         local txt
-        if want == 0 then
+        if want == 0 and staleN == 0 then
             txt = string.format("%s：未设定", cal.label)
         else
             txt = string.format("%s：%d / %d", cal.label, got, want)
         end
-        if soldN > 0 then txt = txt .. string.format("（%d 售罄）", soldN) end
+        local tag = {}
+        if S.dryCal[cal.id] then tag[#tag + 1] = "选中项已买空" end
+        if soldN > 0 then tag[#tag + 1] = soldN .. " 售罄" end
+        if staleN > 0 then tag[#tag + 1] = staleN .. " 失效" end
+        if #tag > 0 then txt = txt .. "（" .. table.concat(tag, "，") .. "）" end
         setLbl(P.sumLabels[cal.id], "sum_" .. cal.id, txt)
     end
 end
@@ -894,7 +1153,7 @@ local function step()
     if S.needRescan or (not S.ready) then
         if not S.scanning then
             S.lastMsg = "扫描商品中…"
-            task.spawn(scanAll)
+            task.spawn(function() scanAll(S.ready) end)   -- 首次全量，之后只扫有目标的
         end
         return
     end
@@ -907,63 +1166,83 @@ local function step()
     end
 
     if not anyPending() then
-        S.lastMsg = "全部达标"
         S.waitingRestock = false
+        local stale = staleCount()
+        if stale > 0 then
+            S.lastMsg = string.format("%d 个目标已不在售（改名或下架），请重新勾选", stale)
+        else
+            S.lastMsg = "全部达标"
+        end
         return
     end
 
+    -- 1) 哪些口径还有未达标的目标
+    local pending = {}
     for _, cal in ipairs(CALIBERS) do
-        local list = S.products[cal.id] or {}
-        local seen = {}
-        for _, p in ipairs(list) do
-            if not seen[p.name] then
-                seen[p.name] = true
-                local remain = remainOf(p.name)
-                if remain > 0 then
-                    local offer = pickBestOffers(cal.id, p.name)[1]
-                    if offer then
-                        local cd = S.lastBuyAt[offer.key]
-                        if not cd or (os.clock() - cd) >= CFG.buyGap then
-                            local packsNeeded = math.ceil(remain / math.max(1, offer.count))
-                            local ok, got, why = buyFromOffer(cal, offer, packsNeeded)
-                            if ok then
-                                S.waitingRestock = false
-                                S.bought = S.bought + got
-                                S.boughtBy[p.name] = (S.boughtBy[p.name] or 0) + got
-                                S.spent = S.spent + offer.perRound * got
-                                offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
-                                if offer.stock == 0 then offer.soldOut = true end
-                                log(string.format("买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
-                                    offer.name, math.max(1, math.floor(got / offer.count)), got,
-                                    money(offer.perRound),
-                                    S.boughtBy[p.name], tonumber(CFG.targets[p.name]) or 0))
-                                return
-                            else
-                                S.lastMsg = "跳过 " .. offer.name .. "：" .. tostring(why)
-                            end
-                        end
-                    end
-                end
+        if caliberHasPending(cal.id) then pending[#pending + 1] = cal end
+    end
+
+    -- 2) 其中还没被判定买空的
+    local buyable = {}
+    for _, cal in ipairs(pending) do
+        if not S.dryCal[cal.id] then buyable[#buyable + 1] = cal end
+    end
+
+    if #buyable == 0 then
+        -- 全部买空 → 等补货，只在倒计时快归零时重扫
+        S.waitingRestock = true
+        S.currentCal = nil
+        local remain = restockRemain()
+        if remain then
+            S.lastMsg = "等待补货 " .. fmtTime(remain)
+            if remain <= CFG.rescanLead and not S.scanning then
+                task.spawn(function() scanAll(true) end)
+            end
+        elseif S.restockText ~= "" then
+            S.lastMsg = "等待补货（面板未打开）"
+            if os.clock() >= S.nextRescanAt and not S.scanning then
+                task.spawn(function() scanAll(true) end)
+            end
+        else
+            S.lastMsg = "等待补货"
+            if os.clock() >= S.nextRescanAt and not S.scanning then
+                task.spawn(function() scanAll(true) end)
             end
         end
+        return
     end
 
-    -- 一圈没成交 → 等补货
-    S.waitingRestock = true
-    local remain = restockRemain()
-    if remain then
-        S.lastMsg = "等待补货 " .. fmtTime(remain)
-    elseif S.restockText ~= "" then
-        S.lastMsg = "等待补货（面板未打开）"
-    else
-        S.lastMsg = "等待补货"
+    -- 3) 优先继续当前口径，把它买完再换
+    local target = nil
+    for _, cal in ipairs(buyable) do
+        if cal.id == S.currentCal then target = cal break end
     end
+    target = target or buyable[1]
 
-    local now = os.clock()
-    local due = (now >= S.nextRescanAt) or (remain ~= nil and remain <= 3)
-    if due and not S.scanning then
-        S.nextRescanAt = now + 25
-        task.spawn(scanAll)
+    local state, why = buyInCaliber(target)
+
+    if state == "bought" then
+        S.softFail[target.id] = 0
+    elseif state == "dry" then
+        S.dryCal[target.id] = true
+        S.softFail[target.id] = 0
+        if S.currentCal == target.id then S.currentCal = nil end
+        S.lastMsg = string.format("%s 已买空%s", target.label, why and ("（" .. why .. "）") or "")
+        log(S.lastMsg)
+    elseif state == "fail" then
+        -- 连续失败若干轮才认定买空，避免一次抖动就把整个口径判死
+        local n = (S.softFail[target.id] or 0) + 1
+        S.softFail[target.id] = n
+        S.lastMsg = string.format("%s 未成交（%s）%d/3", target.label, tostring(why or ""), n)
+        if n >= 3 then
+            S.dryCal[target.id] = true
+            S.softFail[target.id] = 0
+            if S.currentCal == target.id then S.currentCal = nil end
+            S.lastMsg = target.label .. " 连续 3 轮未成交，转等待补货"
+            log(S.lastMsg)
+        end
+    elseif state == "cool" then
+        S.lastMsg = string.format("%s %s", target.label, tostring(why or "冷却中"))
     end
 end
 
@@ -1017,7 +1296,7 @@ end)
 
 task.spawn(function()
     task.wait(1.5)
-    if isLobby() then pcall(scanAll) end
+    if isLobby() then pcall(function() scanAll(false) end) end
     if CFG.autoStart and hasAnyTarget() then
         S.running = true
         if P.toggleRun then pcall(function() P.toggleRun:SetValue(true) end) end
@@ -1029,13 +1308,17 @@ _G.HUSH_AMMO = {
     state = S,
     cfg = CFG,
     panel = P,
-    scan = scanAll,
+    scan = function(onlyTargeted) return scanAll(onlyTargeted ~= false) end,
+    scanAll = scanAll,
     readRestock = readRestock,
     restockRemain = restockRemain,
     saveConfig = saveConfig,
     loadConfig = loadConfig,
+    buyInCaliber = buyInCaliber,
     start = function()
         S.running = true
+        S.dryCal = {}
+        S.needRescan = true
         if P.toggleRun then pcall(function() P.toggleRun:SetValue(true) end) end
     end,
     stop = function()
@@ -1044,6 +1327,7 @@ _G.HUSH_AMMO = {
     end,
     setTarget = function(name, n)
         CFG.targets[name] = math.max(0, math.floor(tonumber(n) or 0))
+        S.dryCal = {}
         S.needRescan = true
         local row = P.rows[name]
         if row then
@@ -1055,7 +1339,11 @@ _G.HUSH_AMMO = {
     dispose = function()
         S.dead = true
         S.running = false
-        pcall(saveConfig)
+        -- 只有确实有目标、或本来就载入过配置时才落盘；
+        -- 否则空状态会把用户的配置文件覆盖掉
+        pcall(function()
+            if hasAnyTarget() or S.loadedFromFile then saveConfig() end
+        end)
         pcall(function()
             if P.library and P.library.ScreenGui then P.library.ScreenGui:Destroy() end
         end)
@@ -1067,4 +1355,4 @@ _G.HUSH_AMMO = {
     end,
 }
 
-log("v3 已加载 · RightCtrl 开关窗口")
+log("v4 已加载 · RightCtrl 开关窗口")
