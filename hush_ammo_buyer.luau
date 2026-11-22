@@ -71,7 +71,11 @@ local LIB_FILE = "obsidian_Library.lua"
 
 local CFG = {
     targets = {},          -- [商品名] = 目标发数；0 或 nil = 不买
-    buyGap = 4.25,         -- 同一 offer 冷却 4s，留点余量
+    buyGap = 1.2,          -- 同一 offer 冷却（越小越连贯）
+    maxBuysPerTick = 5,    -- 一轮最多连续成交几笔
+    tickBudget = 12,       -- 一轮最多占用多少秒
+    dryCooldown = 45,      -- 一张商品全失败后，暂停重试的秒数
+    refreshEvery = 12,     -- 每隔多少秒刷新一次页面数据（防卡片状态过期）
     chipWait = 0.35,       -- 切口径后等列表重建
     selectWait = 0.4,      -- 选中商品后等详情刷新
     tickGap = 0.35,
@@ -107,6 +111,8 @@ local S = {
     nameToCal = {},        -- [商品名] = calId，配置里保留，弹种下架后也能定位口径
     currentCal = nil,      -- 当前正在处理的口径
     dryCal = {},           -- [calId] = true 本轮已确认买空
+    dryProduct = {},       -- [商品名] = 冷却到期时间（页面数据与服务器不一致时避免死磕）
+    lastRefresh = 0,
     softFail = {},         -- [calId] = 连续未成交轮数
     lastBuyAt = {},        -- [offerKey] = os.clock()
     scanning = false,
@@ -594,6 +600,21 @@ local function ensureBuyPage()
 
     if not root then return false, "菜单未打开" end
 
+    -- 页面存在但没有 tab 句柄（上一次会话构建的）：重建一次，拿到 refresh 能力
+    if pt and #pt:GetDescendants() >= 40 and not S.pageTab then
+        local okb, whyb = buildTradersPage()
+        task.wait(0.35)
+        pt = pages and pages:FindFirstChild("Page_traders")
+        local body0 = tradersBody()
+        if body0 and S.pageTab then
+            ensureAmmoTab(body0)
+            return true, "已重建 Gunner 页（后台）"
+        end
+        if not okb then
+            log("重建 Gunner 页失败：" .. tostring(whyb))
+        end
+    end
+
     -- 页面不存在或只有空壳：直接后台构建（不需要鼠标/焦点）
     if not pt or #pt:GetDescendants() < 40 then
         local okb, whyb = buildTradersPage()
@@ -958,6 +979,7 @@ local function scanAll(onlyTargeted)
 
     -- 重扫后重新判断哪些口径还有货
     S.dryCal = {}
+    S.dryProduct = {}
     S.softFail = {}
     S.currentCal = nil
     S.scanning = false
@@ -1052,7 +1074,6 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     end
     if not card() then return false, 0, "卡片未出现:" .. tostring(offer.key) end
     click(card())
-    task.wait(CFG.selectWait)
 
     local detail = body.Detail.Panel.Content
 
@@ -1068,9 +1089,15 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     end
     local wantTitle = norm(offer.name)
     local title = detailTitle()
+    -- 自适应等待：标题一匹配就继续，不再固定等 0.4 秒
+    local deadline = os.clock() + 0.7
+    while os.clock() < deadline and (title == "" or norm(title) ~= wantTitle) do
+        task.wait(0.05)
+        title = detailTitle()
+    end
     if title ~= "" and norm(title) ~= wantTitle then
-        for _ = 1, 6 do
-            task.wait(0.15)
+        for _ = 1, 4 do
+            task.wait(0.08)
             title = detailTitle()
             if norm(title) == wantTitle then break end
             if card() then click(card()) end
@@ -1084,7 +1111,7 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     -- 买过之后该 listing 可能达到限购上限：游戏会直接把 Qty 控件移除，
     -- 只剩 Price / BuyButton。这不是异常，标成不可买然后跳过。
     if not qtyFrame then
-        task.wait(0.3)
+        task.wait(0.12)
         qtyFrame = detail.Foot:FindFirstChild("Qty")
     end
     if not qtyFrame then
@@ -1099,7 +1126,7 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
     local packs = math.min(packsWanted, maxPacks, 50)
     if packs < 1 then
         -- 再确认一次，避免详情刚切过来时读到旧值
-        task.wait(0.25)
+        task.wait(0.1)
         maxPacks = tonumber(get(qtyFrame, "QtyMax")) or 0
         packs = math.min(packsWanted, maxPacks, 50)
         if packs < 1 then
@@ -1111,13 +1138,13 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
 
     -- 点 QtyMax 再减到目标值，比连点加号稳
     click(qtyFrame:FindFirstChild("QtyMax"))
-    task.wait(0.12)
+    task.wait(0.07)
     local cur = tonumber(get(qtyFrame, "Qty")) or 1
     local minus = qtyFrame:FindFirstChild("QtyMinus")
     local guard = 0
     while cur > packs and guard < 60 do
         click(minus)
-        task.wait(0.06)
+        task.wait(0.04)
         cur = tonumber(get(qtyFrame, "Qty")) or cur
         guard = guard + 1
     end
@@ -1164,52 +1191,67 @@ local function buyInCaliber(cal)
 
     local list = S.products[cal.id] or {}
     local seen = {}
+    local buys, fail = 0, 0
     local cooling = false
-    local tried = 0
+    local deadline = os.clock() + (CFG.tickBudget or 12)
+
+    -- 同一商品名下有多张不同价/不同库存的卡：一张在冷却就试下一张
+    local function attempt(name)
+        if (S.dryProduct[name] or 0) > os.clock() then return false end
+        local remain = remainOf(name)
+        if remain <= 0 then return false end
+        local offers = pickBestOffers(cal.id, name)
+        for _, offer in ipairs(offers) do
+            if buys >= CFG.maxBuysPerTick or os.clock() > deadline then return false end
+            local cd = S.lastBuyAt[offer.key]
+            if cd and (os.clock() - cd) < CFG.buyGap then
+                cooling = true
+            else
+                local packsNeeded = math.ceil(remain / math.max(1, offer.count))
+                local ok, got, why = buyFromOffer(cal, offer, packsNeeded, true)
+                if ok then
+                    recordCard(offer, "bought", string.format("+%d发", got))
+                    S.waitingRestock = false
+                    S.boughtBy[name] = (S.boughtBy[name] or 0) + got
+                    S.spentBy[name] = (S.spentBy[name] or 0) + offer.perRound * got
+                    S.boughtDirty = true
+                    recomputeTotals()
+                    offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
+                    if offer.stock == 0 then offer.soldOut = true end
+                    buys = buys + 1
+                    log(string.format("[%s] 买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
+                        cal.label, offer.name, math.max(1, math.floor(got / offer.count)), got,
+                        money(offer.perRound),
+                        S.boughtBy[name], tonumber(CFG.targets[name]) or 0))
+                    return true
+                else
+                    -- 失败也进短冷却：避免同一 tick 反复点同一张卡
+                    S.lastBuyAt[offer.key] = os.clock()
+                    recordCard(offer, "fail", tostring(why))
+                    S.lastBuyErr = tostring(why)
+                    S.lastMsg = string.format("[%s] 跳过 %s：%s", cal.label, name, tostring(why))
+                    fail = fail + 1
+                end
+            end
+        end
+        -- 所有挂牌都失败：认为这一商品当前与服务器不一致，暂停重试
+        S.dryProduct[name] = os.clock() + (CFG.dryCooldown or 45)
+        return false
+    end
 
     for _, p in ipairs(list) do
+        if buys >= CFG.maxBuysPerTick or os.clock() > deadline then break end
         if not seen[p.name] then
             seen[p.name] = true
-            local remain = remainOf(p.name)
-            if remain > 0 then
-                local offer = pickBestOffers(cal.id, p.name)[1]
-                if offer then
-                    local cd = S.lastBuyAt[offer.key]
-                    if not cd or (os.clock() - cd) >= CFG.buyGap then
-                        local packsNeeded = math.ceil(remain / math.max(1, offer.count))
-                        local ok, got, why = buyFromOffer(cal, offer, packsNeeded, true)
-                        if ok then
-                            recordCard(offer, "bought", string.format("+%d发", got))
-                            S.waitingRestock = false
-                            S.boughtBy[p.name] = (S.boughtBy[p.name] or 0) + got
-                            S.spentBy[p.name] = (S.spentBy[p.name] or 0) + offer.perRound * got
-                            S.boughtDirty = true
-                            recomputeTotals()
-                            offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
-                            if offer.stock == 0 then offer.soldOut = true end
-                            log(string.format("[%s] 买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
-                                cal.label, offer.name, math.max(1, math.floor(got / offer.count)), got,
-                                money(offer.perRound),
-                                S.boughtBy[p.name], tonumber(CFG.targets[p.name]) or 0))
-                            return "bought"
-                        else
-                            -- 失败也进冷却：不然同一 tick 会反复点同一张卡，
-                            -- 而且会被误判成「整个口径没货」
-                            S.lastBuyAt[offer.key] = os.clock()
-                            recordCard(offer, "fail", tostring(why))
-                            S.lastBuyErr = tostring(why)
-                            S.lastMsg = string.format("[%s] 跳过 %s：%s", cal.label, offer.name, tostring(why))
-                            tried = tried + 1
-                        end
-                    else
-                        cooling = true
-                    end
-                end
+            if attempt(p.name) and buys < CFG.maxBuysPerTick then
+                -- 成交一笔后不停，继续下一个商品：连贯购买
+                task.wait(0.05)
             end
         end
     end
 
-    if tried > 0 then return "fail", "本轮未成交" end
+    if buys > 0 then return "bought", string.format("本轮成交 %d 笔", buys) end
+    if fail > 0 then return "fail", "本轮未成交" end
     if cooling then return "cool", "冷却中" end
     return "dry"
 end
@@ -1624,6 +1666,15 @@ end
 local function step()
     autoDismiss()
 
+    -- 定期刷新页面数据，避免卡片库存与服务器脱节
+    if S.pageTab and type(S.pageTab.refresh) == "function" then
+        local now = os.clock()
+        if now - (S.lastRefresh or 0) >= (CFG.refreshEvery or 12) then
+            S.lastRefresh = now
+            pcall(function() S.pageTab.refresh() end)
+        end
+    end
+
     if not isLobby() then
         S.lastMsg = "等待进入大厅"
         return
@@ -1730,8 +1781,9 @@ local function step()
         if n >= 3 then
             S.dryCal[target.id] = true
             S.softFail[target.id] = 0
+            S.needRescan = true
             if S.currentCal == target.id then S.currentCal = nil end
-            S.lastMsg = target.label .. " 连续 3 轮未成交，转等待补货"
+            S.lastMsg = target.label .. " 连续 3 轮未成交，重扫页面"
             log(S.lastMsg)
         end
     elseif state == "cool" then
@@ -1820,6 +1872,7 @@ _G.HUSH_AMMO = {
     loadBought = loadBought,
     buyInCaliber = buyInCaliber,
     ensureBuyPage = ensureBuyPage,
+    buildPage = function() return buildTradersPage() end,
     cards = function()
         local list = {}
         for _, c in pairs(S.cards or {}) do list[#list + 1] = c end
