@@ -917,6 +917,14 @@ local function scanAll(onlyTargeted)
     if S.scanning then return end
     S.scanning = true
     S.scanStartAt = os.clock()
+
+    -- 手工构建的页面不会像原生页那样自动同步服务器数据：
+    -- 每次扫描前重建一次，保证卡片库存/限购是最新的
+    if S.pageTab and S.pageFrame then
+        local okR, whyR = buildTradersPage()
+        if not okR then log("扫描前重建页面失败：" .. tostring(whyR)) end
+        task.wait(0.25)
+    end
     S.scanEpoch = (S.scanEpoch or 0) + 1
 
     local targets = {}
