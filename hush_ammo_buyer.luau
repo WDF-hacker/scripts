@@ -35,6 +35,20 @@
 local Players = game:GetService("Players")
 local lp = Players.LocalPlayer
 
+-- autoexec 场景下 LocalPlayer 可能还没就绪，后面所有函数都捕获这个变量
+do
+    local guard = 0
+    while not lp and guard < 300 do
+        task.wait(0.1)
+        lp = Players.LocalPlayer
+        guard = guard + 1
+    end
+end
+if not lp then
+    warn("[AMMO] LocalPlayer 未就绪，放弃加载")
+    return
+end
+
 ------------------------------------------------------------------
 -- 旧实例清理：不清理会导致两个主循环同时下单
 ------------------------------------------------------------------
