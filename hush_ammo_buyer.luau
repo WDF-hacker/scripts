@@ -71,8 +71,10 @@ local LIB_FILE = "obsidian_Library.lua"
 
 local CFG = {
     targets = {},          -- [商品名] = 目标发数；0 或 nil = 不买
-    buyGap = 1.2,          -- 同一 offer 冷却（越小越连贯）
-    maxBuysPerTick = 5,    -- 一轮最多连续成交几笔
+    buyGap = 1.6,          -- 同一 offer 冷却
+    maxBuysPerTick = 3,    -- 一轮最多连续成交几笔（太快服务器会不认）
+    interBuyWait = 0.35,   -- 两笔成交之间的间隔
+    confirmWait = 1.2,     -- 点击购买后等待卡片/按钮确认的时间
     tickBudget = 12,       -- 一轮最多占用多少秒
     dryCooldown = 45,      -- 一张商品全失败后，暂停重试的秒数
     waitRescanEvery = 20,  -- 等待补货期间，每隔多少秒强制重扫一次
@@ -1205,9 +1207,44 @@ local function buyFromOffer(cal, offer, packsWanted, skipChip)
         return false, 0, "已售罄"
     end
 
+    local function cardLabel()
+        local c = card()
+        if not c then return nil end
+        for _, d in ipairs(c:GetDescendants()) do
+            if d:IsA("TextLabel") and d.Name == "Label" then return d.Text end
+        end
+        return nil
+    end
+    local beforeLabel = cardLabel()
+    local beforeTitle = detailTitle()
+
     click(buyBtn)
     S.lastBuyAt[offer.key] = os.clock()
-    return true, packs * offer.count, "已下单"
+
+    -- 等服务器确认：卡片 Label 变化 / 按钮变 SOLD-out / 详情标题变化 才算成交
+    local confirmed = false
+    local confirmDeadline = os.clock() + (CFG.confirmWait or 1.2)
+    while os.clock() < confirmDeadline do
+        task.wait(0.05)
+        local nowLabel = cardLabel()
+        if nowLabel == nil or nowLabel ~= beforeLabel then
+            confirmed = true
+            break
+        end
+        local bb = detail.Foot:FindFirstChild("BuyButton")
+        local lab = textOf(bb and bb.Inner and bb.Inner:FindFirstChild("Text"))
+        local flat2 = string.lower(lab):gsub("[^%w]", "")
+        if flat2:find("sold") or flat2:find("locked") or flat2:find("full") then
+            confirmed = true
+            break
+        end
+    end
+
+    if not confirmed then
+        return false, 0, "未确认成交（服务器未响应）"
+    end
+    task.wait(0.12)
+    return true, packs * offer.count, "已成交"
 end
 
 ------------------------------------------------------------------
@@ -1259,6 +1296,9 @@ local function buyInCaliber(cal)
                     offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
                     if offer.stock == 0 then offer.soldOut = true end
                     buys = buys + 1
+                    if buys < CFG.maxBuysPerTick then
+                        task.wait(CFG.interBuyWait or 0.35)
+                    end
                     log(string.format("[%s] 买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
                         cal.label, offer.name, math.max(1, math.floor(got / offer.count)), got,
                         money(offer.perRound),
