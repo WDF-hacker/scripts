@@ -75,6 +75,7 @@ local CFG = {
     maxBuysPerTick = 5,    -- 一轮最多连续成交几笔
     tickBudget = 12,       -- 一轮最多占用多少秒
     dryCooldown = 45,      -- 一张商品全失败后，暂停重试的秒数
+    waitRescanEvery = 20,  -- 等待补货期间，每隔多少秒强制重扫一次
     refreshEvery = 12,     -- 每隔多少秒刷新一次页面数据（防卡片状态过期）
     chipWait = 0.35,       -- 切口径后等列表重建
     selectWait = 0.4,      -- 选中商品后等详情刷新
@@ -1733,10 +1734,32 @@ local function step()
     end
 
     if #buyable == 0 then
-        -- 全部买空 → 等补货，只在倒计时快归零时重扫
+        -- 全部买空 → 等补货
         S.waitingRestock = true
         S.currentCal = nil
         local remain = restockRemain()
+        local prev = S.lastRestockRemain
+        S.lastRestockRemain = remain
+
+        -- 补货刚发生：倒计时突然变大（进入新一轮）→ 清空买空标记并立即重扫
+        if remain and prev and remain > prev + 20 then
+            S.dryCal = {}
+            S.dryProduct = {}
+            S.needRescan = true
+            S.lastWaitScan = os.clock()
+            log("检测到补货，立即重扫")
+            return
+        end
+
+        -- 等待期间也定期重扫，避免补货后一直干等下一轮倒计时
+        local now = os.clock()
+        if not S.scanning and (now - (S.lastWaitScan or 0)) >= (CFG.waitRescanEvery or 20) then
+            S.lastWaitScan = now
+            S.needRescan = true
+            log("等待补货期间定期重扫")
+            return
+        end
+
         if remain then
             S.lastMsg = "等待补货 " .. fmtTime(remain)
             if remain <= CFG.rescanLead and not S.scanning then
