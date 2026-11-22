@@ -65,7 +65,8 @@ end
 -- 配置
 ------------------------------------------------------------------
 local CONFIG_FILE = "hush_ammo_config.txt"
-local BOUGHT_FILE = "hush_ammo_bought.txt"   -- 已买数量，重连/重载后不丢
+local BOUGHT_FILE = "hush_ammo_bought.txt"
+local CARDS_FILE = "hush_ammo_cards.txt"   -- 已买数量，重连/重载后不丢
 local LIB_FILE = "obsidian_Library.lua"
 
 local CFG = {
@@ -674,6 +675,50 @@ local function parseOffer(o, calId)
     }
 end
 
+--============ 卡片登记 ============
+-- 每张挂牌卡片按 offer.key 记录：名字/口径/包数/单价/库存/状态
+-- 状态：in_stock | sold_out | empty | fail:<原因> | bought | gone
+local function recordCard(rec, state, note)
+    if type(rec) ~= "table" or not rec.key then return end
+    S.cards = S.cards or {}
+    local c = S.cards[rec.key]
+    if not c then
+        c = { key = rec.key }
+        S.cards[rec.key] = c
+    end
+    c.name = rec.name or c.name
+    c.calId = rec.calId or c.calId
+    c.count = rec.count or c.count
+    c.price = rec.price or c.price
+    c.perRound = rec.perRound or c.perRound
+    c.stock = rec.stock or 0
+    c.soldOut = rec.soldOut == true
+    if state then c.state = state end
+    if note then c.note = note end
+    c.seen = S.scanEpoch or 0
+    return c
+end
+
+local function saveCards()
+    if not (writefile and S.cards) then return end
+    local lines = { "# HUSH 卡片状态  " .. os.date("%Y-%m-%d %H:%M:%S") }
+    local list = {}
+    for _, c in pairs(S.cards) do list[#list + 1] = c end
+    table.sort(list, function(a, b)
+        if a.calId ~= b.calId then return tostring(a.calId) < tostring(b.calId) end
+        if (a.perRound or 0) ~= (b.perRound or 0) then return (a.perRound or 0) < (b.perRound or 0) end
+        return tostring(a.key) < tostring(b.key)
+    end)
+    for _, c in ipairs(list) do
+        lines[#lines + 1] = string.format("%s\t%s\t%s\t%d\t%d\t%s\t%.2f\t%s\t%s",
+            tostring(c.calId or "?"), tostring(c.key), tostring(c.name),
+            math.floor(tonumber(c.count) or 0), math.floor(tonumber(c.stock) or 0),
+            tostring(c.price or 0), tonumber(c.perRound) or 0,
+            tostring(c.state or ""), tostring(c.note or ""))
+    end
+    pcall(writefile, CARDS_FILE, table.concat(lines, "\n"))
+end
+
 local function scanCaliber(cal)
     local body = tradersBody()
     if not body then return nil end
@@ -690,7 +735,10 @@ local function scanCaliber(cal)
     for _, o in ipairs(body.Offers:GetChildren()) do
         if o:IsA("TextButton") and o.Name ~= "kit_starter" then
             local rec = parseOffer(o, cal.id)
-            if rec then out[#out + 1] = rec end
+            if rec then
+                recordCard(rec, rec.soldOut and "sold_out" or ((rec.stock or 0) > 0 and "in_stock" or "empty"))
+                out[#out + 1] = rec
+            end
         end
     end
     return out
@@ -708,6 +756,7 @@ local function scanAllList()
                 local cal = inferCal(rec.name)
                 if cal then
                     rec.calId = cal
+                    recordCard(rec, rec.soldOut and "sold_out" or ((rec.stock or 0) > 0 and "in_stock" or "empty"))
                     grouped[cal] = grouped[cal] or {}
                     table.insert(grouped[cal], rec)
                 end
@@ -743,6 +792,7 @@ local function scanAll(onlyTargeted)
     if S.scanning then return end
     S.scanning = true
     S.scanStartAt = os.clock()
+    S.scanEpoch = (S.scanEpoch or 0) + 1
 
     local targets = {}
     if onlyTargeted then
@@ -756,6 +806,7 @@ local function scanAll(onlyTargeted)
 
     local total, sold = 0, 0
     local calMapChanged = false
+    local scannedCals = {}
 
     local body = tradersBody()
     local hasCalibres = body and body.FilterBox and body.FilterBox:FindFirstChild("Calibres")
@@ -763,6 +814,7 @@ local function scanAll(onlyTargeted)
 
     if hasCalibres then
         for _, cal in ipairs(targets) do
+            scannedCals[cal.id] = true
             local ok, res = pcall(scanCaliber, cal)
             local list = (ok and res) or {}
             S.products[cal.id] = list
@@ -780,6 +832,7 @@ local function scanAll(onlyTargeted)
     if not scanned then
         local grouped = scanAllList()
         for calId, list in pairs(grouped) do
+            scannedCals[calId] = true
             S.products[calId] = list
             for _, p in ipairs(list) do
                 total = total + 1
@@ -806,10 +859,17 @@ local function scanAll(onlyTargeted)
     S.currentCal = nil
     S.scanning = false
     S.scanStartAt = 0
+    for key, c in pairs(S.cards or {}) do
+        if scannedCals[c.calId or ""] and c.seen ~= S.scanEpoch then
+            S.cards[key] = nil
+        end
+    end
     S.ready = true
     S.needRescan = false
     S.nextRescanAt = os.clock() + CFG.fallbackRescan
     if P.onScan then pcall(P.onScan) end
+
+    pcall(saveCards)
 
     if total == 0 then
         S.needRescan = true          -- 没扫到东西，下一轮重新导航再试
@@ -1016,6 +1076,7 @@ local function buyInCaliber(cal)
                         local packsNeeded = math.ceil(remain / math.max(1, offer.count))
                         local ok, got, why = buyFromOffer(cal, offer, packsNeeded, true)
                         if ok then
+                            recordCard(offer, "bought", string.format("+%d发", got))
                             S.waitingRestock = false
                             S.boughtBy[p.name] = (S.boughtBy[p.name] or 0) + got
                             S.spentBy[p.name] = (S.spentBy[p.name] or 0) + offer.perRound * got
@@ -1032,6 +1093,7 @@ local function buyInCaliber(cal)
                             -- 失败也进冷却：不然同一 tick 会反复点同一张卡，
                             -- 而且会被误判成「整个口径没货」
                             S.lastBuyAt[offer.key] = os.clock()
+                            recordCard(offer, "fail", tostring(why))
                             S.lastBuyErr = tostring(why)
                             S.lastMsg = string.format("[%s] 跳过 %s：%s", cal.label, offer.name, tostring(why))
                             tried = tried + 1
@@ -1269,6 +1331,7 @@ local function buildUI()
     for _, cal in ipairs(CALIBERS) do
         P.sumLabels[cal.id] = gSum:AddLabel(cal.label .. "：-")
     end
+    P.cardLbl = gSum:AddLabel("卡片：-")
 
     --============ 扫描后追建产品行 ============
     P.onScan = function()
@@ -1358,6 +1421,22 @@ local function buildUI()
                     end
                 end
             end
+        end
+
+        -- 卡片级汇总：按挂牌计数（同一商品可能有多张不同价/不同库存的卡）
+        local cTotal, cIn, cSold = 0, 0, 0
+        for _, cd in pairs(S.cards or {}) do
+            cTotal = cTotal + 1
+            if cd.state == "in_stock" then
+                cIn = cIn + 1
+            elseif cd.state == "sold_out" then
+                cSold = cSold + 1
+            end
+        end
+        if P.cardLbl then
+            pcall(function()
+                P.cardLbl:SetText(string.format("卡片 %d：在售 %d · 售罄 %d", cTotal, cIn, cSold))
+            end)
         end
     end
 
@@ -1638,6 +1717,16 @@ _G.HUSH_AMMO = {
     loadBought = loadBought,
     buyInCaliber = buyInCaliber,
     ensureBuyPage = ensureBuyPage,
+    cards = function()
+        local list = {}
+        for _, c in pairs(S.cards or {}) do list[#list + 1] = c end
+        table.sort(list, function(a, b)
+            if a.calId ~= b.calId then return tostring(a.calId) < tostring(b.calId) end
+            return (a.perRound or 0) < (b.perRound or 0)
+        end)
+        return list
+    end,
+    saveCards = saveCards,
     start = function()
         S.running = true
         S.dryCal = {}
