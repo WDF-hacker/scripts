@@ -72,8 +72,10 @@ local LIB_FILE = "obsidian_Library.lua"
 local CFG = {
     targets = {},          -- [商品名] = 目标发数；0 或 nil = 不买
     buyGap = 1.6,          -- 同一 offer 冷却
-    maxBuysPerTick = 3,    -- 一轮最多连续成交几笔（太快服务器会不认）
-    interBuyWait = 0.35,   -- 两笔成交之间的间隔
+    maxBuysPerTick = 1,    -- 一轮只成交一笔：成功后才处理下一张卡
+    cardRetries = 3,       -- 同一张卡最多重试几次
+    cardRetryWait = 1.2,   -- 同一张卡重试间隔
+    switchWait = 0.4,      -- 放弃一张卡后，切下一张前的停顿
     confirmWait = 1.2,     -- 点击购买后等待卡片/按钮确认的时间
     tickBudget = 12,       -- 一轮最多占用多少秒
     dryCooldown = 45,      -- 一张商品全失败后，暂停重试的秒数
@@ -1255,7 +1257,6 @@ local function buyInCaliber(cal)
     local body = tradersBody()
     if not body then return "wait", "无交易面板" end
 
-    -- 有口径芯片才切；没有说明当前是 ALL 列表，卡片已经在列表里了
     local calBox = body.FilterBox:FindFirstChild("Calibres")
     if calBox and S.currentCal ~= cal.id then
         local chip = calBox:FindFirstChild(cal.chip)
@@ -1268,70 +1269,73 @@ local function buyInCaliber(cal)
 
     local list = S.products[cal.id] or {}
     local seen = {}
-    local buys, fail = 0, 0
     local cooling = false
-    local deadline = os.clock() + (CFG.tickBudget or 12)
+    local deadline = os.clock() + (CFG.tickBudget or 20)
 
-    -- 同一商品名下有多张不同价/不同库存的卡：一张在冷却就试下一张
-    local function attempt(name)
-        if (S.dryProduct[name] or 0) > os.clock() then return false end
-        local remain = remainOf(name)
-        if remain <= 0 then return false end
-        local offers = pickBestOffers(cal.id, name)
-        for _, offer in ipairs(offers) do
-            if buys >= CFG.maxBuysPerTick or os.clock() > deadline then return false end
-            local cd = S.lastBuyAt[offer.key]
-            if cd and (os.clock() - cd) < CFG.buyGap then
-                cooling = true
-            else
-                local packsNeeded = math.ceil(remain / math.max(1, offer.count))
-                local ok, got, why = buyFromOffer(cal, offer, packsNeeded, true)
-                if ok then
-                    recordCard(offer, "bought", string.format("+%d发", got))
-                    S.waitingRestock = false
-                    S.boughtBy[name] = (S.boughtBy[name] or 0) + got
-                    S.spentBy[name] = (S.spentBy[name] or 0) + offer.perRound * got
-                    S.boughtDirty = true
-                    recomputeTotals()
-                    offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
-                    if offer.stock == 0 then offer.soldOut = true end
-                    buys = buys + 1
-                    if buys < CFG.maxBuysPerTick then
-                        task.wait(CFG.interBuyWait or 0.35)
+    for _, p in ipairs(list) do
+        if os.clock() > deadline then break end
+        if not seen[p.name] then
+            seen[p.name] = true
+            if (S.dryProduct[p.name] or 0) <= os.clock() then
+                local remain = remainOf(p.name)
+                if remain > 0 then
+                    local offers = pickBestOffers(cal.id, p.name)
+                    local attempted = false
+                    for _, offer in ipairs(offers) do
+                        if os.clock() > deadline then break end
+                        local cd = S.lastBuyAt[offer.key]
+                        if cd and (os.clock() - cd) < CFG.buyGap then
+                            cooling = true
+                        else
+                            attempted = true
+                            local packsNeeded = math.ceil(remain / math.max(1, offer.count))
+                            local okF, got, why = false, 0, nil
+
+                            -- 同一张卡：失败就等一会儿再试，直到成功或重试用尽
+                            for attempt = 1, (CFG.cardRetries or 3) do
+                                okF, got, why = buyFromOffer(cal, offer, packsNeeded, true)
+                                if okF then break end
+                                S.lastMsg = string.format("[%s] %s 第 %d/%d 次未成功：%s",
+                                    cal.label, offer.name, attempt, CFG.cardRetries or 3, tostring(why))
+                                if attempt < (CFG.cardRetries or 3) then
+                                    task.wait(CFG.cardRetryWait or 1.2)
+                                end
+                            end
+
+                            if okF then
+                                recordCard(offer, "bought", string.format("+%d发", got))
+                                S.waitingRestock = false
+                                S.boughtBy[p.name] = (S.boughtBy[p.name] or 0) + got
+                                S.spentBy[p.name] = (S.spentBy[p.name] or 0) + offer.perRound * got
+                                S.boughtDirty = true
+                                recomputeTotals()
+                                offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
+                                if offer.stock == 0 then offer.soldOut = true end
+                                log(string.format("[%s] 买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
+                                    cal.label, offer.name, math.max(1, math.floor(got / offer.count)), got,
+                                    money(offer.perRound),
+                                    S.boughtBy[p.name], tonumber(CFG.targets[p.name]) or 0))
+                                -- 成功即返回：下一张卡留到下一轮
+                                return "bought", string.format("%s 已成交", offer.name)
+                            else
+                                S.lastBuyAt[offer.key] = os.clock()
+                                recordCard(offer, "fail", tostring(why))
+                                S.lastBuyErr = tostring(why)
+                                S.lastMsg = string.format("[%s] %s 连续 %d 次未成功：%s，换下一张",
+                                    cal.label, offer.name, CFG.cardRetries or 3, tostring(why))
+                                task.wait(CFG.switchWait or 0.4)
+                            end
+                        end
                     end
-                    log(string.format("[%s] 买入 %s x%d包 = %d发（%s/发）｜本弹种 %d/%d",
-                        cal.label, offer.name, math.max(1, math.floor(got / offer.count)), got,
-                        money(offer.perRound),
-                        S.boughtBy[name], tonumber(CFG.targets[name]) or 0))
-                    return true
-                else
-                    -- 失败也进短冷却：避免同一 tick 反复点同一张卡
-                    S.lastBuyAt[offer.key] = os.clock()
-                    recordCard(offer, "fail", tostring(why))
-                    S.lastBuyErr = tostring(why)
-                    S.lastMsg = string.format("[%s] 跳过 %s：%s", cal.label, name, tostring(why))
-                    fail = fail + 1
+                    if attempted and not S.dryProduct[p.name] then
+                        -- 该商品本轮所有卡都没成功：冷却一段时间再碰
+                        S.dryProduct[p.name] = os.clock() + (CFG.dryCooldown or 45)
+                    end
                 end
             end
         end
-        -- 所有挂牌都失败：认为这一商品当前与服务器不一致，暂停重试
-        S.dryProduct[name] = os.clock() + (CFG.dryCooldown or 45)
-        return false
     end
 
-    for _, p in ipairs(list) do
-        if buys >= CFG.maxBuysPerTick or os.clock() > deadline then break end
-        if not seen[p.name] then
-            seen[p.name] = true
-            if attempt(p.name) and buys < CFG.maxBuysPerTick then
-                -- 成交一笔后不停，继续下一个商品：连贯购买
-                task.wait(0.05)
-            end
-        end
-    end
-
-    if buys > 0 then return "bought", string.format("本轮成交 %d 笔", buys) end
-    if fail > 0 then return "fail", "本轮未成交" end
     if cooling then return "cool", "冷却中" end
     return "dry"
 end
