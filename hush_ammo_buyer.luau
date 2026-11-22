@@ -66,7 +66,13 @@ local S = {
     lastBuyAt = {},        -- [offerKey] = os.clock()
     scanning = false,
     ready = false,
+    waitingRestock = false,   -- 买空后等待补货
+    restockText = "",         -- "Restock in 12:44"
+    nextRescanAt = 0,
 }
+
+-- 面板句柄（提前声明，scanAll 会回调 P.rebuild）
+local P = { gui = nil, frame = nil, rows = {}, visible = true, status = nil, boughtLbl = nil }
 
 ------------------------------------------------------------------
 -- 工具
@@ -185,6 +191,20 @@ end
 ------------------------------------------------------------------
 -- 扫描商品
 ------------------------------------------------------------------
+-- 读商人整体补货倒计时："Restock in 12:44" / "在 13:54 时间内重新补货"
+local function readRestock()
+    local body = tradersBody()
+    if not body then return "", nil end
+    local tb = body:FindFirstChild("Toolbar")
+    local rf = tb and tb:FindFirstChild("Restock")
+    local lbl = rf and rf:FindFirstChild("Text")
+    local txt = textOf(lbl)
+    if txt == "" then return "", nil end
+    local m, sec = txt:match("(%d+):(%d+)")
+    local seconds = m and (tonumber(m) * 60 + tonumber(sec)) or nil
+    return txt, seconds
+end
+
 local function scanCaliber(cal)
     local body = tradersBody()
     if not body then return nil end
@@ -243,6 +263,7 @@ local function scanAll()
     end
     S.scanning = false
     S.ready = true
+    if P.rebuild then pcall(P.rebuild) end
     local total = 0
     for _, v in pairs(S.products) do total = total + #v end
     log("扫描完成，共 " .. total .. " 个挂牌")
@@ -315,7 +336,6 @@ end
 ------------------------------------------------------------------
 -- 面板
 ------------------------------------------------------------------
-local P = { gui = nil, frame = nil, rows = {}, visible = true, status = nil, boughtLbl = nil }
 
 local function mk(className, props, parent)
     local o = Instance.new(className)
@@ -327,6 +347,7 @@ local function mk(className, props, parent)
 end
 
 local function buildPanel()
+P.rebuild = rebuildList
     local host = (gethui and gethui()) or game:GetService("CoreGui")
     local old = host:FindFirstChild("HushAmmo")
     if old then old:Destroy() end
@@ -543,8 +564,8 @@ end
 ------------------------------------------------------------------
 local function updateStatus()
     if not P.status then return end
-    P.status.Text = string.format("%s | 已买 %d 发 | 花 $%d",
-        S.running and "运行中" or S.lastMsg, S.bought, math.floor(S.spent))
+    local head = S.running and (S.waitingRestock and S.lastMsg or "运行中") or S.lastMsg
+    P.status.Text = string.format("%s | 已买 %d 发 | 花 $%d", head, S.bought, math.floor(S.spent))
     if P.boughtLbl then
         P.boughtLbl.Text = string.format("已买 %d 发 / 目标 %d", S.bought, CFG.threshold)
     end
@@ -595,6 +616,7 @@ local function step()
                         local packsNeeded = math.ceil(remain / math.max(1, offer.count))
                         local ok, got, why = buyFromOffer(cal, offer, packsNeeded)
                         if ok then
+                            S.waitingRestock = false
                             S.bought = S.bought + got
                             S.spent = S.spent + offer.perRound * got
                             offer.stock = math.max(0, offer.stock - math.max(1, math.floor(got / offer.count)))
@@ -608,6 +630,24 @@ local function step()
                 end
             end
         end
+    end
+
+    -- 一圈下来一笔都没成交 → 视为买空，等补货
+    S.waitingRestock = true
+    local txt, sec = readRestock()
+    S.restockText = txt
+    if txt ~= "" then
+        S.lastMsg = "等待补货 " .. txt:gsub("Restock in ", ""):gsub("在 ", ""):gsub(" 时间内重新补货", "")
+    else
+        S.lastMsg = "等待补货"
+    end
+
+    -- 到点或兜底 25 秒重扫一次，补货一出现就能立刻继续买
+    local now = os.clock()
+    local due = (now >= S.nextRescanAt) or (sec ~= nil and sec <= 3)
+    if due and not S.scanning then
+        S.nextRescanAt = now + 25
+        task.spawn(scanAll)
     end
 end
 
@@ -641,6 +681,7 @@ _G.HUSH_AMMO = {
     panel = P,
     scan = scanAll,
     rebuild = rebuildList,
+    readRestock = readRestock,
     start = function() S.running = true end,
     stop = function() S.running = false end,
 }
