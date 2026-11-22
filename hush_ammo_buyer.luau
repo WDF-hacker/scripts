@@ -763,17 +763,23 @@ end
 -- 本地插值：暂停或读不到面板时也不会冻在旧数字
 local function restockRemain()
     if not S.restockSec or not S.restockAt then return nil end
-    if os.clock() - S.restockAt > 3 then return nil end
-    return math.max(0, S.restockSec - (os.clock() - S.restockAt))
+    -- 允许长时间外推：页面是手工构建的，倒计时文本不会自己走动
+    local remain = S.restockSec - (os.clock() - S.restockAt)
+    if remain < -5 then return 0 end
+    return math.max(0, remain)
 end
 
 task.spawn(function()
     while not S.dead do
         local ok, txt, sec = pcall(readRestock)
         if ok and type(txt) == "string" and txt ~= "" then
-            S.restockText = txt
-            S.restockSec = sec
-            S.restockAt = os.clock()
+            -- 手工构建的页面里倒计时文本不会自己刷新：
+            -- 只有文本真的变了才重置锚点，否则会每秒把倒计时"钉"回旧值
+            if txt ~= S.restockText or S.restockSec == nil then
+                S.restockText = txt
+                S.restockSec = sec
+                S.restockAt = os.clock()
+            end
         end
         task.wait(CFG.restockPoll)
     end
@@ -1795,6 +1801,11 @@ local function step()
 
         if remain then
             S.lastMsg = "等待补货 " .. fmtTime(remain)
+            if remain <= 0.2 then
+                S.needRescan = true
+                S.dryCal = {}
+                S.dryProduct = {}
+            end
             if remain <= CFG.rescanLead and not S.scanning then
                 task.spawn(function() scanAll(true) end)
             end
