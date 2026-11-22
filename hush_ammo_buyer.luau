@@ -497,14 +497,117 @@ local function shopLooksAmmo(body)
     return false
 end
 
+--============ 后台构建 traders 页 ============
+-- 不走鼠标、不依赖窗口焦点：通过 Menu 内部的 pageFor/api 直接 new 出交易页
+-- 适用：重进游戏后页面不存在 / 只存在空壳（desc=0）
+local function findTradersBuilder()
+    local root = menuRoot()
+    local tabs = root and root:FindFirstChild("TopBar") and root.TopBar:FindFirstChild("Tabs")
+    local tab = tabs and tabs:FindFirstChild("Tab_traders")
+    if not tab then return nil end
+    local ok, conns = pcall(getconnections, tab.Activated)
+    if not ok or type(conns) ~= "table" or not conns[1] then return nil end
+    local ok2, uv1 = pcall(function() return debug.getupvalues(conns[1].Function)[1] end)
+    if not ok2 or type(uv1) ~= "table" or type(uv1.setTab) ~= "function" then return nil end
+    local uvs = debug.getupvalues(uv1.setTab)
+    local pageFor, cache
+    for _, v in ipairs(uvs) do
+        if type(v) == "function" then
+            local ok3, inner = pcall(debug.getupvalues, v)
+            if ok3 then
+                for _, w in ipairs(inner) do
+                    if type(w) == "table" and type(w["play"]) == "table" and w["play"].frame ~= nil then
+                        pageFor, cache = v, w
+                        break
+                    end
+                end
+            end
+        end
+        if pageFor then break end
+    end
+    if not pageFor then return nil end
+    local api
+    local ok4, pfUvs = pcall(debug.getupvalues, pageFor)
+    if ok4 then
+        for _, w in ipairs(pfUvs) do
+            if type(w) == "table" and type(w.back) == "function" and type(w.openStore) == "function" then
+                api = w
+                break
+            end
+        end
+    end
+    return { pageFor = pageFor, api = api, cache = cache }
+end
+
+local function buildTradersPage()
+    local b = findTradersBuilder()
+    if not b or not b.api then
+        return false, "找不到菜单构建器（MenuTraders/api）"
+    end
+    local root = menuRoot()
+    local pages = root and root:FindFirstChild("Pages")
+    if not pages then return false, "无 Pages" end
+
+    for _, p in ipairs(pages:GetChildren()) do
+        if p.Name == "Page_traders" then pcall(function() p:Destroy() end) end
+    end
+    if b.cache then b.cache["traders"] = nil end
+
+    local hc = lp.PlayerScripts:FindFirstChild("HushClient")
+    local lib = hc and hc:FindFirstChild("Lib")
+    local mt = lib and lib:FindFirstChild("MenuTraders")
+    if not mt then return false, "无 MenuTraders" end
+    local okReq, MT = pcall(require, mt)
+    if not okReq or type(MT) ~= "table" or type(MT.new) ~= "function" then
+        return false, "MenuTraders 加载失败"
+    end
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Page_traders"
+    frame.Size = UDim2.fromScale(1, 1)
+    frame.BackgroundTransparency = 1
+    frame.Visible = true
+    frame.Parent = pages
+
+    local okNew, tabObj = pcall(MT.new, b.api, frame)
+    if not okNew or type(tabObj) ~= "table" then
+        pcall(function() frame:Destroy() end)
+        return false, "构建失败: " .. tostring(tabObj)
+    end
+
+    pcall(function() if tabObj.show then tabObj.show() end end)
+    pcall(function() if tabObj.showSub then tabObj.showSub("buy") end end)
+    task.wait(0.25)
+    pcall(function() if tabObj.gotoCard then tabObj.gotoCard("gunner") end end)
+    pcall(function() if tabObj.draw then tabObj.draw() end end)
+    task.wait(0.45)
+
+    S.pageTab = tabObj
+    S.pageFrame = frame
+    return true, "已构建 traders 页"
+end
+
 local function ensureBuyPage()
     local root = menuRoot()
     local pages = root and root:FindFirstChild("Pages")
     local pt = pages and pages:FindFirstChild("Page_traders")
 
     if not root then return false, "菜单未打开" end
-    if not pt or #pt:GetDescendants() == 0 then
-        return false, "交易页未加载，请手动点一次 TRADERS"
+
+    -- 页面不存在或只有空壳：直接后台构建（不需要鼠标/焦点）
+    if not pt or #pt:GetDescendants() < 40 then
+        local okb, whyb = buildTradersPage()
+        task.wait(0.4)
+        pt = pages and pages:FindFirstChild("Page_traders")
+        local body2 = tradersBody()
+        if body2 then
+            ensureAmmoTab(body2)
+            return true, "已构建 Gunner 页（后台）"
+        end
+        if not okb then
+            return false, "构建失败: " .. tostring(whyb)
+        end
+        return false, "构建后仍未找到交易面板"
     end
 
     -- 1) 切到交易页（内容已存在才点，安全）
