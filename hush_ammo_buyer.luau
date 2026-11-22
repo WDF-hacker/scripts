@@ -306,7 +306,10 @@ end
 ------------------------------------------------------------------
 -- 三列格式：口径<TAB>商品名<TAB>目标发数；旧的两列格式仍可读
 local function saveConfig()
-    local lines = { "# HUSH 弹药采购配置  " .. os.date("%Y-%m-%d %H:%M") }
+    local lines = {
+        "# HUSH 弹药采购配置  " .. os.date("%Y-%m-%d %H:%M"),
+        "# auto\t" .. (CFG.autoStart and "1" or "0"),
+    }
     local rowsOut = {}
     for name, n in pairs(CFG.targets) do
         if (tonumber(n) or 0) > 0 then
@@ -341,7 +344,10 @@ local function loadConfig()
     local n = 0
     -- 注意：Luau 的 pattern 不支持 %t（Lua 5.2 才有），必须用 \t 字面量
     for line in data:gmatch("[^\r\n]+") do
-        if line:sub(1, 1) ~= "#" then
+        if line:sub(1, 1) == "#" then
+            local auto = line:match("^#%s*auto%s+(%d)")
+            if auto then CFG.autoStart = (auto == "1") end
+        else
             local cal, name, val = line:match("^([^\t]+)\t(.-)\t(%d+)$")
             if not cal then
                 name, val = line:match("^([^\t]+)\t(%d+)$")
@@ -1450,10 +1456,12 @@ local function buildUI()
 
     P.toggleRun = gCtl:AddToggle("ammoRun", {
         Text = "启用自动购买",
-        Default = false,
+        Default = CFG.autoStart == true,
         Tooltip = "按口径顺序：把当前口径下勾选且有货的弹种买空，再进下一个口径",
         Callback = function(v)
             S.running = v
+            CFG.autoStart = v
+            queueSave()
             if v then
                 S.nextRescanAt = 0
                 S.dryCal = {}
