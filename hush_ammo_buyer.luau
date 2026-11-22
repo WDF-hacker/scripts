@@ -114,6 +114,7 @@ local S = {
     dryCal = {},           -- [calId] = true 本轮已确认买空
     dryProduct = {},       -- [商品名] = 冷却到期时间（页面数据与服务器不一致时避免死磕）
     lastRefresh = 0,
+    joinIntro = nil,       -- JoinIntro 模块缓存（false = 加载失败）
     softFail = {},         -- [calId] = 连续未成交轮数
     lastBuyAt = {},        -- [offerKey] = os.clock()
     scanning = false,
@@ -688,6 +689,30 @@ local function autoDismiss()
     local now = os.clock()
     if now - (S.lastDismissAt or 0) < 1 then return end
     S.lastDismissAt = now
+
+    -- 0) 开场动画：直接调用 JoinIntro.skip()，不依赖窗口焦点/鼠标
+    if S.joinIntro == nil then
+        local rf = game:GetService("ReplicatedFirst")
+        local m = rf:FindFirstChild("JoinIntro")
+        local api
+        if m then
+            local ok, v = pcall(require, m)
+            if ok and type(v) == "table" then api = v end
+        end
+        S.joinIntro = api or false
+    end
+    if S.joinIntro and S.joinIntro ~= false then
+        local playing = false
+        pcall(function()
+            playing = (S.joinIntro.isPlaying and S.joinIntro.isPlaying() == true)
+                or (S.joinIntro.isPreparing and S.joinIntro.isPreparing() == true)
+        end)
+        if playing then
+            pcall(function() S.joinIntro.skip() end)
+            log("已跳过开场动画（JoinIntro.skip）")
+            return
+        end
+    end
 
     -- 1) 过场 / 开场动画的 SKIP
     for _, g in ipairs(pg:GetChildren()) do
