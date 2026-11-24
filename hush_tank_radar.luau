@@ -1,5 +1,5 @@
 --[[
-    HUSH Tank Radar v1.5  （方向标版）
+    HUSH Tank Radar v1.6  （方向标版）
     ==================================================================
     只读脚本：不碰 remote / 不改坐标 / 不改伤害 / 不装 hook / 不刷包。
     所有数据都是客户端已经同步给你的实例属性，等价于"把小地图读出来"。
@@ -256,7 +256,8 @@ local S = {
     sites = {},
     knownIds = {},
     raid = nil,
-    tTank = 0, tExit = 0, tIntel = 0,
+    siteParts = nil,
+    tTank = 0, tExit = 0, tIntel = 0, tBuilt = 0,
     seen = false,
     alert = nil,
 }
@@ -642,6 +643,23 @@ local function step()
         if not ok2 then log("scanRaidInfo: %s", tostring(err2)) end
     end
 
+    -- 站点结构确认：在流式范围内数一下站点周围零件。
+    -- 有结构 = "没坦克"才是可信结论；没结构 = 只是还没加载，不能下结论。
+    if now - S.tBuilt > 2 then
+        S.tBuilt = now
+        local st = S.site
+        local mp = charPos()
+        if st and mp and (st.pos - mp).Magnitude <= (STREAM_RANGE + 120) then
+            local p = Vector3.new(st.pos.X, st.pos.Y + 30, st.pos.Z)
+            local okb, parts = pcall(function()
+                return workspace:GetPartBoundsInBox(CFrame.new(p), Vector3.new(220, 160, 220))
+            end)
+            S.siteParts = (okb and type(parts) == "table") and #parts or -1
+        else
+            S.siteParts = nil
+        end
+    end
+
     releaseAll()
 
     local vp = cam.ViewportSize
@@ -754,7 +772,7 @@ local function step()
     -- 状态面板
     if CFG.hud then
         local lines = {}
-        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.5 --", color = C.dim }
+        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.6 --", color = C.dim }
 
         if #S.tanks > 0 then
             local t1 = S.tanks[1]
@@ -775,7 +793,7 @@ local function step()
                 if d > STREAM_RANGE then
                     hint = string.format("site %s away, out of stream range", fmtDist(d))
                 else
-                    hint = "in range, none spawned (rolled Armored/none?)"
+                    hint = "on site, none this raid"
                 end
             end
             lines[#lines + 1] = { text = "TANK 0  (" .. hint .. ")", color = C.dim }
@@ -793,6 +811,20 @@ local function step()
                     text = string.format("  %s from you%s", fmtDist(d),
                         d > STREAM_RANGE and "  (beyond stream)" or ""),
                     color = d > STREAM_RANGE and C.dim or C.panel,
+                }
+            end
+            local sp2 = S.siteParts
+            if sp2 == nil then
+                lines[#lines + 1] = { text = "  SITE not streamed - cannot confirm", color = C.dim }
+            elseif sp2 > 50 then
+                lines[#lines + 1] = {
+                    text = string.format("  SITE built (%dp) - confirmed no tank", sp2),
+                    color = C.panel,
+                }
+            else
+                lines[#lines + 1] = {
+                    text = string.format("  SITE empty (%dp) - site not spawned", sp2),
+                    color = C.site,
                 }
             end
         else
@@ -890,7 +922,7 @@ local function dispose()
 end
 
 API = {
-    version = "1.5",
+    version = "1.6",
     dispose = dispose,
     cfg = CFG,
     num = NUM,
@@ -963,7 +995,7 @@ genv[NAME] = API
 pcall(scanVeh)
 pcall(scanExits)
 pcall(scanIntel)
-log("加载完成 v1.5 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
+log("加载完成 v1.6 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
     #S.tanks, #S.armor, #S.exits, S.site and S.site.title or "无",
     tostring(S.site and S.site.hit), S.allVeh)
 flushLog()
