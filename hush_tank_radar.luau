@@ -1,5 +1,5 @@
 --[[
-    HUSH Tank Radar v1.3  （方向标版）
+    HUSH Tank Radar v1.4  （方向标版）
     ==================================================================
     只读脚本：不碰 remote / 不改坐标 / 不改伤害 / 不装 hook / 不刷包。
     所有数据都是客户端已经同步给你的实例属性，等价于"把小地图读出来"。
@@ -198,13 +198,17 @@ local function wrap180(a)
     return a
 end
 
+-- 相机偏航：用 RightVector 求，RightVector 永远是水平的，
+-- 所以 E/Q 把视角上下俯仰到接近垂直时也不会失效。
+-- 约定：yaw 0 = 面向 -Z（北），顺时针为正。
 local function camYaw(cam)
-    local lv = cam.CFrame.LookVector
-    return math.deg(math.atan2(-lv.X, -lv.Z))
+    local r = cam.CFrame.RightVector
+    return math.deg(math.atan2(r.Z, r.X))
 end
 
+-- 目标相对玩家的方位角（与 camYaw 同一约定）
 local function bearingTo(dx, dz)
-    return math.deg(math.atan2(-dx, -dz))
+    return math.deg(math.atan2(dx, -dz))
 end
 
 local function fmtDist(n)
@@ -698,7 +702,7 @@ local function step()
     -- 状态面板
     if CFG.hud then
         local lines = {}
-        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.3 --", color = C.dim }
+        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.4 --", color = C.dim }
 
         if #S.tanks > 0 then
             local t1 = S.tanks[1]
@@ -810,7 +814,7 @@ local function dispose()
 end
 
 API = {
-    version = "1.3",
+    version = "1.4",
     dispose = dispose,
     cfg = CFG,
     num = NUM,
@@ -839,13 +843,32 @@ API = {
         S.fake = nil
         return true
     end,
+    -- 自检：分别朝"相机右侧 / 正前方 / 正后方"取方位，应当得到 +90 / 0 / ±180
+    dirTest = function()
+        local cam = workspace.CurrentCamera
+        if not cam then return nil end
+        local r = cam.CFrame.RightVector
+        local lv = cam.CFrame.LookVector
+        local y = camYaw(cam)
+        local rightRel = wrap180(bearingTo(r.X, r.Z) - y)
+        local fwdRel = wrap180(bearingTo(lv.X, lv.Z) - y)
+        local backRel = wrap180(bearingTo(-lv.X, -lv.Z) - y)
+        return {
+            camYaw = y,
+            right = rightRel,      -- 期望 +90
+            forward = fwdRel,      -- 期望 0
+            back = backRel,        -- 期望 ±180
+            rightArrowX = math.sin(math.rad(rightRel)),  -- 期望 +1
+            pitch = math.deg(math.asin(math.clamp(lv.Y, -1, 1))),
+        }
+    end,
 }
 genv[NAME] = API
 
 pcall(scanVeh)
 pcall(scanExits)
 pcall(scanIntel)
-log("加载完成 v1.3 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
+log("加载完成 v1.4 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
     #S.tanks, #S.armor, #S.exits, S.site and S.site.title or "无",
     tostring(S.site and S.site.hit), S.allVeh)
 flushLog()
