@@ -1,5 +1,5 @@
 --[[
-    HUSH Tank Radar v1.4  （方向标版）
+    HUSH Tank Radar v1.5  （方向标版）
     ==================================================================
     只读脚本：不碰 remote / 不改坐标 / 不改伤害 / 不装 hook / 不刷包。
     所有数据都是客户端已经同步给你的实例属性，等价于"把小地图读出来"。
@@ -56,8 +56,13 @@ end
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
+local RS = game:GetService("ReplicatedStorage")
 
 local LP = Players.LocalPlayer
+
+-- 实测：客户端实际流式半径只有 ~400-500 studs（StreamingTargetRadius=1024 是上限，
+-- 不代表真的加载）。超出该范围的站点几何与载具都不会下发到客户端。
+local STREAM_RANGE = 480
 
 --------------------------------------------------------------------------
 -- 1. 配置
@@ -250,7 +255,7 @@ local S = {
     site = nil,
     sites = {},
     knownIds = {},
-    placedIds = {},
+    raid = nil,
     tTank = 0, tExit = 0, tIntel = 0,
     seen = false,
     alert = nil,
@@ -322,58 +327,97 @@ local function decodeKnown()
     return set
 end
 
+-- 撤离点权威源：ReplicatedStorage.HushRuntime.Raid.Extracts 里有**全部**出口的坐标，
+-- 不受流式影响；workspace.Raid.Extracts 只有已流式进来的那几个，作为补充。
+local function extractFolders()
+    local list = {}
+    local rt = RS:FindFirstChild("HushRuntime")
+    local rr = rt and rt:FindFirstChild("Raid")
+    local a = rr and rr:FindFirstChild("Extracts")
+    if a then list[#list + 1] = a end
+    local raid = workspace:FindFirstChild("Raid")
+    local b = raid and raid:FindFirstChild("Extracts")
+    if b then list[#list + 1] = b end
+    return list
+end
+
 local function scanExits()
-    local out = {}
-    local placed = {}
+    local byId = {}
     local known = decodeKnown()
     S.knownIds = known
 
-    local raid = raidRoot()
-    local ex = raid and raid:FindFirstChild("Extracts")
-    if ex then
-        for _, child in ipairs(ex:GetChildren()) do
+    for _, folder in ipairs(extractFolders()) do
+        for _, child in ipairs(folder:GetChildren()) do
             if child:IsA("BasePart") and child:GetAttribute("Personal") ~= true then
                 local id = tostring(child:GetAttribute("ExtractId") or child.Name)
-                placed[id] = true
-                out[#out + 1] = {
-                    id = id,
-                    kind = cleanStr(child:GetAttribute("Kind"), 16),
-                    name = cleanStr(child:GetAttribute("Name"), 40),
-                    state = cleanStr(child:GetAttribute("State"), 16),
-                    cond = cleanStr(child:GetAttribute("Condition"), 60),
-                    open = child:GetAttribute("Open") == true,
-                    known = known[id] == true,
-                    pos = child.Position,
-                }
+                if byId[id] == nil then
+                    byId[id] = {
+                        id = id,
+                        kind = cleanStr(child:GetAttribute("Kind"), 16),
+                        name = cleanStr(child:GetAttribute("Name"), 40),
+                        state = cleanStr(child:GetAttribute("State"), 16),
+                        cond = cleanStr(child:GetAttribute("Condition"), 60),
+                        open = child:GetAttribute("Open") == true,
+                        known = known[id] == true,
+                        seats = tonumber(child:GetAttribute("Seats")) or 0,
+                        pos = child.Position,
+                    }
+                end
             end
         end
     end
 
+    -- 个人撤离点
     local pg = LP:FindFirstChildOfClass("PlayerGui")
     local pe = pg and pg:FindFirstChild("HushPersonalExtracts")
     if pe then
         for _, child in ipairs(pe:GetChildren()) do
             if child:IsA("BasePart") then
-                out[#out + 1] = {
-                    id = tostring(child:GetAttribute("ExtractId") or child.Name),
+                local id = "P_" .. tostring(child.Name)
+                byId[id] = {
+                    id = id,
                     kind = cleanStr(child:GetAttribute("Kind"), 16),
                     name = "MY " .. cleanStr(child:GetAttribute("Name") or child.Name, 30),
                     state = cleanStr(child:GetAttribute("State"), 16),
                     cond = cleanStr(child:GetAttribute("Condition"), 60),
                     open = child:GetAttribute("Open") == true,
                     known = true,
+                    seats = 0,
                     pos = child.Position,
                 }
             end
         end
     end
 
+    local out = {}
+    for _, e in pairs(byId) do out[#out + 1] = e end
     table.sort(out, function(a, b)
         if (a.kind == "Road") ~= (b.kind == "Road") then return a.kind == "Road" end
         return a.name < b.name
     end)
     S.exits = out
-    S.placedIds = placed
+end
+
+-- 对局元信息：难度 / 阶段 / 剩余时间
+local function scanRaidInfo()
+    local rt = RS:FindFirstChild("HushRuntime")
+    local rr = rt and rt:FindFirstChild("Raid")
+    if not rr then
+        S.raid = nil
+        return
+    end
+    local endsAt = tonumber(rr:GetAttribute("EndsAt"))
+    local remain = nil
+    if endsAt then
+        local ok, now = pcall(function() return workspace:GetServerTimeNow() end)
+        if ok and type(now) == "number" then remain = endsAt - now end
+    end
+    S.raid = {
+        map = cleanStr(rr:GetAttribute("Map"), 24),
+        difficulty = cleanStr(rr:GetAttribute("Difficulty"), 16),
+        phase = cleanStr(rr:GetAttribute("Phase"), 16),
+        remains = remain,
+    }
 end
 
 -- 只有"军械库车队"类文案算坦克事件；the base armory 这类普通站点不参与
@@ -511,9 +555,9 @@ local function ring(cam, center, radius, color, label)
 end
 
 -- 方向标：箭头绕准星一圈，指向目标方位；带名称与距离
-local POINTER_R = 0.26      -- 基准半径 = min(视口) * 该系数
-local POINTER_STEP = 30     -- 多个目标时向外错开的间距
-local POINTER_MAX = 5
+local POINTER_R = 0.24      -- 基准半径 = min(视口) * 该系数
+local POINTER_STEP = 26     -- 多个目标时向外错开的间距
+local POINTER_MAX = 6       -- 坦克 + 2 公路 + 事件点 恒显，剩 2 个给其他出口
 
 local function drawPointer(cam, pos, color, label, dist, radius)
     local mypos = charPos()
@@ -594,6 +638,8 @@ local function step()
         S.tIntel = now
         local ok, err = pcall(scanIntel)
         if not ok then log("scanIntel: %s", tostring(err)) end
+        local ok2, err2 = pcall(scanRaidInfo)
+        if not ok2 then log("scanRaidInfo: %s", tostring(err2)) end
     end
 
     releaseAll()
@@ -603,7 +649,8 @@ local function step()
 
     local mypos = charPos()
     local site = S.site
-    local ptr = {}
+    -- 方向标按优先级分桶，最后拼接：坦克 > 公路撤离点 > 事件点 > 其他撤离点
+    local ptrTank, ptrRoad, ptrSite, ptrOther = {}, {}, {}, {}
 
     -- 测试假目标（只在内存里，不创建实例）
     local tanksDraw = S.tanks
@@ -634,7 +681,7 @@ local function step()
                 string.format("HP %d/%d  seats %d  fuel %d%%", tk.hp, tk.hpMax, tk.seats,
                     math.floor(tk.fuel * 100 + 0.5)), fmtDist(d))
         end
-        ptr[#ptr + 1] = { pos = center, color = C.tank, text = "TANK", dist = fmtDist(d) }
+        ptrTank[#ptrTank + 1] = { pos = center, color = C.tank, text = "TANK", dist = fmtDist(d) }
     end
 
     -- 装甲车（只在事件点附近提示，避免满屏 PARKING 车噪音）
@@ -650,7 +697,7 @@ local function step()
                 box3d(cam, av.pos + Vector3.new(0, 5, 0), Vector3.new(14, 12, 14), C.armor,
                     "ARMOR " .. av.variant, string.format("HP %d/%d", av.hp, av.hpMax), fmtDist(d))
             end
-            ptr[#ptr + 1] = { pos = av.pos, color = C.armor, text = "ARMOR", dist = fmtDist(d) }
+            ptrTank[#ptrTank + 1] = { pos = av.pos, color = C.armor, text = "ARMOR", dist = fmtDist(d) }
         end
     end
 
@@ -679,10 +726,10 @@ local function step()
                 text = (isRoad and "ROAD" or e.kind),
                 dist = fmtDist(d),
             }
-            if isRoad then roadPtr[#roadPtr + 1] = rec else ptr[#ptr + 1] = rec end
+            if isRoad then roadPtr[#roadPtr + 1] = rec else ptrOther[#ptrOther + 1] = rec end
         end
     end
-    for _, r in ipairs(roadPtr) do ptr[#ptr + 1] = r end
+    for _, r in ipairs(roadPtr) do ptrRoad[#ptrRoad + 1] = r end
 
     -- 事件点
     if CFG.site and site and mypos then
@@ -694,7 +741,12 @@ local function step()
         if sp then
             txt(fmtDist(d) .. (site.rumour and " . rumour" or ""), 12, C.panel, sp.X, sp.Y + 44)
         end
-        ptr[#ptr + 1] = { pos = site.pos, color = color, text = "EVENT", dist = fmtDist(d) }
+        ptrSite[#ptrSite + 1] = { pos = site.pos, color = color, text = "EVENT", dist = fmtDist(d) }
+    end
+
+    local ptr = {}
+    for _, list in ipairs({ ptrTank, ptrRoad, ptrSite, ptrOther }) do
+        for _, m in ipairs(list) do ptr[#ptr + 1] = m end
     end
 
     drawPointers(cam, ptr)
@@ -702,7 +754,7 @@ local function step()
     -- 状态面板
     if CFG.hud then
         local lines = {}
-        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.4 --", color = C.dim }
+        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.5 --", color = C.dim }
 
         if #S.tanks > 0 then
             local t1 = S.tanks[1]
@@ -717,36 +769,60 @@ local function step()
                 color = C.panel,
             }
         else
-            lines[#lines + 1] = { text = "TANK 0 (no motor pool this raid)", color = C.dim }
+            local hint = "no motor pool this raid"
+            if site and site.hit and mypos then
+                local d = (site.pos - mypos).Magnitude
+                if d > STREAM_RANGE then
+                    hint = string.format("site %s away, out of stream range", fmtDist(d))
+                else
+                    hint = "in range, none spawned (rolled Armored/none?)"
+                end
+            end
+            lines[#lines + 1] = { text = "TANK 0  (" .. hint .. ")", color = C.dim }
         end
 
         if site then
+            local d = mypos and (site.pos - mypos).Magnitude or nil
             lines[#lines + 1] = {
-                text = string.format("EVENT %s  r=%d%s", site.title, math.floor(site.r + 0.5),
-                    site.hit and "  << TANK EVENT" or ""),
+                text = string.format("EVENT %s  r=%d  %s", site.title, math.floor(site.r + 0.5),
+                    site.hit and "<< TANK EVENT" or ""),
                 color = site.hit and C.tank or C.site,
             }
+            if d then
+                lines[#lines + 1] = {
+                    text = string.format("  %s from you%s", fmtDist(d),
+                        d > STREAM_RANGE and "  (beyond stream)" or ""),
+                    color = d > STREAM_RANGE and C.dim or C.panel,
+                }
+            end
         else
             lines[#lines + 1] = { text = "EVENT none", color = C.dim }
         end
 
-        local roadN, openN, closedN = 0, 0, 0
+        local roadN, openN, closedN, knownN = 0, 0, 0, 0
         for _, e in ipairs(S.exits) do
             if e.kind == "Road" then roadN = roadN + 1 end
             if e.open then openN = openN + 1 else closedN = closedN + 1 end
+            if e.known then knownN = knownN + 1 end
         end
         lines[#lines + 1] = {
-            text = string.format("EXIT %d  open %d  closed %d  road %d", #S.exits, openN, closedN, roadN),
+            text = string.format("EXIT %d  open %d  closed %d  road %d  known %d",
+                #S.exits, openN, closedN, roadN, knownN),
             color = C.road,
         }
 
-        local unknown = {}
-        for id in pairs(S.knownIds) do
-            if not S.placedIds[id] then unknown[#unknown + 1] = id end
-        end
-        table.sort(unknown)
-        if #unknown > 0 then
-            lines[#lines + 1] = { text = "known no-pos: " .. table.concat(unknown, " "), color = C.dim }
+        local ri = S.raid
+        if ri then
+            local clock = ""
+            if ri.remains and ri.remains > 0 then
+                local m = math.floor(ri.remains / 60)
+                local s = math.floor(ri.remains % 60)
+                clock = string.format("  %d:%02d", m, s)
+            end
+            lines[#lines + 1] = {
+                text = ri.map .. "  " .. string.upper(ri.difficulty) .. "  " .. ri.phase .. clock,
+                color = C.dim,
+            }
         end
 
         lines[#lines + 1] = {
@@ -814,7 +890,7 @@ local function dispose()
 end
 
 API = {
-    version = "1.4",
+    version = "1.5",
     dispose = dispose,
     cfg = CFG,
     num = NUM,
@@ -824,12 +900,31 @@ API = {
         pcall(scanVeh)
         pcall(scanExits)
         pcall(scanIntel)
+        pcall(scanRaidInfo)
+        local roadN = 0
+        for _, e in ipairs(S.exits) do
+            if e.kind == "Road" then roadN = roadN + 1 end
+        end
         return {
-            tanks = #S.tanks, armor = #S.armor, exits = #S.exits,
+            tanks = #S.tanks, armor = #S.armor, exits = #S.exits, road = roadN,
             site = S.site and S.site.title or nil,
             siteHit = S.site and S.site.hit or nil,
+            sitePos = S.site and string.format("%.0f,%.0f", S.site.pos.X, S.site.pos.Z) or nil,
             veh = S.allVeh, sites = #S.sites,
+            difficulty = S.raid and S.raid.difficulty or nil,
+            remains = S.raid and S.raid.remains and math.floor(S.raid.remains + 0.5) or nil,
         }
+    end,
+    exitsList = function()
+        local t = {}
+        for _, e in ipairs(S.exits) do
+            t[#t + 1] = {
+                id = e.id, kind = e.kind, name = e.name,
+                x = math.floor(e.pos.X + 0.5), y = math.floor(e.pos.Y + 0.5), z = math.floor(e.pos.Z + 0.5),
+                open = e.open, known = e.known, seats = e.seats,
+            }
+        end
+        return t
     end,
     flush = flushLog,
     logFile = LOG_FILE,
@@ -868,7 +963,7 @@ genv[NAME] = API
 pcall(scanVeh)
 pcall(scanExits)
 pcall(scanIntel)
-log("加载完成 v1.4 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
+log("加载完成 v1.5 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
     #S.tanks, #S.armor, #S.exits, S.site and S.site.title or "无",
     tostring(S.site and S.site.hit), S.allVeh)
 flushLog()
