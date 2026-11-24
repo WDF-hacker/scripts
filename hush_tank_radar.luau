@@ -1,5 +1,5 @@
 --[[
-    HUSH Tank Radar v1.2  （方向标版）
+    HUSH Tank Radar v1.3  （方向标版）
     ==================================================================
     只读脚本：不碰 remote / 不改坐标 / 不改伤害 / 不装 hook / 不刷包。
     所有数据都是客户端已经同步给你的实例属性，等价于"把小地图读出来"。
@@ -72,21 +72,35 @@ local CFG = {
 
 local CFG_KEYS = { "esp", "exits", "pointer", "site", "hud" }
 
+-- 数值配置（百分比，用于状态面板位置；0/0 也合法）
+local NUM = { hudx = 1, hudy = 40 }
+local NUM_KEYS = { "hudx", "hudy" }
+
 local function readCfg()
     local ok, data = pcall(readfile, CFG_FILE)
     if not ok or type(data) ~= "string" then return end
     for line in string.gmatch(data, "[^\r\n]+") do
         if string.sub(line, 1, 1) ~= "#" then
-            local k, v = string.match(line, "^(%w+)%s*=%s*(%d)$")
-            if k and CFG[k] ~= nil then CFG[k] = (v == "1") end
+            local k, v = string.match(line, "^(%w+)%s*=%s*([%d%.%-]+)$")
+            if k then
+                if CFG[k] ~= nil then
+                    CFG[k] = (v == "1")
+                elseif NUM[k] ~= nil then
+                    local n = tonumber(v)
+                    if n then NUM[k] = math.clamp(n, 0, 100) end
+                end
+            end
         end
     end
 end
 
 local function saveCfg()
-    local L = { "# HUSH Tank Radar config (1=on 0=off)" }
+    local L = { "# HUSH Tank Radar config (1=on 0=off; hudx/hudy = percent of screen)" }
     for _, k in ipairs(CFG_KEYS) do
         L[#L + 1] = string.format("%s=%d", k, CFG[k] and 1 or 0)
+    end
+    for _, k in ipairs(NUM_KEYS) do
+        L[#L + 1] = string.format("%s=%d", k, math.floor(NUM[k] + 0.5))
     end
     pcall(writefile, CFG_FILE, table.concat(L, "\n"))
 end
@@ -542,10 +556,11 @@ local function drawPointers(cam, list)
     end
 end
 
-local HUD_Y = 200
 local function hud(lines)
+    local x = math.floor(VW * NUM.hudx / 100 + 0.5)
+    local y = math.floor(VH * NUM.hudy / 100 + 0.5)
     for i, line in ipairs(lines) do
-        txt(line.text, line.size or 13, line.color or C.panel, 16, HUD_Y + (i - 1) * 16, false)
+        txt(line.text, line.size or 13, line.color or C.panel, x, y + (i - 1) * 16, false)
     end
 end
 
@@ -683,7 +698,7 @@ local function step()
     -- 状态面板
     if CFG.hud then
         local lines = {}
-        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.2 --", color = C.dim }
+        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.3 --", color = C.dim }
 
         if #S.tanks > 0 then
             local t1 = S.tanks[1]
@@ -795,10 +810,12 @@ local function dispose()
 end
 
 API = {
-    version = "1.2",
+    version = "1.3",
     dispose = dispose,
     cfg = CFG,
+    num = NUM,
     state = S,
+    saveCfg = saveCfg,
     rescan = function()
         pcall(scanVeh)
         pcall(scanExits)
@@ -828,7 +845,7 @@ genv[NAME] = API
 pcall(scanVeh)
 pcall(scanExits)
 pcall(scanIntel)
-log("加载完成 v1.2 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
+log("加载完成 v1.3 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
     #S.tanks, #S.armor, #S.exits, S.site and S.site.title or "无",
     tostring(S.site and S.site.hit), S.allVeh)
 flushLog()
