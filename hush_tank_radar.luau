@@ -1,5 +1,5 @@
 --[[
-    HUSH Tank Radar v1.6  （方向标版）
+    HUSH Tank Radar v1.7  （方向标版）
     ==================================================================
     只读脚本：不碰 remote / 不改坐标 / 不改伤害 / 不装 hook / 不刷包。
     所有数据都是客户端已经同步给你的实例属性，等价于"把小地图读出来"。
@@ -257,6 +257,9 @@ local S = {
     knownIds = {},
     raid = nil,
     siteParts = nil,
+    exitSize = nil,
+    mapRaid = nil,
+    mapHalf = nil,
     tTank = 0, tExit = 0, tIntel = 0, tBuilt = 0,
     seen = false,
     alert = nil,
@@ -399,7 +402,7 @@ local function scanExits()
     S.exits = out
 end
 
--- 对局元信息：难度 / 阶段 / 剩余时间
+-- 对局元信息：难度 / 阶段 / 剩余时间，以及 MapInfo 里的出口真实尺寸
 local function scanRaidInfo()
     local rt = RS:FindFirstChild("HushRuntime")
     local rr = rt and rt:FindFirstChild("Raid")
@@ -419,6 +422,31 @@ local function scanRaidInfo()
         phase = cleanStr(rr:GetAttribute("Phase"), 16),
         remains = remain,
     }
+
+    -- MapInfo: 每局一个 JSON，含全部出口的 cf 与 size，比实例更稳
+    local rid = cleanStr(rr:GetAttribute("RaidId"), 40)
+    if rid ~= "" and rid ~= S.mapRaid then
+        S.mapRaid = rid
+        S.exitSize = {}
+        local mi = rt and rt:FindFirstChild("MapInfo")
+        if mi and type(mi.Value) == "string" and #mi.Value > 0 then
+            local okj, tbl = pcall(function()
+                return game:GetService("HttpService"):JSONDecode(mi.Value)
+            end)
+            if okj and type(tbl) == "table" then
+                S.mapHalf = tonumber(tbl.half)
+                for _, e in ipairs(tbl.extracts or {}) do
+                    if type(e) == "table" and type(e.id) == "string" and type(e.size) == "table" then
+                        S.exitSize[e.id] = Vector3.new(tonumber(e.size[1]) or 12,
+                            tonumber(e.size[2]) or 8, tonumber(e.size[3]) or 12)
+                    end
+                end
+                log("MapInfo 解析: 出口%d 半长%s", #(tbl.extracts or {}), tostring(S.mapHalf))
+            else
+                log("MapInfo 解析失败: %s", tostring(tbl))
+            end
+        end
+    end
 end
 
 -- 只有"军械库车队"类文案算坦克事件；the base armory 这类普通站点不参与
@@ -727,9 +755,12 @@ local function step()
             local isRoad = (e.kind == "Road")
             local color = isRoad and C.road or C.exit
             local openTxt = e.open and "OPEN" or "CLOSED"
+            local sz = (S.exitSize and S.exitSize[e.id]) or nil
             if isRoad then
                 ring(cam, Vector3.new(e.pos.X, e.pos.Y, e.pos.Z), 24, color, nil)
-                box3d(cam, e.pos + Vector3.new(0, 6, 0), Vector3.new(26, 16, 26), color,
+                local hs2 = sz and (sz.Y * 2.2) or 16
+                local hs1 = sz and (math.max(sz.X, sz.Z) * 0.9) or 26
+                box3d(cam, e.pos + Vector3.new(0, hs2 * 0.4, 0), Vector3.new(hs1, hs2, hs1), color,
                     "[ROAD] " .. e.name, openTxt .. " | " .. e.kind, fmtDist(d))
             else
                 box3d(cam, e.pos + Vector3.new(0, 4, 0), Vector3.new(12, 10, 12), color,
@@ -772,7 +803,7 @@ local function step()
     -- 状态面板
     if CFG.hud then
         local lines = {}
-        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.6 --", color = C.dim }
+        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.7 --", color = C.dim }
 
         if #S.tanks > 0 then
             local t1 = S.tanks[1]
@@ -842,6 +873,23 @@ local function step()
                 #S.exits, openN, closedN, roadN, knownN),
             color = C.road,
         }
+
+        -- 最近的可开车撤离点（开车撤离看这一行）
+        if mypos then
+            local best, bestD = nil, math.huge
+            for _, e in ipairs(S.exits) do
+                if e.kind == "Road" and e.open then
+                    local dd = (e.pos - mypos).Magnitude
+                    if dd < bestD then best, bestD = e, dd end
+                end
+            end
+            if best then
+                lines[#lines + 1] = {
+                    text = string.format("DRIVE > %s  %s", best.name, fmtDist(bestD)),
+                    color = C.road,
+                }
+            end
+        end
 
         local ri = S.raid
         if ri then
@@ -922,7 +970,7 @@ local function dispose()
 end
 
 API = {
-    version = "1.6",
+    version = "1.7",
     dispose = dispose,
     cfg = CFG,
     num = NUM,
@@ -995,7 +1043,7 @@ genv[NAME] = API
 pcall(scanVeh)
 pcall(scanExits)
 pcall(scanIntel)
-log("加载完成 v1.6 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
+log("加载完成 v1.7 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
     #S.tanks, #S.armor, #S.exits, S.site and S.site.title or "无",
     tostring(S.site and S.site.hit), S.allVeh)
 flushLog()
