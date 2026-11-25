@@ -78,6 +78,9 @@ local CFG = {
 
 local CFG_KEYS = { "render", "esp", "exits", "pointer", "site", "hud" }
 
+-- 这些开关是"临时视图状态"，不写盘：否则截图关掉后重载会看起来像坏了
+local NOPERSIST = { render = true }
+
 -- 数值配置（百分比，用于状态面板位置；0/0 也合法）
 local NUM = { hudx = 1, hudy = 40 }
 local NUM_KEYS = { "hudx", "hudy" }
@@ -89,7 +92,9 @@ local function readCfg()
         if string.sub(line, 1, 1) ~= "#" then
             local k, v = string.match(line, "^(%w+)%s*=%s*([%d%.%-]+)$")
             if k then
-                if CFG[k] ~= nil then
+                if NOPERSIST[k] then
+                    -- 忽略：临时状态不参与持久化
+                elseif CFG[k] ~= nil then
                     CFG[k] = (v == "1")
                 elseif NUM[k] ~= nil then
                     local n = tonumber(v)
@@ -103,7 +108,9 @@ end
 local function saveCfg()
     local L = { "# HUSH Tank Radar config (1=on 0=off; hudx/hudy = percent of screen)" }
     for _, k in ipairs(CFG_KEYS) do
-        L[#L + 1] = string.format("%s=%d", k, CFG[k] and 1 or 0)
+        if not NOPERSIST[k] then
+            L[#L + 1] = string.format("%s=%d", k, CFG[k] and 1 or 0)
+        end
     end
     for _, k in ipairs(NUM_KEYS) do
         L[#L + 1] = string.format("%s=%d", k, math.floor(NUM[k] + 0.5))
