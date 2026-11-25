@@ -1,5 +1,5 @@
 --[[
-    HUSH Tank Radar v1.7  （方向标版）
+    HUSH Tank Radar v1.8  （方向标版）
     ==================================================================
     只读脚本：不碰 remote / 不改坐标 / 不改伤害 / 不装 hook / 不刷包。
     所有数据都是客户端已经同步给你的实例属性，等价于"把小地图读出来"。
@@ -68,6 +68,7 @@ local STREAM_RANGE = 480
 -- 1. 配置
 --------------------------------------------------------------------------
 local CFG = {
+    render = true,   -- 总开关：关掉后本脚本不画任何东西（F2，方便截图）
     esp = true,      -- 坦克/装甲车透视
     exits = true,    -- 撤离点透视
     pointer = true,  -- 方向标
@@ -75,7 +76,7 @@ local CFG = {
     hud = true,      -- 状态面板
 }
 
-local CFG_KEYS = { "esp", "exits", "pointer", "site", "hud" }
+local CFG_KEYS = { "render", "esp", "exits", "pointer", "site", "hud" }
 
 -- 数值配置（百分比，用于状态面板位置；0/0 也合法）
 local NUM = { hudx = 1, hudy = 40 }
@@ -263,6 +264,7 @@ local S = {
     tTank = 0, tExit = 0, tIntel = 0, tBuilt = 0,
     seen = false,
     alert = nil,
+    rendered = true,
 }
 
 local function raidRoot()
@@ -688,7 +690,16 @@ local function step()
         end
     end
 
+    -- F2 总开关：关掉后一帧都不画（数据扫描仍在跑，随时开回来就是实时的）
+    if not CFG.render then
+        if S.rendered then
+            releaseAll()
+            S.rendered = false
+        end
+        return
+    end
     releaseAll()
+    S.rendered = true
 
     local vp = cam.ViewportSize
     VW, VH = vp.X, vp.Y
@@ -803,7 +814,7 @@ local function step()
     -- 状态面板
     if CFG.hud then
         local lines = {}
-        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.7 --", color = C.dim }
+        lines[#lines + 1] = { text = "-- HUSH Tank Radar v1.8 --", color = C.dim }
 
         if #S.tanks > 0 then
             local t1 = S.tanks[1]
@@ -906,7 +917,7 @@ local function step()
         end
 
         lines[#lines + 1] = {
-            text = string.format("veh %d  sites %d   F7 F8 F9 F10", S.allVeh, #S.sites),
+            text = string.format("veh %d  sites %d   F2 hide all | F5 F6 F7 F8", S.allVeh, #S.sites),
             color = C.dim,
         }
 
@@ -936,17 +947,21 @@ local function toggle(k)
     flushLog()
 end
 
+-- 键位：避开 Roblox 自己的 F9（开发者控制台）、F11（全屏）
+--   F2 总开关（截图用）  F5 面板  F6 方向标  F7 坦克  F8 撤离点
 conns[#conns + 1] = UIS.InputBegan:Connect(function(input, processed)
     if processed then return end
     local k = input.KeyCode
-    if k == Enum.KeyCode.F7 then
+    if k == Enum.KeyCode.F2 then
+        toggle("render")
+    elseif k == Enum.KeyCode.F5 then
+        toggle("hud")
+    elseif k == Enum.KeyCode.F6 then
+        toggle("pointer")
+    elseif k == Enum.KeyCode.F7 then
         toggle("esp")
     elseif k == Enum.KeyCode.F8 then
         toggle("exits")
-    elseif k == Enum.KeyCode.F9 then
-        toggle("pointer")
-    elseif k == Enum.KeyCode.F10 then
-        toggle("hud")
     end
 end)
 
@@ -970,12 +985,34 @@ local function dispose()
 end
 
 API = {
-    version = "1.7",
+    version = "1.8",
     dispose = dispose,
     cfg = CFG,
     num = NUM,
     state = S,
     saveCfg = saveCfg,
+    -- 总开关（等价于按 F2）
+    toggleRender = function(v)
+        if type(v) == "boolean" then
+            CFG.render = v
+        else
+            CFG.render = not CFG.render
+        end
+        saveCfg()
+        log("render=%s", tostring(CFG.render))
+        return CFG.render
+    end,
+    -- 当前可见的绘制对象数量（自检用；render 关闭后应为 0）
+    visibleCount = function()
+        local n = 0
+        for _, list in pairs(pool) do
+            for i = 1, #list do
+                local ok, v = pcall(function() return list[i].obj.Visible end)
+                if ok and v then n = n + 1 end
+            end
+        end
+        return n
+    end,
     rescan = function()
         pcall(scanVeh)
         pcall(scanExits)
@@ -1043,7 +1080,7 @@ genv[NAME] = API
 pcall(scanVeh)
 pcall(scanExits)
 pcall(scanIntel)
-log("加载完成 v1.7 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
+log("加载完成 v1.8 坦克=%d 装甲=%d 出口=%d 事件=%s 命中=%s 载具=%d",
     #S.tanks, #S.armor, #S.exits, S.site and S.site.title or "无",
     tostring(S.site and S.site.hit), S.allVeh)
 flushLog()
